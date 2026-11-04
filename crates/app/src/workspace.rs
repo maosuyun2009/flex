@@ -665,6 +665,9 @@ impl Workspace {
                             el.text_color(theme::text())
                                 .hover(|el| el.bg(chrome.hover()))
                         })
+                        .when_some(session.agent_state(), |el, state| {
+                            el.child(theme::dot(theme::agent(state)))
+                        })
                         .child(div().flex_1().truncate().child(session.label.clone()))
                         .child(
                             div()
@@ -717,6 +720,9 @@ impl Workspace {
                     .when(!active, |el| {
                         el.text_color(theme::muted())
                             .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                    })
+                    .when_some(window_agent(&window), |el, state| {
+                        el.child(theme::dot(theme::agent(state)))
                     })
                     .child(window.label.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1252,6 +1258,15 @@ fn control(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, window, cx| action(window, cx))
         .into_any_element()
+}
+
+/// The most urgent agent state among a window's panes, if any pane reports one.
+fn window_agent(window: &WindowState) -> Option<shrew_core::AgentState> {
+    window
+        .blocks
+        .iter()
+        .filter_map(|block| block.agent.as_ref().map(|agent| agent.state))
+        .max()
 }
 
 /// The floating layer that holds `block_id`, from a `session.view` result.

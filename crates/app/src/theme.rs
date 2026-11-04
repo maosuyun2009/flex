@@ -90,6 +90,24 @@ pub fn danger() -> Hsla {
     color(DANGER)
 }
 
+/// The dot beside a session or tab, from the program-status protocol: white
+/// idle, green working, red blocked, amber failed, blue finished.
+pub fn agent(state: shrew_core::AgentState) -> Hsla {
+    use shrew_core::AgentState;
+    color(match state {
+        AgentState::Idle => 0xf2f5f9,
+        AgentState::Working => 0x4e_c9_7b,
+        AgentState::Blocked => 0xe0_5b_4f,
+        AgentState::Error => 0xe0_a0_4f,
+        AgentState::Done => 0x6e_a8_d8,
+    })
+}
+
+/// A 6px status dot.
+pub fn dot(colour: Hsla) -> gpui::Div {
+    gpui::div().size(px(6.0)).rounded_full().bg(colour)
+}
+
 /// Uppercase section label, as in Pebrel's sidebar.
 pub fn section(text: impl Into<gpui::SharedString>) -> gpui::Div {
     gpui::div()

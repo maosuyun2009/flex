@@ -168,7 +168,82 @@ identical in the sidebar and the terminal — one sheet, not two panels. The
 Settings switch labelled **Translucent** turns the gradient off and leaves flat
 surfaces.
 
-## Terminal theme## Terminal theme## Terminal theme
+## Agent status
+
+Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
+terraform and anything else that adopts it — report what they are doing, and the
+server keeps the record. The shell reads it from `BlockState::agent`:
+
+| State | Dot |
+| --- | --- |
+| idle | white |
+| working | green |
+| blocked | red |
+| error | amber |
+| done | blue |
+
+Sessions aggregate with the most urgent state among their panes (GPUI's
+`max()` over the state order), so a session that has one blocked agent shows
+red even while three others are idle. The dot sits on the session row in the
+sidebar and on each tab chip, so a split with several agents still tells you
+which one needs you.
+
+Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
+on the server installs that for the harnesses Rex knows (claude, codex, opencode,
+pi); anything else can print it, e.g.
+`printf '\033]7501;state=working:app=codex\033\\'`.
+
+## Terminal theme## Agent status
+
+Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
+terraform and anything else that adopts it — report what they are doing, and the
+server keeps the record. The shell reads it from `BlockState::agent`:
+
+| State | Dot |
+| --- | --- |
+| idle | white |
+| working | green |
+| blocked | red |
+| error | amber |
+| done | blue |
+
+Sessions aggregate with the most urgent state among their panes (GPUI's
+`max()` over the state order), so a session that has one blocked agent shows
+red even while three others are idle. The dot sits on the session row in the
+sidebar and on each tab chip, so a split with several agents still tells you
+which one needs you.
+
+Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
+on the server installs that for the harnesses Rex knows (claude, codex, opencode,
+pi); anything else can print it, e.g.
+`printf '\033]7501;state=working:app=codex\033\\'`.
+
+## Terminal theme## Agent status
+
+Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
+terraform and anything else that adopts it — report what they are doing, and the
+server keeps the record. The shell reads it from `BlockState::agent`:
+
+| State | Dot |
+| --- | --- |
+| idle | white |
+| working | green |
+| blocked | red |
+| error | amber |
+| done | blue |
+
+Sessions aggregate with the most urgent state among their panes (GPUI's
+`max()` over the state order), so a session that has one blocked agent shows
+red even while three others are idle. The dot sits on the session row in the
+sidebar and on each tab chip, so a split with several agents still tells you
+which one needs you.
+
+Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
+on the server installs that for the harnesses Rex knows (claude, codex, opencode,
+pi); anything else can print it, e.g.
+`printf '\033]7501;state=working:app=codex\033\\'`.
+
+## Terminal theme
 
 The terminal is themed to the same palette as the chrome rather than keeping the
 server's Ghostty defaults: `THEME` in `crates/app/src/terminal.rs` sets the
