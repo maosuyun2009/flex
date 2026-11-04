@@ -5,8 +5,9 @@ use std::sync::Arc;
 use async_channel::Sender;
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, px, App, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    Render, SharedString, Window,
+    canvas, div, px, App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
+    Focusable, IntoElement, KeyDownEvent, MouseButton, Point, Render, SharedString, UTF16Selection,
+    Window,
 };
 use rexshell_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
 use shrew_core::{ColorTheme, Frame, Rgb, TerminalStatus};
@@ -49,6 +50,15 @@ const LINE_HEIGHT_EM: f32 = 1.3;
 
 pub struct TerminalView {
     block_id: String,
+    /// An input method is composing. Its pinyin letters arrive as ordinary key
+    /// events and must not reach the terminal; only the committed text should,
+    /// and that comes through `replace_text_in_range` instead.
+    composing: bool,
+    /// ASCII letters sent since the last non-letter key. The first pinyin
+    /// letters arrive before the composition starts, so they have already
+    /// reached the terminal by the time we know better; the composition start
+    /// retracts them with backspaces.
+    leaked: String,
     session: Option<Arc<TerminalSession>>,
     error: Option<String>,
     frame: Frame,
@@ -98,6 +108,8 @@ impl TerminalView {
         }
         Self {
             block_id: block.to_owned(),
+            composing: false,
+            leaked: String::new(),
             session,
             error,
             frame: empty_frame(),
@@ -118,14 +130,31 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn press(&self, event: &KeyDownEvent) {
+    fn press(&mut self, event: &KeyDownEvent) {
+        // While an IME is composing, the keys belong to it.
+        if self.composing {
+            return;
+        }
         // Shell shortcuts are not the terminal's: leave them to bubble up.
         if shortcuts::lookup(&event.keystroke).is_some() {
             return;
         }
         let Some(session) = &self.session else { return };
         match keymap::translate(&event.keystroke) {
-            Some(p) => session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta),
+            Some(p) => {
+                let plain_letter = !p.ctrl
+                    && !p.alt
+                    && !p.meta
+                    && matches!(p.key, shrew_core::Key::Char(c) if c.is_ascii_alphabetic());
+                if !plain_letter {
+                    // Anything that is not a bare letter ends the pinyin run, so
+                    // nothing is left to retract.
+                    self.leaked.clear();
+                } else if let shrew_core::Key::Char(c) = p.key {
+                    self.leaked.push(c);
+                }
+                session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta);
+            }
             None => {
                 if std::env::var_os("REXSHELL_DEBUG").is_some() {
                     let k = &event.keystroke;
@@ -169,12 +198,21 @@ impl Render for TerminalView {
         };
         let prepaint_palette = palette.clone();
         let prepaint_session = session.clone();
+        let view = cx.entity();
+        let focus = self.focus.clone();
 
         div()
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, _cx| this.press(event)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Debug hook: exercises the IME commit path without a real IME.
+                if debug() && event.keystroke.key == "f12" {
+                    this.replace_text_in_range(None, "中文测试", window, cx);
+                    return;
+                }
+                this.press(event)
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _cx| {
@@ -204,6 +242,14 @@ impl Render for TerminalView {
                         metrics
                     },
                     move |bounds, metrics, window, cx| {
+                        // IME text never arrives as a keystroke: the platform hands
+                        // it to whichever element registered an input handler for
+                        // the focused element, so do that here, during paint.
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, view.clone()),
+                            cx,
+                        );
                         paint::paint(&frame, bounds, metrics, px(PAD), &palette, window, cx)
                     },
                 )
@@ -252,5 +298,111 @@ fn empty_frame() -> Frame {
         lines: Vec::new(),
         scrollbar: Default::default(),
         alternate_screen: false,
+    }
+}
+
+/// Text that arrives from an input method — Chinese, Japanese, Korean — never
+/// comes through `on_key_down`. The platform hands the composed string to the
+/// focused element's input handler instead, and the terminal has no editable
+/// buffer of its own, so the committed text is simply typed into the pty.
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _adjusted: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        None
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.composing = false;
+    }
+
+    /// The committed string, after the candidate window closes.
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.composing = false;
+        if std::env::var_os("REXSHELL_DEBUG").is_some() {
+            eprintln!("[ime] commit {text:?}");
+        }
+        // ASCII already arrives as key events; sending it here would type every
+        // character twice. Only the IME's own output takes this path.
+        if !text.chars().any(|c| !c.is_ascii()) {
+            return;
+        }
+        self.leaked.clear();
+        if let Some(session) = &self.session {
+            session.send_text(text);
+        }
+    }
+
+    /// The composition in progress. A terminal shows it in the IME's own window,
+    /// not in the buffer, so there is nothing to do until it is committed.
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        _new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if _new_text.is_empty() {
+            return;
+        }
+        if !self.composing {
+            // The composition has just started, and the pinyin letters sent
+            // before this message are the last thing on the line: take them back.
+            if !self.leaked.is_empty() {
+                if let Some(session) = &self.session {
+                    session.send_text(&"\u{7f}".repeat(self.leaked.len()));
+                }
+                self.leaked.clear();
+            }
+        }
+        // Composition in progress: swallow key events until it commits.
+        self.composing = true;
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _element_bounds: Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }

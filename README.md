@@ -168,6 +168,25 @@ identical in the sidebar and the terminal — one sheet, not two panels. The
 Settings switch labelled **Translucent** turns the gradient off and leaves flat
 surfaces.
 
+## Input methods
+
+Chinese, Japanese and Korean text never arrives as a keystroke: the IME hands the
+composed string to the focused element's *input handler*. So `TerminalView`
+implements `EntityInputHandler` and registers it during paint with
+`window.handle_input`; `replace_text_in_range` types the committed text into the
+pty with `session.send_text`.
+
+Three things had to line up:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Composed text never appeared | nothing registered an input handler, so the IME had nowhere to deliver | `EntityInputHandler` + `handle_input` in the paint callback |
+| Every ASCII character arrived twice | with a handler registered, GPUI delivers characters *both* as keys and as input-handler text | only accept text with a non-ASCII character in it |
+| pinyin letters leaked before the commit | the first letters arrive before the composition starts | swallow keys while composing, and retract the ones already sent when the composition starts |
+
+`REXSHELL_DEBUG=1` logs each commit, and F12 exercises the commit path without
+an IME, which is how this was verified.
+
 ## Agent status
 
 Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
@@ -205,7 +224,26 @@ on the server installs that for the harnesses Rex knows (claude, codex, opencode
 pi); anything else can print it, e.g.
 `printf '\033]7501;state=working:app=codex\033\\'`.
 
-## Terminal theme## Agent status
+## Terminal theme## Input methods
+
+Chinese, Japanese and Korean text never arrives as a keystroke: the IME hands the
+composed string to the focused element's *input handler*. So `TerminalView`
+implements `EntityInputHandler` and registers it during paint with
+`window.handle_input`; `replace_text_in_range` types the committed text into the
+pty with `session.send_text`.
+
+Three things had to line up:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Composed text never appeared | nothing registered an input handler, so the IME had nowhere to deliver | `EntityInputHandler` + `handle_input` in the paint callback |
+| Every ASCII character arrived twice | with a handler registered, GPUI delivers characters *both* as keys and as input-handler text | only accept text with a non-ASCII character in it |
+| pinyin letters leaked before the commit | the first letters arrive before the composition starts | swallow keys while composing, and retract the ones already sent when the composition starts |
+
+`REXSHELL_DEBUG=1` logs each commit, and F12 exercises the commit path without
+an IME, which is how this was verified.
+
+## Agent status
 
 Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
 terraform and anything else that adopts it — report what they are doing, and the
@@ -242,7 +280,26 @@ on the server installs that for the harnesses Rex knows (claude, codex, opencode
 pi); anything else can print it, e.g.
 `printf '\033]7501;state=working:app=codex\033\\'`.
 
-## Terminal theme## Agent status
+## Terminal theme## Input methods
+
+Chinese, Japanese and Korean text never arrives as a keystroke: the IME hands the
+composed string to the focused element's *input handler*. So `TerminalView`
+implements `EntityInputHandler` and registers it during paint with
+`window.handle_input`; `replace_text_in_range` types the committed text into the
+pty with `session.send_text`.
+
+Three things had to line up:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Composed text never appeared | nothing registered an input handler, so the IME had nowhere to deliver | `EntityInputHandler` + `handle_input` in the paint callback |
+| Every ASCII character arrived twice | with a handler registered, GPUI delivers characters *both* as keys and as input-handler text | only accept text with a non-ASCII character in it |
+| pinyin letters leaked before the commit | the first letters arrive before the composition starts | swallow keys while composing, and retract the ones already sent when the composition starts |
+
+`REXSHELL_DEBUG=1` logs each commit, and F12 exercises the commit path without
+an IME, which is how this was verified.
+
+## Agent status
 
 Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
 terraform and anything else that adopts it — report what they are doing, and the
