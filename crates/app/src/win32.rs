@@ -15,7 +15,8 @@ mod imp {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, IsWindowVisible, IsZoomed, SendMessageW,
-        ShowWindowAsync, HTCAPTION, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_NCLBUTTONDOWN,
+        ShowWindowAsync, SystemParametersInfoW, HTCAPTION, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+        WM_NCLBUTTONDOWN,
     };
 
     static FOUND: AtomicIsize = AtomicIsize::new(0);
@@ -73,6 +74,30 @@ mod imp {
         }
     }
 
+    /// The desktop wallpaper's file, for the blurred backdrop.
+    pub fn wallpaper() -> Option<std::path::PathBuf> {
+        const SPI_GETDESKWALLPAPER: u32 = 0x0073;
+        let mut buffer = vec![0u16; 512];
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETDESKWALLPAPER,
+                buffer.len() as u32,
+                buffer.as_mut_ptr().cast(),
+                0,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let len = buffer.iter().position(|&c| c == 0).unwrap_or(0);
+        if len == 0 {
+            return None;
+        }
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(
+            &buffer[..len],
+        )))
+    }
+
     /// Windows 11 rounds a decorated window's corners; ours has no decorations,
     /// so ask DWM for the same rounding (DWMWA_WINDOW_CORNER_PREFERENCE = 33).
     pub fn round_corners() {
@@ -94,6 +119,9 @@ mod imp {
     pub fn toggle_maximize() {}
     pub fn minimize() {}
     pub fn round_corners() {}
+    pub fn wallpaper() -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
-pub use imp::{drag, is_maximized, minimize, round_corners, toggle_maximize};
+pub use imp::{drag, is_maximized, minimize, round_corners, toggle_maximize, wallpaper};

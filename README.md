@@ -146,18 +146,40 @@ box. The `×` character is used where a diagonal is needed — GPUI 0.2.2 has no
 rotation — which does exist in the Windows fallback chain, unlike `─`, `□` and
 `✕`.
 
-The acrylic is the shell's own, and this is why: GPUI's Windows window is
-`WS_EX_NOREDIRECTIONBITMAP` over DirectComposition, so DWM has no redirection
-surface to frost. Measured on this machine (Windows 11, 150% scaling):
+The acrylic is the shell's own, and that was measured rather than assumed:
 
-| Attempt | Result |
+| Attempt | Result on Windows 11, 150% scaling |
 | --- | --- |
-| `WindowBackgroundAppearance::Blurred` (legacy accent, acrylic) | every screen capture on the desktop went black |
-| `Transparent` + `DWMWA_SYSTEMBACKDROP_TYPE` (the supported Win11 backdrop) | window composited over black, backdrop never drawn |
-| opaque window, surfaces layered over a gradient | reads as frosted glass, captures fine |
+| `WindowBackgroundAppearance::Blurred` (legacy accent, the real acrylic) | every screen capture on the desktop went black |
+| `Transparent` + `DWMWA_SYSTEMBACKDROP_TYPE` (the supported Win11 backdrop) | window composited over black; backdrop never drawn |
+| `GPUI_DISABLE_DIRECT_COMPOSITION=true` + `Blurred` | capture fine, but the renderer still writes opaque pixels, so nothing shows through |
 
-So the window is opaque, the chrome sits at 62-80% alpha over a vertical
-gradient, and Settings offers "Acrylic" for the denser or flatter finish.
+GPUI draws opaque pixels through DirectComposition, so no window-level blur can
+reach the screen. What the shell does instead is what Mica does: read the desktop
+wallpaper (`SPI_GETDESKWALLPAPER`), downscale it hard, box-blur it twice, and
+paint it as the window background (`backdrop.rs`). Every surface then composites
+over it — chrome at 72% alpha, the terminal at 72% over a scrim — so the window
+reads as one frosted sheet:
+
+```
+title bar (77,67,66)   sidebar (71,61,50)   terminal (51,45,41)
+   └─ warm, and each one tracks the wallpaper behind it
+```
+
+The trade is that the blur shows the *wallpaper*, not what is behind the window,
+because sampling behind the window would include the window itself. Wallpaper
+changes are picked up on the next start. Without a wallpaper (a solid colour
+desktop) the shell falls back to its own gradient, and Settings turns the effect
+off entirely.
+
+## Terminal theme
+
+The terminal is themed to the same palette as the chrome rather than keeping the
+server's Ghostty defaults: `THEME` in `crates/app/src/terminal.rs` sets the
+foreground, background, cursor (the amber accent) and all sixteen ANSI colours
+from the shell's hues, and is pushed with `TerminalSession::set_theme`. The pane
+background is painted translucent, so the terminal sits on the same sheet as
+everything else.
 
 ## What works
 

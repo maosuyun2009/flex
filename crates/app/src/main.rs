@@ -4,6 +4,7 @@
 //! shell attaches to a local Rex server if one is running, and otherwise shows
 //! whatever server list it saved last time.
 
+mod backdrop;
 mod fonts;
 mod icons;
 mod keymap;

@@ -9,11 +9,38 @@ use gpui::{
     Render, SharedString, Window,
 };
 use rexshell_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
-use shrew_core::{Frame, TerminalStatus};
+use shrew_core::{ColorTheme, Frame, Rgb, TerminalStatus};
 
 use crate::{keymap, paint, shortcuts};
 
 const PAD: f32 = 4.0;
+
+/// The terminal's colours, so it belongs to the same window as the chrome: the
+/// settings page's greys, the amber accent as the cursor, and a muted ANSI set
+/// built from the same hues.
+const THEME: ColorTheme = ColorTheme {
+    foreground: Rgb::new(0xc9, 0xce, 0xd8),
+    background: Rgb::new(0x0f, 0x11, 0x14),
+    cursor: Rgb::new(0xf0, 0xb4, 0x29),
+    ansi: [
+        Rgb::new(0x1a, 0x1c, 0x21),
+        Rgb::new(0xc4, 0x56, 0x4f),
+        Rgb::new(0x8f, 0xbf, 0x6b),
+        Rgb::new(0xf0, 0xb4, 0x29),
+        Rgb::new(0x6e, 0xa8, 0xd8),
+        Rgb::new(0xb4, 0x8e, 0xad),
+        Rgb::new(0x7f, 0xc8, 0xc0),
+        Rgb::new(0xc9, 0xce, 0xd8),
+        Rgb::new(0x4a, 0x4f, 0x5a),
+        Rgb::new(0xe0, 0x7b, 0x74),
+        Rgb::new(0xa9, 0xd9, 0x8a),
+        Rgb::new(0xf6, 0xc8, 0x5f),
+        Rgb::new(0x8f, 0xc3, 0xea),
+        Rgb::new(0xcb, 0xa8, 0xc7),
+        Rgb::new(0xa3, 0xde, 0xd6),
+        Rgb::new(0xf2, 0xf5, 0xf9),
+    ],
+};
 
 /// Line height in em, i.e. a multiple of the font size. The glyph box
 /// (ascent + descent) is only ~0.78 em, so using it alone sets lines almost
@@ -56,6 +83,9 @@ impl TerminalView {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e.to_string())),
         };
+        if let Some(session) = &session {
+            session.set_theme(Some(THEME));
+        }
         if session.is_some() {
             cx.spawn(async move |this, cx| {
                 while rx.recv().await.is_ok() {

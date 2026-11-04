@@ -39,7 +39,17 @@ pub fn paint(
         )
     };
 
-    window.paint_quad(fill(bounds, color(frame.background)));
+    // Translucent, not opaque: the window background (acrylic, or the shell's
+    // own gradient) is what the terminal sits on, so the whole window reads as
+    // one sheet instead of a dark rectangle with a glass border.
+    let backdrop: Hsla = color(frame.background);
+    window.paint_quad(fill(
+        bounds,
+        Hsla {
+            a: 0.72,
+            ..backdrop
+        },
+    ));
 
     if let Some(cursor) = &frame.cursor {
         let at = cell(cursor.col, cursor.row);
