@@ -15,6 +15,8 @@ pub enum Action {
     NewTab,
     ToggleSidebar,
     Settings,
+    /// Arms a one-shot prefix: the next bare key picks a tool.
+    Prefix,
 }
 
 /// `(keys, action, what it does)`. Keep the key order stable; the settings page
@@ -39,6 +41,11 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
     ("ctrl-shift-t", Action::NewTab, "Open a new tab"),
     ("ctrl-b", Action::ToggleSidebar, "Show or hide the sidebar"),
     ("ctrl-,", Action::Settings, "Settings"),
+    (
+        "ctrl-shift-space",
+        Action::Prefix,
+        "Prefix, then g lazygit · f file · d directory · z either",
+    ),
 ];
 
 pub fn lookup(keystroke: &Keystroke) -> Option<Action> {

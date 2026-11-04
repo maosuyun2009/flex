@@ -54,6 +54,8 @@ pub struct TerminalView {
     /// events and must not reach the terminal; only the committed text should,
     /// and that comes through `replace_text_in_range` instead.
     composing: bool,
+    /// The shell's prefix key is armed, so the next key belongs to the chrome.
+    prefix: Arc<std::sync::atomic::AtomicBool>,
     /// ASCII letters sent since the last non-letter key. The first pinyin
     /// letters arrive before the composition starts, so they have already
     /// reached the terminal by the time we know better; the composition start
@@ -85,6 +87,7 @@ impl TerminalView {
         block: &str,
         font: SharedString,
         font_size: f32,
+        prefix: Arc<std::sync::atomic::AtomicBool>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (tx, rx) = async_channel::unbounded();
@@ -109,6 +112,7 @@ impl TerminalView {
         Self {
             block_id: block.to_owned(),
             composing: false,
+            prefix,
             leaked: String::new(),
             session,
             error,
@@ -130,7 +134,26 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// The pane's whole screen and scrollback, as text.
+    pub fn text(&self) -> String {
+        self.session
+            .as_ref()
+            .map(|session| session.all_text())
+            .unwrap_or_default()
+    }
+
+    /// Type text into the pty, as a paste would.
+    pub fn send(&self, text: &str) {
+        if let Some(session) = &self.session {
+            session.send_text(text);
+        }
+    }
+
     fn press(&mut self, event: &KeyDownEvent) {
+        // An armed prefix means the next key is the shell's, not the pty's.
+        if self.prefix.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         // While an IME is composing, the keys belong to it.
         if self.composing {
             return;

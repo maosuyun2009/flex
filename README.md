@@ -132,6 +132,24 @@ a 30/70 split returns as `after` with a ratio of 0.3, not a flat 50/50. Rex take
 only a side and a ratio, not a saved layout, so a nested split comes back one
 level deep.
 
+### Prefix tools
+
+`Ctrl-Shift-Space` arms a prefix; the next bare key opens a tool beside the
+active pane, herdr-style:
+
+| Key | Opens |
+| --- | --- |
+| `g` | `lazygit` in the pane's directory; quit it and the pane closes, focus returns |
+| `f` | `fzf` over `rg --files`, and the choice is typed into the pane it came from |
+| `d` | `fzf` over directories, typed in with a trailing `/` |
+| `z` | both files and directories |
+
+The picker prints its choice as a marked line (`@@pick@@<path>`) instead of
+relying on fzf's screen, so the client can find it: when the picker's process
+exits, the shell reads that line out of the pane's text and sends it to the
+origin block with the same path that a paste uses. No file on the server, no
+extra round trip, and nothing to poll — the pane's own stream is the channel.
+
 Splits and floats are Rex's own: the server holds the layout, this shell only
 sends `session.new_split` / `session.float_block` / `session.move_block` and
 draws the blocks at the fractions it gets back. Another client sees the same

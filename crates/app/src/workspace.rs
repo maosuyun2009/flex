@@ -24,6 +24,39 @@ use crate::shortcuts::{self, Action};
 use crate::terminal::TerminalView;
 use crate::theme;
 
+/// Printed by a picker pane once it has a choice, so the client can find it in
+/// the pane's text without guessing at fzf's redraws.
+const PICK_MARK: &str = "@@pick@@";
+
+const PICK_FILES: &str =
+    "p=$(rg --files --hidden -g '!.git' 2>/dev/null | fzf --height=100% --layout=reverse); \
+[ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
+const PICK_DIRS: &str = "p=$(find . -mindepth 1 -type d -not -path './.git*' -not -path '*/node_modules*' 2>/dev/null \
+| sed 's|^\\./||' | fzf --height=100% --layout=reverse); [ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
+const PICK_ANY: &str = "p=$({ rg --files --hidden -g '!.git' 2>/dev/null; find . -mindepth 1 -type d -not -path './.git*' \
+-not -path '*/node_modules*' 2>/dev/null | sed 's|^\\./||'; } | fzf --height=100% --layout=reverse); \
+[ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
+
+/// What the prefix key can open.
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    /// A lazygit pane that disappears again when you quit it.
+    Lazygit,
+    Files,
+    Dirs,
+    /// Files and directories in one list.
+    Anything,
+}
+
+/// A picker pane that is running: when its program exits, the choice is read out
+/// of its text and typed into the pane it was opened from.
+#[derive(Clone)]
+struct PendingPick {
+    origin_block: String,
+    pick_block: String,
+    suffix: &'static str,
+}
+
 /// Where a pane lands when it is floated: centred, leaving the tiled panes
 /// visible around it, the way a floating terminal is usually wanted.
 const FLOAT_BOUNDS: [f64; 4] = [0.14, 0.12, 0.72, 0.7];
@@ -74,6 +107,10 @@ pub struct Workspace {
     /// Where each floating pane sat before it was floated, so tiling it again
     /// can put it back on the same side with roughly the same share.
     float_rects: std::collections::HashMap<String, [f64; 4]>,
+    /// Prefix armed: the next bare key picks a tool.
+    prefix: Arc<std::sync::atomic::AtomicBool>,
+    /// A picker pane that has not answered yet.
+    pending_pick: Option<PendingPick>,
     _wake: Option<Task<()>>,
 }
 
@@ -100,6 +137,8 @@ impl Workspace {
             pull: None,
             settled: None,
             float_rects: std::collections::HashMap::new(),
+            prefix: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_pick: None,
             _wake: None,
         };
         this.reload(cx);
@@ -168,6 +207,9 @@ impl Workspace {
             .flat_map(|w| &w.blocks)
             .map(|b| b.id.clone())
             .collect();
+        // The picker is read before pruning: a pane that closed on exit is gone
+        // from the state, but its text is still in our terminal.
+        self.settle_pick(&live, cx);
         self.terminals.retain(|id, _| live.contains(id));
 
         // A dropped pane stops being drawn from our own copy as soon as the
@@ -236,9 +278,10 @@ impl Workspace {
         let engine = self.engine.clone();
         let font_size = self.settings.font_size;
         let font = self.font.clone();
+        let prefix = self.prefix.clone();
         let view = cx.new(|cx| {
             TerminalView::new(
-                &engine, server_id, session_id, block_id, font, font_size, cx,
+                &engine, server_id, session_id, block_id, font, font_size, prefix, cx,
             )
         });
         self.terminals.insert(block_id.to_owned(), view.clone());
@@ -278,6 +321,12 @@ impl Workspace {
             }
             Action::Settings => {
                 self.show_settings = !self.show_settings;
+                cx.notify();
+            }
+            Action::Prefix => {
+                let armed = !self.prefix.load(std::sync::atomic::Ordering::Relaxed);
+                self.prefix
+                    .store(armed, std::sync::atomic::Ordering::Relaxed);
                 cx.notify();
             }
         }
@@ -429,6 +478,143 @@ impl Workspace {
             this.update(cx, |_, cx| cx.notify()).ok();
         })
         .detach();
+    }
+
+    /// Open a tool beside the active pane: lazygit, or an fzf picker whose choice
+    /// is typed back into the pane it came from.
+    fn run_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        let (Some(address), Some(session_id), Some(origin)) =
+            (self.address(), self.session_id.clone(), self.active())
+        else {
+            return;
+        };
+
+        let (command, keep_open, suffix) = match tool {
+            Tool::Lazygit => (vec!["lazygit".to_owned()], false, ""),
+            Tool::Files => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_FILES.to_owned()],
+                true,
+                " ",
+            ),
+            Tool::Dirs => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_DIRS.to_owned()],
+                true,
+                "/",
+            ),
+            Tool::Anything => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_ANY.to_owned()],
+                true,
+                " ",
+            ),
+        };
+
+        let mut options = json!({"shell": "none", "command": command});
+        if !origin.pwd.is_empty() {
+            options["cwd"] = json!(origin.pwd);
+        }
+        let payload = json!({
+            "session_id": session_id,
+            "block_id": origin.id,
+            "side": "after",
+            "direction": "horizontal",
+            "ratio": 0.42,
+            "layout": {
+                "block": {
+                    "flavor": "com.superlogical.terminal.shell",
+                    "options": options,
+                }
+            },
+        });
+
+        let engine = self.engine.clone();
+        let origin_block = origin.id;
+        cx.spawn(async move |this, cx| {
+            match engine.call(&address, "session.new_split", payload).await {
+                Ok(view) => {
+                    let block = view
+                        .pointer("/block_ids/0")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned);
+                    let Some(block) = block else { return };
+                    if keep_open {
+                        let pick = PendingPick {
+                            origin_block,
+                            pick_block: block,
+                            suffix,
+                        };
+                        this.update(cx, |me, cx| {
+                            // The picker takes the keyboard: it is what you type into.
+                            me.active_block = Some(pick.pick_block.clone());
+                            me.pending_focus = Some(pick.pick_block.clone());
+                            me.pending_pick = Some(pick);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+                Err(e) => eprintln!("rexshell: session.new_split: {e}"),
+            }
+        })
+        .detach();
+    }
+
+    /// A picker's program has exited: take the choice out of its text, type it
+    /// into the pane it came from, and close the picker.
+    fn settle_pick(&mut self, live: &HashSet<String>, cx: &mut Context<Self>) {
+        let Some(pick) = self.pending_pick.clone() else {
+            return;
+        };
+        let present = self
+            .windows()
+            .into_iter()
+            .flat_map(|window| window.blocks)
+            .find(|block| block.id == pick.pick_block);
+        // Gone from the session means it closed on exit; still present means we
+        // wait until its process reports having exited.
+        let finished = present
+            .as_ref()
+            .map_or(true, |block| block.exited.is_some());
+        if !finished {
+            return;
+        }
+        let still_open = present.is_some();
+        self.pending_pick = None;
+
+        let text = self
+            .terminals
+            .get(&pick.pick_block)
+            .map(|view| view.read(cx).text())
+            .unwrap_or_default();
+        let choice = text
+            .lines()
+            .rev()
+            .find_map(|line| {
+                line.split_once(PICK_MARK)
+                    .map(|(_, path)| path.trim().to_owned())
+            })
+            .filter(|path| !path.is_empty());
+        if std::env::var_os("REXSHELL_DEBUG").is_some() {
+            eprintln!("[pick] finished open={still_open} choice={choice:?}");
+        }
+        if let Some(path) = choice {
+            if let Some(origin) = self.terminals.get(&pick.origin_block) {
+                origin.read(cx).send(&format!("{path}{}", pick.suffix));
+            }
+        }
+
+        // Only a pane that is still open needs closing; one that closed on exit
+        // is already gone, and `live` says so.
+        if still_open && live.contains(&pick.pick_block) {
+            if let (Some(server), Some(session)) = (self.server_id.clone(), self.session_id.clone())
+            {
+                let engine = self.engine.clone();
+                let block = pick.pick_block;
+                cx.spawn(async move |_, _| {
+                    let _ = engine.shrew().close_block(&server, &session, &block).await;
+                })
+                .detach();
+            }
+        }
     }
 
     /// A tiled block to place `block_id` beside: this window first, then any
@@ -1296,6 +1482,25 @@ impl Render for Workspace {
                 }
                 if let Some(action) = shortcuts::lookup(&event.keystroke) {
                     this.run(action, window, cx);
+                    return;
+                }
+                // Armed prefix: the next bare key picks a tool.
+                if this.prefix.load(std::sync::atomic::Ordering::Relaxed) {
+                    this.prefix
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    let modifiers = &event.keystroke.modifiers;
+                    let bare = !modifiers.control && !modifiers.alt && !modifiers.platform;
+                    if bare {
+                        match event.keystroke.key.to_ascii_lowercase().as_str() {
+                            "g" => this.run_tool(Tool::Lazygit, cx),
+                            "f" => this.run_tool(Tool::Files, cx),
+                            "d" => this.run_tool(Tool::Dirs, cx),
+                            "z" => this.run_tool(Tool::Anything, cx),
+                            _ => {}
+                        }
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
                 }
             }))
             .child(title_bar)
