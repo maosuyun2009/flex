@@ -1045,7 +1045,9 @@ impl Workspace {
                 div()
                     .w(px(460.0))
                     .rounded_lg()
-                    .bg(chrome.surface())
+                    // Opaque on purpose: the chrome is translucent, but a dialog
+                    // with a terminal bleeding through it is unreadable.
+                    .bg(theme::color(theme::SURFACE))
                     .border_1()
                     .border_color(theme::border())
                     .shadow_lg()
@@ -1077,8 +1079,8 @@ impl Workspace {
                             ),
                     )
                     .child(row(
-                        "Acrylic",
-                        "Blur the desktop behind the chrome".into(),
+                        "Translucent",
+                        "Layer the chrome over a gradient instead of flat colours".into(),
                         acrylic,
                     ))
                     .child(row("Sidebar", "Show the session list".into(), sidebar))
