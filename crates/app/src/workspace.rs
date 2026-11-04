@@ -66,7 +66,6 @@ pub struct Workspace {
     /// A pane to take focus once it exists, e.g. the one a split just made.
     pending_focus: Option<String>,
     terminals: HashMap<String, Entity<TerminalView>>,
-    focused_once: bool,
     styled: bool,
     show_settings: bool,
     pull: Option<Pull>,
@@ -93,7 +92,6 @@ impl Workspace {
             active_block: None,
             pending_focus: None,
             terminals: HashMap::new(),
-            focused_once: false,
             styled: false,
             show_settings: false,
             pull: None,
@@ -756,20 +754,26 @@ impl Workspace {
             })
             .collect();
 
-        // A window with nothing focused swallows every keystroke, and nothing
-        // else here can take focus, so give it to the first pane. A pane a split
-        // just created takes it instead, once it exists.
+        // Keep *something* focused. Closing a pane takes its focus handle with
+        // it, and GPUI dispatches keys along the focused element's path: with
+        // nothing focused even the shell's own shortcuts stop arriving. So a
+        // freshly split pane takes focus, and if focus has gone missing it goes
+        // to the active pane, or the first one left.
+        let focused_somewhere = views
+            .iter()
+            .any(|(_, view)| view.read(cx).handle().is_focused(window));
         let wanted = self.pending_focus.take().or_else(|| {
-            if self.focused_once {
+            if focused_somewhere {
                 None
             } else {
-                views.first().map(|(block, _)| block.id.clone())
+                self.active_block
+                    .clone()
+                    .or_else(|| views.first().map(|(block, _)| block.id.clone()))
             }
         });
         if let Some(wanted) = wanted {
             if let Some((_, view)) = views.iter().find(|(block, _)| block.id == wanted) {
                 window.focus(&view.read(cx).handle());
-                self.focused_once = true;
             } else {
                 self.pending_focus = Some(wanted);
             }
