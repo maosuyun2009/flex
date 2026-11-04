@@ -12,6 +12,7 @@ pub enum Action {
     SplitDown,
     ClosePane,
     ToggleFloat,
+    ZoomPane,
     NewTab,
     ToggleSidebar,
     Settings,
@@ -38,6 +39,11 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         Action::ToggleFloat,
         "Float the pane, or tile it again",
     ),
+    (
+        "ctrl-shift-enter",
+        Action::ZoomPane,
+        "Zoom the pane, or restore the layout",
+    ),
     ("ctrl-shift-t", Action::NewTab, "Open a new tab"),
     ("ctrl-b", Action::ToggleSidebar, "Show or hide the sidebar"),
     ("ctrl-,", Action::Settings, "Settings"),
@@ -49,7 +55,11 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
 ];
 
 pub fn lookup(keystroke: &Keystroke) -> Option<Action> {
-    let key = keystroke.key.to_ascii_lowercase();
+    // Enter arrives as "\r" on Windows; the table spells it "enter".
+    let key = match keystroke.key.to_ascii_lowercase().as_str() {
+        "\r" | "\n" => "enter".to_owned(),
+        other => other.to_owned(),
+    };
     let modifiers = &keystroke.modifiers;
     BINDINGS.iter().find_map(|(keys, action, _)| {
         let (ctrl, shift, alt, wanted) = parse(keys);

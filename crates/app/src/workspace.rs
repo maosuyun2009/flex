@@ -318,6 +318,7 @@ impl Workspace {
             Action::ClosePane => self.close_pane(cx),
             Action::ToggleFloat => self.toggle_float(cx),
             Action::NewTab => self.new_tab(cx),
+            Action::ZoomPane => self.zoom_pane(cx),
             Action::ToggleSidebar => {
                 self.settings.sidebar = !self.settings.sidebar;
                 self.settings.save(&self.engine);
@@ -385,6 +386,29 @@ impl Workspace {
                 .await
             {
                 eprintln!("rexshell: close: {e}");
+            }
+        })
+        .detach();
+    }
+
+    /// Fill the window with the active pane, or put the layout back. Rex
+    /// toggles when no `zoom` argument is given.
+    fn zoom_pane(&mut self, cx: &mut Context<Self>) {
+        let (Some(server), Some(session), Some(block)) = (
+            self.server_id.clone(),
+            self.session_id.clone(),
+            self.active(),
+        ) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, _| {
+            if let Err(e) = engine
+                .shrew()
+                .zoom_block(&server, &session, &block.id)
+                .await
+            {
+                eprintln!("rexshell: zoom: {e}");
             }
         })
         .detach();
@@ -1070,6 +1094,15 @@ impl Workspace {
             return div().flex_1().into_any_element();
         };
 
+        // A zoomed block fills its window. For a tiled pane the server already
+        // reports it that way; a floating one keeps its layer bounds, so the
+        // shell has to enlarge it itself.
+        let zoomed = self
+            .windows()
+            .into_iter()
+            .find(|window| Some(&window.id) == self.window_id.as_ref())
+            .and_then(|window| window.zoomed_block_id);
+
         let blocks = self.blocks();
         let views: Vec<(BlockState, Entity<TerminalView>)> = blocks
             .into_iter()
@@ -1110,7 +1143,11 @@ impl Workspace {
         // Floating layers paint last, so they sit above the tiled panes.
         for floating_pass in [false, true] {
             for (block, view) in views.iter().filter(|(b, _)| b.floating == floating_pass) {
-                let [x, y, w, h] = self.rect_of(block);
+                let [x, y, w, h] = if Some(&block.id) == zoomed.as_ref() {
+                    [0.0, 0.0, 1.0, 1.0]
+                } else {
+                    self.rect_of(block)
+                };
                 let is_active = active.as_deref() == Some(block.id.as_str());
                 let outline = if is_active {
                     theme::accent()

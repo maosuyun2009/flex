@@ -123,8 +123,13 @@ all (found by screenshotting the title bar).
 
 `Ctrl-Shift-d` split right · `Ctrl-Shift-e` split down · `Ctrl-Shift-w` close pane
 · `Ctrl-Shift-f` float the pane or tile it again · `Ctrl-Shift-t` new tab ·
-`Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
+`Ctrl-Shift-Enter` zoom · `Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
 matcher and the settings page, so the list you read is the list that works.
+
+Zoom buys the whole pane area for one block: Rex toggles it, and the shell draws a
+zoomed *floating* pane at full size because the server keeps its layer bounds and
+only reports `zoomed_block_id` (for a tiled pane the reported layout already
+collapses to that one block).
 
 Floating a pane remembers the rect it had, so tiling it again puts it back on
 the same side with roughly its old share (`split_hint`): a pane from the right of
