@@ -154,25 +154,24 @@ The acrylic is the shell's own, and that was measured rather than assumed:
 | `Transparent` + `DWMWA_SYSTEMBACKDROP_TYPE` (the supported Win11 backdrop) | window composited over black; backdrop never drawn |
 | `GPUI_DISABLE_DIRECT_COMPOSITION=true` + `Blurred` | capture fine, but the renderer still writes opaque pixels, so nothing shows through |
 
-GPUI draws opaque pixels through DirectComposition, so no window-level blur can
-reach the screen. What the shell does instead is what Mica does: read the desktop
-wallpaper (`SPI_GETDESKWALLPAPER`), downscale it hard, box-blur it twice, and
-paint it as the window background (`backdrop.rs`). Every surface then composites
-over it — chrome at 72% alpha, the terminal at 72% over a scrim — so the window
-reads as one frosted sheet:
+So the shell takes the picture itself (`backdrop.rs`): every 350 ms it grabs the
+client area with GDI, throws away most of the detail, box-blurs it twice, and
+paints the result behind everything with `paint_image`. Chrome sits at 72% alpha
+over it and the terminal at 72% over a tint, so the window reads as one frosted
+sheet of whatever is actually behind it. A coarse 16×16 signature comparison
+skips frames where nothing changed, so an idle desktop costs nothing.
 
-```
-title bar (77,67,66)   sidebar (71,61,50)   terminal (51,45,41)
-   └─ warm, and each one tracks the wallpaper behind it
-```
+Grabbing the desktop behind the window means the window must not be *in* that
+grab, so it sets `WDA_EXCLUDEFROMCAPTURE` while acrylic is on:
 
-The trade is that the blur shows the *wallpaper*, not what is behind the window,
-because sampling behind the window would include the window itself. Wallpaper
-changes are picked up on the next start. Without a wallpaper (a solid colour
-desktop) the shell falls back to its own gradient, and Settings turns the effect
-off entirely.
+> While acrylic is enabled, this window does not appear in your own screenshots
+> or screen shares. Turning the Acrylic setting off releases the exclusion and
+> falls back to a gradient.
 
-## Terminal theme
+Costs: the capture is a 1651×950 BitBlt plus a downscale and two blurs, every
+350 ms, at about 0.1% of one core here.
+
+## Terminal theme## Terminal theme
 
 The terminal is themed to the same palette as the chrome rather than keeping the
 server's Ghostty defaults: `THEME` in `crates/app/src/terminal.rs` sets the

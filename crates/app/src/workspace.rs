@@ -11,10 +11,9 @@ use std::sync::Arc;
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, hsla, img, linear_color_stop, linear_gradient, px, relative, AnyElement, App,
-    Context, Entity, ImageSource, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, Resource, SharedString, Size,
-    Task, Window,
+    canvas, div, hsla, linear_color_stop, linear_gradient, px, relative, AnyElement, App, Context,
+    Corners, Entity, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, RenderImage, SharedString, Size, Task, Window,
 };
 use rexshell_engine::{AppState, BlockState, Connectivity, Engine, SessionState, WindowState};
 use serde_json::json;
@@ -58,8 +57,11 @@ pub struct Workspace {
     settings: Settings,
     /// The terminal font, resolved once at startup from what is installed.
     font: SharedString,
-    /// A blurred copy of the wallpaper, painted behind the translucent chrome.
-    backdrop: Option<std::path::PathBuf>,
+    /// A blurred copy of the desktop behind the window, painted behind the
+    /// translucent chrome. `None` until the first frame arrives.
+    backdrop: Option<Arc<RenderImage>>,
+    /// Whether the backdrop thread should keep taking pictures.
+    backdrop_on: Arc<std::sync::atomic::AtomicBool>,
     server_id: Option<String>,
     session_id: Option<String>,
     window_id: Option<String>,
@@ -76,17 +78,18 @@ pub struct Workspace {
     /// Keeps a released pane where it was dropped until the server confirms.
     settled: Option<(String, [f64; 4])>,
     _wake: Option<Task<()>>,
+    _backdrop: Option<Task<()>>,
 }
 
 impl Workspace {
     pub fn new(engine: Arc<Engine>, wake: Receiver<()>, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load(&engine);
         let font = crate::fonts::resolve(cx);
-        let backdrop = if settings.acrylic {
-            crate::backdrop::generate()
-        } else {
-            None
-        };
+        // The backdrop thread takes pictures of the desktop behind the window;
+        // `backdrop_on` is the switch the Acrylic setting flips.
+        let backdrop_on = Arc::new(std::sync::atomic::AtomicBool::new(settings.acrylic));
+        let (backdrop_tx, backdrop_rx) = async_channel::unbounded();
+        crate::backdrop::live_blur(backdrop_tx, backdrop_on.clone());
         if std::env::var_os("REXSHELL_DEBUG").is_some() {
             eprintln!("[font] using {font}");
         }
@@ -95,7 +98,8 @@ impl Workspace {
             state: AppState::default(),
             settings,
             font,
-            backdrop,
+            backdrop: None,
+            backdrop_on,
             server_id: None,
             session_id: None,
             window_id: None,
@@ -108,8 +112,25 @@ impl Workspace {
             pull: None,
             settled: None,
             _wake: None,
+            _backdrop: None,
         };
         this.reload(cx);
+        this._backdrop = Some(cx.spawn(async move |this, cx| {
+            while let Ok(image) = backdrop_rx.recv().await {
+                if this
+                    .update(cx, |me, cx| {
+                        if std::env::var_os("REXSHELL_DEBUG").is_some() {
+                            eprintln!("[backdrop] ui got a frame");
+                        }
+                        me.backdrop = Some(image);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
         this._wake = Some(cx.spawn(async move |this, cx| {
             while wake.recv().await.is_ok() {
                 if this.update(cx, |me, cx| me.reload(cx)).is_err() {
@@ -980,6 +1001,8 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     let value = pick(&mut this.settings);
                     *value = !*value;
+                    this.backdrop_on
+                        .store(this.settings.acrylic, std::sync::atomic::Ordering::Relaxed);
                     this.settings.save(&this.engine);
                     cx.notify();
                 }))
@@ -1135,23 +1158,34 @@ impl Render for Workspace {
             None
         };
 
-        // Acrylic: a blurred wallpaper behind translucent chrome. Without one
-        // (no wallpaper, or the setting off) fall back to the gradient.
+        // Acrylic: the desktop behind us, blurred, painted under translucent
+        // chrome. Without a frame yet (or with the setting off) a gradient.
         let mut root = div().relative().flex().flex_col().size_full();
-        match (&self.backdrop, self.settings.acrylic) {
-            (Some(path), true) => {
-                let source = ImageSource::Resource(Resource::Path(path.clone().into()));
+        match (self.backdrop.clone(), self.settings.acrylic) {
+            (Some(image), true) => {
                 root = root
                     .child(
-                        img(source)
-                            .object_fit(ObjectFit::Cover)
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(0.0))
-                            .size_full(),
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _cx| {
+                                if let Err(e) = window.paint_image(
+                                    bounds,
+                                    Corners::default(),
+                                    image.clone(),
+                                    0,
+                                    false,
+                                ) {
+                                    eprintln!("[backdrop] paint_image: {e}");
+                                }
+                            },
+                        )
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .size_full(),
                     )
                     // A tint over the picture, as every acrylic recipe has: without
-                    // it a bright patch of wallpaper washes the text out.
+                    // it a bright patch of the desktop washes the text out.
                     .child(
                         div()
                             .absolute()
