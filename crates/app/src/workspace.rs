@@ -358,45 +358,84 @@ impl Workspace {
         else {
             return;
         };
-        // Tiling again needs a pane to place this one beside.
-        let anchor = self
-            .blocks()
-            .into_iter()
-            .find(|b| !b.floating && b.id != block.id)
-            .map(|b| b.id);
         let engine = self.engine.clone();
-        let block_id = block.id;
+        let block_id = block.id.clone();
         let floating = block.floating;
+        // Tiling again means placing the pane beside a *tiled* one, and Rex
+        // needs a real anchor id. Prefer this window, then another tab in the
+        // session; if the whole session is floating, a fresh tab's shell is
+        // created to sit beside.
+        let anchor = self.tiled_anchor(&block_id);
+
         cx.spawn(async move |this, cx| {
-            let (method, payload) = if floating {
-                let Some(anchor) = anchor else { return };
-                (
-                    "session.move_block",
-                    json!({
-                        "session_id": session_id,
-                        "block_id": block_id,
-                        "anchor_block_id": anchor,
-                        "side": "after",
-                        "direction": "horizontal",
-                        "ratio": 0.5,
-                    }),
-                )
+            if !floating {
+                let payload = json!({
+                    "session_id": session_id,
+                    "block_id": block_id,
+                    "bounds": FLOAT_BOUNDS,
+                });
+                if let Err(e) = engine.call(&address, "session.float_block", payload).await {
+                    eprintln!("rexshell: session.float_block: {e}");
+                }
             } else {
-                (
-                    "session.float_block",
-                    json!({
-                        "session_id": session_id,
-                        "block_id": block_id,
-                        "bounds": FLOAT_BOUNDS,
-                    }),
-                )
-            };
-            if let Err(e) = engine.call(&address, method, payload).await {
-                eprintln!("rexshell: {method}: {e}");
+                let anchor = match anchor {
+                    Some(anchor) => Some(anchor),
+                    None => {
+                        // A split needs an anchor, and the whole session is
+                        // floating, so open a tab with a shell to sit beside.
+                        let payload = json!({
+                            "session_id": session_id,
+                            "layout": {"block": {"flavor": "com.superlogical.terminal.shell"}},
+                        });
+                        match engine.call(&address, "session.new_window", payload).await {
+                            Ok(view) => view
+                                .get("block_ids")
+                                .and_then(|ids| ids.as_array())
+                                .and_then(|ids| ids.first())
+                                .and_then(|id| id.as_str())
+                                .map(str::to_owned),
+                            Err(e) => {
+                                eprintln!("rexshell: session.new_window: {e}");
+                                None
+                            }
+                        }
+                    }
+                };
+                let Some(anchor) = anchor else { return };
+                let payload = json!({
+                    "session_id": session_id,
+                    "block_id": block_id,
+                    "anchor_block_id": anchor,
+                    "side": "after",
+                    "direction": "horizontal",
+                    "ratio": 0.5,
+                });
+                if let Err(e) = engine.call(&address, "session.move_block", payload).await {
+                    eprintln!("rexshell: session.move_block: {e}");
+                }
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
         .detach();
+    }
+
+    /// A tiled block to place `block_id` beside: this window first, then any
+    /// other window in the session.
+    fn tiled_anchor(&self, block_id: &str) -> Option<String> {
+        let mut fallback = None;
+        for window in self.windows() {
+            let here = Some(&window.id) == self.window_id.as_ref();
+            for block in window.blocks {
+                if block.floating || block.id == block_id {
+                    continue;
+                }
+                if here {
+                    return Some(block.id);
+                }
+                fallback.get_or_insert(block.id);
+            }
+        }
+        fallback
     }
 
     fn chrome(&self) -> theme::Chrome {
