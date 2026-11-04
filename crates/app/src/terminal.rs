@@ -11,7 +11,7 @@ use gpui::{
 use rexshell_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
 use shrew_core::{Frame, TerminalStatus};
 
-use crate::{keymap, paint};
+use crate::{keymap, paint, shortcuts};
 
 const PAD: f32 = 4.0;
 
@@ -40,6 +40,7 @@ impl TerminalView {
         server: &str,
         session: &str,
         block: &str,
+        font_size: f32,
         cx: &mut Context<Self>,
     ) -> Self {
         let (tx, rx) = async_channel::unbounded();
@@ -65,7 +66,7 @@ impl TerminalView {
             focus: cx.focus_handle(),
             palette: paint::Palette {
                 family: "monospace".into(),
-                font_size: px(14.0),
+                font_size: px(font_size),
             },
         }
     }
@@ -74,7 +75,16 @@ impl TerminalView {
         self.focus.clone()
     }
 
+    pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        self.palette.font_size = px(size);
+        cx.notify();
+    }
+
     fn press(&self, event: &KeyDownEvent) {
+        // Shell shortcuts are not the terminal's: leave them to bubble up.
+        if shortcuts::lookup(&event.keystroke).is_some() {
+            return;
+        }
         let Some(session) = &self.session else { return };
         if let Some(p) = keymap::translate(&event.keystroke) {
             session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta);

@@ -6,4 +6,6 @@ license.workspace = true
 description = "Toolkit-free glue between a Rex server and the rexshell UI"
 
 [dependencies]
+serde_json = "1"
+shrew-client = { git = "https://github.com/teddytennant/shrew", rev = "9cfc45ff91ab1d2283f7514f8a5d0096a0d68690" }
 shrew-core = { workspace = true }

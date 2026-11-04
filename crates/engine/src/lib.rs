@@ -7,6 +7,7 @@ mod grid;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use grid::{fit_grid, Metrics};
 pub use shrew_core::{
@@ -67,6 +68,53 @@ impl Engine {
     /// Add this machine's local Rex server when one is running and none is saved.
     pub fn add_local_server_if_present(&self) -> Option<String> {
         self.shrew.add_local_server_if_present()
+    }
+
+    /// Call a Rex method that `shrew-core` does not wrap — `session.float_block`
+    /// and `session.move_block` today. shrew-core keeps its control connection
+    /// private, so this opens a short-lived one of its own.
+    pub async fn call(
+        &self,
+        address: &str,
+        method: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        use shrew_client::{ConnectOptions, Connection, Endpoint};
+        use shrew_core::ClientInfo;
+
+        let endpoint =
+            Endpoint::parse(address).map_err(|e| CoreError::InvalidAddress(e.to_string()))?;
+        let options = ConnectOptions {
+            client: ClientInfo {
+                kind: Some("app".into()),
+                platform: Some(shrew_client::platform_name().into()),
+                name: Some("rexshell".into()),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+                label: None,
+            },
+            reconnect_token: None,
+            timeout: Duration::from_secs(8),
+        };
+        let method = method.to_owned();
+        self.shrew
+            .runtime()
+            .clone()
+            .spawn(async move {
+                let (connection, _events) = Connection::connect(&endpoint, options).await?;
+                // Session-scoped methods need the connection attached first.
+                let _ = connection
+                    .call(
+                        "session.attach_all",
+                        serde_json::json!({"event_scope": "session"}),
+                    )
+                    .await;
+                let result = connection.call(&method, payload).await;
+                connection.close();
+                result
+            })
+            .await
+            .map_err(|e| CoreError::Server(e.to_string()))?
+            .map_err(|e| CoreError::Server(e.to_string()))
     }
 
     pub fn open_terminal(

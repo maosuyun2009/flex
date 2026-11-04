@@ -4,8 +4,11 @@
 //! shell attaches to a local Rex server if one is running, and otherwise shows
 //! whatever server list it saved last time.
 
+mod icons;
 mod keymap;
 mod paint;
+mod settings;
+mod shortcuts;
 mod terminal;
 mod theme;
 mod win32;

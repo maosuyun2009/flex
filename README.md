@@ -26,7 +26,10 @@ of the multiplexer.
 |---|---|
 | `crates/engine` | Toolkit-free glue over `shrew_core::Shrew`: connects, reconnects, opens terminals, and the pixel→cell arithmetic. **This crate compiles and tests without a GPU.** |
 | `crates/app/src/workspace.rs` | The chrome: title bar, sidebar, tabs, pane area |
-| `crates/app/src/theme.rs` | Palette and metrics, styled after [Pebrel](https://github.com/Kuddev/pebrel) |
+| `crates/app/src/theme.rs` | Palette, metrics and the two chrome finishes, after [Pebrel](https://github.com/Kuddev/pebrel) |
+| `crates/app/src/icons.rs` | Icons drawn from primitives, and the square icon button |
+| `crates/app/src/shortcuts.rs` | The key table that both the matcher and the settings page read |
+| `crates/app/src/settings.rs` | Font size, sidebar, glass; persisted next to the saved servers |
 | `crates/app/src/win32.rs` | The four Win32 calls GPUI has no API for: drag, maximize/restore, minimize, round corners |
 | `crates/app/src/terminal.rs` | One block as an entity: the terminal stream, focus, input |
 | `crates/app/src/paint.rs` | `shrew_core::Frame` → GPUI quads and shaped text runs |
@@ -97,6 +100,39 @@ Window controls are drawn with divs on purpose: `─`, `□` and `✕` are not i
 GPUI's Windows fallback chain, and rendering them as text produced nothing at
 all (found by screenshotting the title bar).
 
+## Shortcuts
+
+`Ctrl-Shift-d` split right · `Ctrl-Shift-e` split down · `Ctrl-Shift-w` close pane
+· `Ctrl-Shift-f` float the pane or tile it again · `Ctrl-Shift-t` new tab ·
+`Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
+matcher and the settings page, so the list you read is the list that works.
+
+Splits and floats are Rex's own: the server holds the layout, this shell only
+sends `session.new_split` / `session.float_block` / `session.move_block` and
+draws the blocks at the fractions it gets back. Another client sees the same
+split immediately.
+
+## Icons and glass
+
+Icons are painted from divs, not shipped as SVG: GPUI would need an
+`AssetSource` and a bundled file per icon, and every icon here is a line or a
+box. The `×` character is used where a diagonal is needed — GPUI 0.2.2 has no
+rotation — which does exist in the Windows fallback chain, unlike `─`, `□` and
+`✕`.
+
+The acrylic is the shell's own, and this is why: GPUI's Windows window is
+`WS_EX_NOREDIRECTIONBITMAP` over DirectComposition, so DWM has no redirection
+surface to frost. Measured on this machine (Windows 11, 150% scaling):
+
+| Attempt | Result |
+| --- | --- |
+| `WindowBackgroundAppearance::Blurred` (legacy accent, acrylic) | every screen capture on the desktop went black |
+| `Transparent` + `DWMWA_SYSTEMBACKDROP_TYPE` (the supported Win11 backdrop) | window composited over black, backdrop never drawn |
+| opaque window, surfaces layered over a gradient | reads as frosted glass, captures fine |
+
+So the window is opaque, the chrome sits at 62-80% alpha over a vertical
+gradient, and Settings offers "Acrylic" for the denser or flatter finish.
+
 ## What works
 
 - Sidebar of servers → sessions; tab bar of windows; panes laid out from the
@@ -109,6 +145,11 @@ all (found by screenshotting the title bar).
 - Reconnect after a drop: the engine resumes the stream and forces a repaint.
 - Window drag, minimize, maximize/restore and close — verified by moving the
   window over synthetic mouse input and reading its rect back.
+- Splits and floats — verified end to end: `ctrl-shift-d` added a second block to
+  the window, `ctrl-shift-f` moved it into a `floating` layer at the bounds the
+  shell asked for.
+- Settings page: font size (live on every open terminal), sidebar, finish; all
+  saved and reloaded from the engine's store.
 
 ## What is not there yet
 

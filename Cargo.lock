@@ -4399,6 +4399,7 @@ dependencies = [
  "async-channel 2.5.0",
  "gpui",
  "rexshell-engine",
+ "serde_json",
  "shrew-core",
  "windows-sys 0.61.2",
 ]
@@ -4407,6 +4408,8 @@ dependencies = [
 name = "rexshell-engine"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+ "shrew-client",
  "shrew-core",
 ]
 
