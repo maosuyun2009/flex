@@ -124,8 +124,17 @@ impl TerminalView {
             return;
         }
         let Some(session) = &self.session else { return };
-        if let Some(p) = keymap::translate(&event.keystroke) {
-            session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta);
+        match keymap::translate(&event.keystroke) {
+            Some(p) => session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta),
+            None => {
+                if std::env::var_os("REXSHELL_DEBUG").is_some() {
+                    let k = &event.keystroke;
+                    eprintln!(
+                        "[key] dropped key={:?} char={:?} mods={:?}",
+                        k.key, k.key_char, k.modifiers
+                    );
+                }
+            }
         }
     }
 }
