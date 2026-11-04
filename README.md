@@ -138,7 +138,7 @@ id is not part of this shell's state — the commit resolves it with a
 `session.view` call first (`session.resize_layer`). A drag therefore costs two
 round trips in total, and none while the pointer is moving.
 
-## Icons and glass
+## Icons and translucency
 
 Icons are painted from divs, not shipped as SVG: GPUI would need an
 `AssetSource` and a bundled file per icon, and every icon here is a line or a
@@ -146,32 +146,29 @@ box. The `×` character is used where a diagonal is needed — GPUI 0.2.2 has no
 rotation — which does exist in the Windows fallback chain, unlike `─`, `□` and
 `✕`.
 
-The acrylic is the shell's own, and that was measured rather than assumed:
+The window is translucent, not see-through, and that is a measured limit rather
+than a preference:
 
 | Attempt | Result on Windows 11, 150% scaling |
 | --- | --- |
-| `WindowBackgroundAppearance::Blurred` (legacy accent, the real acrylic) | every screen capture on the desktop went black |
+| `WindowBackgroundAppearance::Blurred` (the real acrylic) | every screen capture on the desktop went black |
 | `Transparent` + `DWMWA_SYSTEMBACKDROP_TYPE` (the supported Win11 backdrop) | window composited over black; backdrop never drawn |
-| `GPUI_DISABLE_DIRECT_COMPOSITION=true` + `Blurred` | capture fine, but the renderer still writes opaque pixels, so nothing shows through |
+| `GPUI_DISABLE_DIRECT_COMPOSITION=true` | capture fine, but the renderer still writes opaque pixels |
+| GDI capture of the desktop behind the window, painted as the background | worked, and GPUI panicked (`RefCell already borrowed`) as soon as a task delivered the frames — the task is polled from the Win32 message pump while the app is borrowed |
 
-So the shell takes the picture itself (`backdrop.rs`): every 350 ms it grabs the
-client area with GDI, throws away most of the detail, box-blurs it twice, and
-paints the result behind everything with `paint_image`. Chrome sits at 72% alpha
-over it and the terminal at 72% over a tint, so the window reads as one frosted
-sheet of whatever is actually behind it. A coarse 16×16 signature comparison
-skips frames where nothing changed, so an idle desktop costs nothing.
+GPUI always paints opaque pixels on Windows, so nothing behind the window can
+reach the screen without a framework change. What the shell does instead: one
+vertical gradient behind everything (slate at the top, near-black at the
+bottom), chrome surfaces at 72% alpha over it, and the terminal at 72% over the
+same. The window then reads as a single translucent sheet, and text stays
+readable because the gradient is the darkest thing in the stack.
 
-Grabbing the desktop behind the window means the window must not be *in* that
-grab, so it sets `WDA_EXCLUDEFROMCAPTURE` while acrylic is on:
+Measured across the window: `(25,31,37)` at the top, `(17,20,24)` at the bottom,
+identical in the sidebar and the terminal — one sheet, not two panels. The
+Settings switch labelled **Translucent** turns the gradient off and leaves flat
+surfaces.
 
-> While acrylic is enabled, this window does not appear in your own screenshots
-> or screen shares. Turning the Acrylic setting off releases the exclusion and
-> falls back to a gradient.
-
-Costs: the capture is a 1651×950 BitBlt plus a downscale and two blurs, every
-350 ms, at about 0.1% of one core here.
-
-## Terminal theme## Terminal theme
+## Terminal theme## Terminal theme## Terminal theme
 
 The terminal is themed to the same palette as the chrome rather than keeping the
 server's Ghostty defaults: `THEME` in `crates/app/src/terminal.rs` sets the

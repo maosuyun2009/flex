@@ -11,10 +11,9 @@ use std::sync::Arc;
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, hsla, img, linear_color_stop, linear_gradient, px, relative, AnyElement, App,
-    Context, Entity, ImageSource, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, Resource, SharedString, Size,
-    Task, Window,
+    canvas, div, hsla, linear_color_stop, linear_gradient, px, relative, AnyElement, App, Context,
+    Entity, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, Render, SharedString, Size, Task, Window,
 };
 use rexshell_engine::{AppState, BlockState, Connectivity, Engine, SessionState, WindowState};
 use serde_json::json;
@@ -58,8 +57,6 @@ pub struct Workspace {
     settings: Settings,
     /// The terminal font, resolved once at startup from what is installed.
     font: SharedString,
-    /// A blurred copy of the wallpaper, painted behind the translucent chrome.
-    backdrop: Option<std::path::PathBuf>,
     server_id: Option<String>,
     session_id: Option<String>,
     window_id: Option<String>,
@@ -82,11 +79,6 @@ impl Workspace {
     pub fn new(engine: Arc<Engine>, wake: Receiver<()>, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load(&engine);
         let font = crate::fonts::resolve(cx);
-        let backdrop = if settings.acrylic {
-            crate::backdrop::generate()
-        } else {
-            None
-        };
         if std::env::var_os("REXSHELL_DEBUG").is_some() {
             eprintln!("[font] using {font}");
         }
@@ -95,7 +87,6 @@ impl Workspace {
             state: AppState::default(),
             settings,
             font,
-            backdrop,
             server_id: None,
             session_id: None,
             window_id: None,
@@ -897,8 +888,8 @@ impl Workspace {
             }
         }
 
-        // No background here: the window's backdrop has to reach the terminal,
-        // and an opaque layer under the canvas swallowed it.
+        // Left transparent so the window's gradient reaches the terminal: an
+        // opaque layer here would flatten the glass.
         let mut area = div().relative().flex_1().children(elements);
 
         // While a pane is being pulled, the window reports pointer movement: a
@@ -1135,45 +1126,24 @@ impl Render for Workspace {
             None
         };
 
-        // Acrylic: a blurred wallpaper behind translucent chrome. Without one
-        // (no wallpaper, or the setting off) fall back to the gradient.
-        let mut root = div().relative().flex().flex_col().size_full();
-        match (&self.backdrop, self.settings.acrylic) {
-            (Some(path), true) => {
-                let source = ImageSource::Resource(Resource::Path(path.clone().into()));
-                root = root
-                    .child(
-                        img(source)
-                            .object_fit(ObjectFit::Cover)
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(0.0))
-                            .size_full(),
-                    )
-                    // A tint over the picture, as every acrylic recipe has: without
-                    // it a bright patch of wallpaper washes the text out.
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(0.0))
-                            .size_full()
-                            .bg(hsla(0.6, 0.12, 0.06, 0.42)),
-                    );
-            }
-            _ => {
-                let background = if self.settings.acrylic {
-                    linear_gradient(
-                        160.0,
-                        linear_color_stop(hsla(0.6, 0.16, 0.11, 1.0), 0.0),
-                        linear_color_stop(theme::bg(), 1.0),
-                    )
-                } else {
-                    theme::bg().into()
-                };
-                root = root.bg(background);
-            }
-        }
+        // Semi-transparent, not see-through: GPUI paints opaque pixels on
+        // Windows, so the glass is the shell's own — a gradient behind surfaces
+        // that are only partly opaque. `Chrome::glass` carries the alphas.
+        let background = if self.settings.acrylic {
+            linear_gradient(
+                180.0,
+                linear_color_stop(hsla(0.58, 0.22, 0.27, 1.0), 0.0),
+                linear_color_stop(hsla(0.62, 0.16, 0.09, 1.0), 1.0),
+            )
+        } else {
+            theme::bg().into()
+        };
+        let root = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(background);
 
         root.text_color(theme::text())
             .text_sm()

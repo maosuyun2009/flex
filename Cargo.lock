@@ -4398,7 +4398,6 @@ version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
  "gpui",
- "image",
  "rexshell-engine",
  "serde_json",
  "shrew-core",

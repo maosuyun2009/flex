@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 async-channel = "2"
 gpui = "0.2.2"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde_json = "1"
 rexshell-engine = { workspace = true }
 shrew-core = { workspace = true }
