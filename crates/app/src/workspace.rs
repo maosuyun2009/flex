@@ -71,6 +71,9 @@ pub struct Workspace {
     pull: Option<Pull>,
     /// Keeps a released pane where it was dropped until the server confirms.
     settled: Option<(String, [f64; 4])>,
+    /// Where each floating pane sat before it was floated, so tiling it again
+    /// can put it back on the same side with roughly the same share.
+    float_rects: std::collections::HashMap<String, [f64; 4]>,
     _wake: Option<Task<()>>,
 }
 
@@ -96,6 +99,7 @@ impl Workspace {
             show_settings: false,
             pull: None,
             settled: None,
+            float_rects: std::collections::HashMap::new(),
             _wake: None,
         };
         this.reload(cx);
@@ -366,6 +370,10 @@ impl Workspace {
         // session; if the whole session is floating, a fresh tab's shell is
         // created to sit beside.
         let anchor = self.tiled_anchor(&block_id);
+        if !floating {
+            self.float_rects.insert(block_id.clone(), block.rect);
+        }
+        let hint = self.float_rects.remove(&block_id);
 
         cx.spawn(async move |this, cx| {
             if !floating {
@@ -402,13 +410,17 @@ impl Workspace {
                     }
                 };
                 let Some(anchor) = anchor else { return };
+                // Put it back on the side it came from, with roughly the share it
+                // had. Rex only takes a side and a ratio, not a saved layout.
+                let (side, direction, ratio) =
+                    hint.map(split_hint).unwrap_or(("after", "horizontal", 0.5));
                 let payload = json!({
                     "session_id": session_id,
                     "block_id": block_id,
                     "anchor_block_id": anchor,
-                    "side": "after",
-                    "direction": "horizontal",
-                    "ratio": 0.5,
+                    "side": side,
+                    "direction": direction,
+                    "ratio": ratio,
                 });
                 if let Err(e) = engine.call(&address, "session.move_block", payload).await {
                     eprintln!("rexshell: session.move_block: {e}");
@@ -1410,4 +1422,56 @@ fn floating_layer_id(view: &serde_json::Value, block_id: &str) -> Option<String>
         }
     }
     None
+}
+
+/// Which side of its neighbour a pane sat on, and how much of the space it took,
+/// from the rect it had before being floated.
+///
+/// `move_block` takes a side and the share the *before* half gets, so a pane on
+/// the right of a 30/70 split comes back as `after` with a ratio of 0.3.
+fn split_hint([x, y, w, h]: [f64; 4]) -> (&'static str, &'static str, f64) {
+    // Taller than wide means it was divided left/right.
+    let (side, direction, ratio) = if h >= w {
+        if x < 0.5 {
+            ("before", "horizontal", w)
+        } else {
+            ("after", "horizontal", x)
+        }
+    } else if y < 0.5 {
+        ("before", "vertical", h)
+    } else {
+        ("after", "vertical", y)
+    };
+    (side, direction, ratio.clamp(0.05, 0.95))
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_hint;
+
+    #[test]
+    fn remembers_the_side_and_share() {
+        // Right half of an even split.
+        assert_eq!(
+            split_hint([0.5, 0.0, 0.5, 1.0]),
+            ("after", "horizontal", 0.5)
+        );
+        // Left 30%.
+        assert_eq!(
+            split_hint([0.0, 0.0, 0.3, 1.0]),
+            ("before", "horizontal", 0.3)
+        );
+        // Top 40%.
+        assert_eq!(
+            split_hint([0.0, 0.0, 1.0, 0.4]),
+            ("before", "vertical", 0.4)
+        );
+        // Bottom quarter.
+        assert_eq!(
+            split_hint([0.0, 0.75, 1.0, 0.25]),
+            ("after", "vertical", 0.75)
+        );
+        // A lone pane cannot ask for the whole space back.
+        assert_eq!(split_hint([0.0, 0.0, 1.0, 1.0]).2, 0.95);
+    }
 }

@@ -126,6 +126,12 @@ all (found by screenshotting the title bar).
 `Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
 matcher and the settings page, so the list you read is the list that works.
 
+Floating a pane remembers the rect it had, so tiling it again puts it back on
+the same side with roughly its old share (`split_hint`): a pane from the right of
+a 30/70 split returns as `after` with a ratio of 0.3, not a flat 50/50. Rex takes
+only a side and a ratio, not a saved layout, so a nested split comes back one
+level deep.
+
 Splits and floats are Rex's own: the server holds the layout, this shell only
 sends `session.new_split` / `session.float_block` / `session.move_block` and
 draws the blocks at the fractions it gets back. Another client sees the same
