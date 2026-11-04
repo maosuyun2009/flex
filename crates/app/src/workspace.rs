@@ -623,7 +623,79 @@ impl Workspace {
 
     fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let chrome = self.chrome();
-        let mut rows: Vec<AnyElement> = vec![theme::section("SESSIONS").into_any_element()];
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        // Agents first: the whole point is to see who needs you without
+        // hunting through sessions and tabs. Ordered by urgency by the engine.
+        let agents = self.state.attention();
+        if !agents.is_empty() {
+            rows.push(theme::section("AGENTS").into_any_element());
+            for item in agents {
+                let agent = item.block.agent.clone();
+                let Some(agent) = agent else { continue };
+                let (server, session, window, block) = (
+                    item.server_id.clone(),
+                    item.session_id.clone(),
+                    item.window_id.clone(),
+                    item.block.id.clone(),
+                );
+                let name = if agent.app.is_empty() {
+                    item.block.display_name()
+                } else {
+                    agent.app.clone()
+                };
+                let state_label = match agent.state {
+                    shrew_core::AgentState::Idle => "idle",
+                    shrew_core::AgentState::Working => "working",
+                    shrew_core::AgentState::Blocked => "blocked",
+                    shrew_core::AgentState::Error => "failed",
+                    shrew_core::AgentState::Done => "done",
+                };
+                let detail = agent
+                    .waiting_for
+                    .clone()
+                    .unwrap_or_else(|| item.session_label.clone());
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("agent:{block}")))
+                        .mx_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(theme::text())
+                        .hover(|el| el.bg(chrome.hover()))
+                        .child(theme::dot(theme::agent(agent.state)))
+                        // The name keeps its width; the detail gives way, so an
+                        // agent is never shown as "claud".
+                        .child(div().flex_none().child(name))
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(format!("{state_label} · {detail}")),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.server_id = Some(server.clone());
+                                this.session_id = Some(session.clone());
+                                this.window_id = Some(window.clone());
+                                this.active_block = Some(block.clone());
+                                this.pending_focus = Some(block.clone());
+                                this.reload(cx);
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        rows.push(theme::section("SESSIONS").into_any_element());
         for server in &self.state.servers {
             let dot = match server.connectivity {
                 Connectivity::Online => theme::accent(),
@@ -675,12 +747,15 @@ impl Workspace {
                                 .text_color(theme::muted())
                                 .child(session.block_count().to_string()),
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.session_id = Some(id.clone());
-                            this.window_id = None;
-                            this.active_block = None;
-                            this.reload(cx);
-                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.session_id = Some(id.clone());
+                                this.window_id = None;
+                                this.active_block = None;
+                                this.reload(cx);
+                            }),
+                        )
                         .into_any_element(),
                 );
             }
@@ -725,12 +800,15 @@ impl Workspace {
                         el.child(theme::dot(theme::agent(state)))
                     })
                     .child(window.label.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.window_id = Some(id.clone());
-                        this.active_block = None;
-                        this.focus_window(&id, cx);
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.window_id = Some(id.clone());
+                            this.active_block = None;
+                            this.focus_window(&id, cx);
+                            cx.notify();
+                        }),
+                    )
                     .into_any_element()
             })
             .collect()

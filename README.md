@@ -182,11 +182,23 @@ server keeps the record. The shell reads it from `BlockState::agent`:
 | error | amber |
 | done | blue |
 
-Sessions aggregate with the most urgent state among their panes (GPUI's
-`max()` over the state order), so a session that has one blocked agent shows
-red even while three others are idle. The dot sits on the session row in the
-sidebar and on each tab chip, so a split with several agents still tells you
-which one needs you.
+The sidebar opens with an **AGENTS** section, ordered most urgent first by the
+engine (`AppState::attention`), listing every pane that reports a status with its
+app name, state word, and — when blocked — what it is waiting for:
+
+```
+AGENTS
+  ● claude   blocked · permission
+  ● codex    working · Demo
+SESSIONS
+  ● Demo  3
+```
+
+Clicking a row jumps to that pane: it selects the pane's server, session and
+window, and hands it focus. Below it, sessions aggregate with the most urgent
+state among their panes (GPUI's `max()` over the state order), so a session with
+one blocked agent shows red even while three others are idle, and each tab chip
+carries the same dot so a split still says which pane needs you.
 
 Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
 on the server installs that for the harnesses Rex knows (claude, codex, opencode,
@@ -207,11 +219,23 @@ server keeps the record. The shell reads it from `BlockState::agent`:
 | error | amber |
 | done | blue |
 
-Sessions aggregate with the most urgent state among their panes (GPUI's
-`max()` over the state order), so a session that has one blocked agent shows
-red even while three others are idle. The dot sits on the session row in the
-sidebar and on each tab chip, so a split with several agents still tells you
-which one needs you.
+The sidebar opens with an **AGENTS** section, ordered most urgent first by the
+engine (`AppState::attention`), listing every pane that reports a status with its
+app name, state word, and — when blocked — what it is waiting for:
+
+```
+AGENTS
+  ● claude   blocked · permission
+  ● codex    working · Demo
+SESSIONS
+  ● Demo  3
+```
+
+Clicking a row jumps to that pane: it selects the pane's server, session and
+window, and hands it focus. Below it, sessions aggregate with the most urgent
+state among their panes (GPUI's `max()` over the state order), so a session with
+one blocked agent shows red even while three others are idle, and each tab chip
+carries the same dot so a split still says which pane needs you.
 
 Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
 on the server installs that for the harnesses Rex knows (claude, codex, opencode,
@@ -232,11 +256,23 @@ server keeps the record. The shell reads it from `BlockState::agent`:
 | error | amber |
 | done | blue |
 
-Sessions aggregate with the most urgent state among their panes (GPUI's
-`max()` over the state order), so a session that has one blocked agent shows
-red even while three others are idle. The dot sits on the session row in the
-sidebar and on each tab chip, so a split with several agents still tells you
-which one needs you.
+The sidebar opens with an **AGENTS** section, ordered most urgent first by the
+engine (`AppState::attention`), listing every pane that reports a status with its
+app name, state word, and — when blocked — what it is waiting for:
+
+```
+AGENTS
+  ● claude   blocked · permission
+  ● codex    working · Demo
+SESSIONS
+  ● Demo  3
+```
+
+Clicking a row jumps to that pane: it selects the pane's server, session and
+window, and hands it focus. Below it, sessions aggregate with the most urgent
+state among their panes (GPUI's `max()` over the state order), so a session with
+one blocked agent shows red even while three others are idle, and each tab chip
+carries the same dot so a split still says which pane needs you.
 
 Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
 on the server installs that for the harnesses Rex knows (claude, codex, opencode,
