@@ -70,6 +70,10 @@ impl TerminalView {
         }
     }
 
+    pub fn handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
     fn press(&self, event: &KeyDownEvent) {
         let Some(session) = &self.session else { return };
         if let Some(p) = keymap::translate(&event.keystroke) {
@@ -89,6 +93,18 @@ impl Render for TerminalView {
         };
 
         self.frame = session.frame();
+        // REXSHELL_DEBUG=1 explains an empty pane: no frames means the stream is
+        // dead, frames with no lines means the snapshot failed to restore.
+        if debug() {
+            let f = &self.frame;
+            eprintln!(
+                "[frame] {}x{} lines={} cursor={:?}",
+                f.cols,
+                f.rows,
+                f.lines.len(),
+                f.cursor
+            );
+        }
         let frame = self.frame.clone();
         let palette = paint::Palette {
             family: self.palette.family.clone(),
@@ -157,6 +173,10 @@ fn measure(cx: &mut App, palette: &paint::Palette) -> Metrics {
         cell_w: advance as f64,
         cell_h: (ascent + descent + 1.0) as f64,
     }
+}
+
+fn debug() -> bool {
+    std::env::var_os("REXSHELL_DEBUG").is_some()
 }
 
 fn empty_frame() -> Frame {

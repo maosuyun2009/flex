@@ -103,6 +103,13 @@ Deliberately, so the first version stays readable:
 - **Add/remove server UI.** Set an address on the command line or let it save
   from the last run.
 - Notifications, agent "needs you" inbox, file viewer, themes, font settings.
+- The cursor is a solid block behind the glyph and does not blink, so on the
+  last row it can look clipped at the pane edge.
+- Very fast synthetic input (a `SendKeys` burst) can interleave; typing by hand
+  is clean.
+
+Set `REXSHELL_DEBUG=1` to log one line per rendered frame — the quickest way to
+tell a dead stream from a failed snapshot restore.
 
 ## Verification
 

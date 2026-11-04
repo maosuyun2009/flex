@@ -33,8 +33,17 @@ fn main() {
 
         match &address {
             Some(address) => {
-                if let Err(e) = engine.add_server("", address) {
-                    eprintln!("rexshell: {address}: {e}");
+                // Addresses are saved between runs; adding one again would leave
+                // a duplicate entry, and each duplicate is another connection.
+                let saved = engine
+                    .state()
+                    .servers
+                    .iter()
+                    .any(|s| s.address.trim() == address.trim());
+                if !saved {
+                    if let Err(e) = engine.add_server("", address) {
+                        eprintln!("rexshell: {address}: {e}");
+                    }
                 }
             }
             None => {
@@ -44,6 +53,10 @@ fn main() {
 
         let bounds = Bounds::centered(None, size(px(1280.0), px(760.0)), cx);
         let options = WindowOptions {
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("rexshell".into()),
+                ..Default::default()
+            }),
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()
         };

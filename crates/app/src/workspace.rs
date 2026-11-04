@@ -4,7 +4,7 @@
 //! Every pane is placed from `BlockState::rect`, which the server sends as
 //! fractions of its window, so splits, floats and zoom all come for free.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_channel::Receiver;
@@ -24,6 +24,7 @@ pub struct Workspace {
     session_id: Option<String>,
     window_id: Option<String>,
     terminals: HashMap<String, Entity<TerminalView>>,
+    focused_once: bool,
     _wake: Option<Task<()>>,
 }
 
@@ -36,6 +37,7 @@ impl Workspace {
             session_id: None,
             window_id: None,
             terminals: HashMap::new(),
+            focused_once: false,
             _wake: None,
         };
         this.reload(cx);
@@ -75,8 +77,19 @@ impl Workspace {
             self.window_id = windows.first().map(|w| w.id.clone());
         }
 
-        let live: Vec<String> = self.blocks().iter().map(|b| b.id.clone()).collect();
-        self.terminals.retain(|id, _| live.iter().any(|l| l == id));
+        // Drop only blocks the engine no longer has anywhere. Pruning to the
+        // visible window re-opened a stream on every state change, which fed
+        // itself: each open changed state and pruned the terminal again.
+        let live: HashSet<String> = self
+            .state
+            .servers
+            .iter()
+            .flat_map(|s| &s.sessions)
+            .flat_map(|s| &s.windows)
+            .flat_map(|w| &w.blocks)
+            .map(|b| b.id.clone())
+            .collect();
+        self.terminals.retain(|id, _| live.contains(id));
         cx.notify();
     }
 
@@ -195,7 +208,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn panes(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(session_id) = self.session_id.clone() else {
             return div()
                 .size_full()
@@ -232,12 +245,28 @@ impl Workspace {
             })
             .collect();
 
-        let panes: Vec<AnyElement> = self
+        let views: Vec<([f64; 4], Entity<TerminalView>)> = self
             .blocks()
             .into_iter()
             .map(|block| {
                 let view = self.terminal(&server_id, &session_id, &block.id, cx);
-                let [x, y, w, h] = block.rect;
+                (block.rect, view)
+            })
+            .collect();
+
+        // A window with nothing focused swallows every keystroke, and nothing
+        // else here can take focus, so give it to the first pane.
+        if !self.focused_once {
+            if let Some((_, view)) = views.first() {
+                window.focus(&view.read(cx).handle());
+                self.focused_once = true;
+            }
+        }
+
+        let panes: Vec<AnyElement> = views
+            .into_iter()
+            .map(|(rect, view)| {
+                let [x, y, w, h] = rect;
                 div()
                     .absolute()
                     .left(relative(x as f32))
@@ -268,9 +297,9 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = self.sidebar(cx);
-        let panes = self.panes(cx);
+        let panes = self.panes(window, cx);
         div()
             .flex()
             .size_full()
