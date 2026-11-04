@@ -39,13 +39,16 @@ You need Rust 1.90+, a C toolchain, and **Zig 0.17** on `PATH` (or in `ZIG`):
 `shrew-term` builds the real Ghostty VT engine from source.
 
 ```powershell
-# Windows
-rustup default stable
-winget install zig.zig          # or unzip a release and add it to PATH
-cargo build --release
+# Windows: rustup toolchain + Zig, both installed off C:
+rustup-init.exe -y --no-modify-path --profile minimal --default-toolchain stable
+# then unzip zig 0.17 next to it and add it to PATH
+
+build.bat build --release
 ```
 
-First build is slow: it compiles Ghostty and ~500 crates.
+`build.bat` points `RUSTUP_HOME` / `CARGO_HOME` at D:, adds Zig to `PATH`, and
+calls MSVC's `vcvars64.bat` before handing its arguments to `cargo`. First
+build compiles Ghostty and ~460 crates: **18m 37s** here, 17.7 MB exe.
 
 On Linux, `cargo check` currently trips over `xattr v0.2.3` vs `libc v0.2.191`
 (`ENOATTR` was dropped), a known-upstream mismatch pulled in by
@@ -107,5 +110,8 @@ Deliberately, so the first version stays readable:
   is type-checked against real `shrew-core`, including the Ghostty build).
 - `cargo check -p rexshell --target x86_64-pc-windows-gnu` — clean, with Zig as
   the C cross-compiler.
-- **Not yet run on a real Windows machine.** The next step is a real window
-  against a live server; expect GPUI font-metric and DPI surprises there.
+- Built and run on Windows 11 / MSVC 14.41 / Rust 1.99.1: the process opens a
+  window and registers as a Rex client (`rex client ls` shows
+  `rexshell 0.1.0  app  anonymous over tcp`).
+- **Not eyeballed yet**: the desktop was locked during the first run, so
+  font metrics, DPI scaling and the wide-glyph drift are still unconfirmed.
