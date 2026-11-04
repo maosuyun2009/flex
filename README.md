@@ -27,6 +27,7 @@ of the multiplexer.
 | `crates/engine` | Toolkit-free glue over `shrew_core::Shrew`: connects, reconnects, opens terminals, and the pixel→cell arithmetic. **This crate compiles and tests without a GPU.** |
 | `crates/app/src/workspace.rs` | The chrome: title bar, sidebar, tabs, pane area |
 | `crates/app/src/theme.rs` | Palette, metrics and the two chrome finishes, after [Pebrel](https://github.com/Kuddev/pebrel) |
+| `crates/app/src/fonts.rs` | Picks the terminal font from what is installed |
 | `crates/app/src/icons.rs` | Icons drawn from primitives, and the square icon button |
 | `crates/app/src/shortcuts.rs` | The key table that both the matcher and the settings page read |
 | `crates/app/src/settings.rs` | Font size, sidebar, glass; persisted next to the saved servers |
@@ -82,6 +83,24 @@ rex server start --tailscale
 # full access; the Rex docs call this "super dangerous".
 rex server start --extra-listen :7297 --allow-anonymous
 ```
+
+## Terminal font
+
+Maple Mono NF, as asked for, with a fallback chain: `fonts.rs` checks
+`TextSystem::all_font_names` and takes the first of *Maple Mono Normal NF CN*,
+*Maple Mono NF CN*, *Maple Mono Normal NF*, *Maple Mono NF*, *Maple Mono*,
+*Cascadia Mono*, *Consolas*, `monospace`. Naming a family blindly is not enough:
+GPUI resolves through DirectWrite and substitutes *something* when the family is
+missing, possibly a proportional face, which would wreck the grid.
+
+The installed Nerd Font build registers as **Maple Mono Normal NF CN** (from
+`MapleMonoNormal-NF-CN-Regular.ttf` in the per-user font folder), so that is the
+first name tried. The `CN` variant carries CJK glyphs in the same family, which
+also fixes double-width alignment for Chinese text. Only the Regular weight is
+installed here, so bold is synthesised by the platform.
+
+Settings shows which family was actually picked. The shell's own chrome keeps the
+system UI font — Maple Mono is for the terminals.
 
 ## Chrome
 

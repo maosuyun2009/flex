@@ -6,7 +6,7 @@ use async_channel::Sender;
 use gpui::prelude::*;
 use gpui::{
     canvas, div, px, App, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    Render, Window,
+    Render, SharedString, Window,
 };
 use rexshell_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
 use shrew_core::{Frame, TerminalStatus};
@@ -46,6 +46,7 @@ impl TerminalView {
         server: &str,
         session: &str,
         block: &str,
+        font: SharedString,
         font_size: f32,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -72,7 +73,7 @@ impl TerminalView {
             frame: empty_frame(),
             focus: cx.focus_handle(),
             palette: paint::Palette {
-                family: "monospace".into(),
+                family: font,
                 font_size: px(font_size),
             },
         }

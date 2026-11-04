@@ -55,6 +55,8 @@ pub struct Workspace {
     engine: Arc<Engine>,
     state: AppState,
     settings: Settings,
+    /// The terminal font, resolved once at startup from what is installed.
+    font: SharedString,
     server_id: Option<String>,
     session_id: Option<String>,
     window_id: Option<String>,
@@ -76,10 +78,15 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(engine: Arc<Engine>, wake: Receiver<()>, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load(&engine);
+        let font = crate::fonts::resolve(cx);
+        if std::env::var_os("REXSHELL_DEBUG").is_some() {
+            eprintln!("[font] using {font}");
+        }
         let mut this = Self {
             engine,
             state: AppState::default(),
             settings,
+            font,
             server_id: None,
             session_id: None,
             window_id: None,
@@ -226,8 +233,12 @@ impl Workspace {
         }
         let engine = self.engine.clone();
         let font_size = self.settings.font_size;
-        let view =
-            cx.new(|cx| TerminalView::new(&engine, server_id, session_id, block_id, font_size, cx));
+        let font = self.font.clone();
+        let view = cx.new(|cx| {
+            TerminalView::new(
+                &engine, server_id, session_id, block_id, font, font_size, cx,
+            )
+        });
         self.terminals.insert(block_id.to_owned(), view.clone());
         view
     }
@@ -1079,6 +1090,12 @@ impl Workspace {
                             .child(down)
                             .child(up)
                             .into_any_element(),
+                    ))
+                    .child(theme::section("FONT"))
+                    .child(row(
+                        "Terminal",
+                        self.font.to_string(),
+                        div().into_any_element(),
                     ))
                     .child(theme::section("SHORTCUTS"))
                     .children(shortcuts)
