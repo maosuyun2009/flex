@@ -11,8 +11,9 @@ use std::sync::Arc;
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    div, hsla, linear_color_stop, linear_gradient, px, relative, AnyElement, App, Context, Entity,
-    IntoElement, KeyDownEvent, MouseButton, Render, SharedString, Task, Window,
+    canvas, div, hsla, linear_color_stop, linear_gradient, px, relative, AnyElement, App, Context,
+    Entity, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, Render, SharedString, Size, Task, Window,
 };
 use rexshell_engine::{AppState, BlockState, Connectivity, Engine, SessionState, WindowState};
 use serde_json::json;
@@ -26,6 +27,29 @@ use crate::theme;
 /// Where a pane lands when it is floated: centred, leaving the tiled panes
 /// visible around it, the way a floating terminal is usually wanted.
 const FLOAT_BOUNDS: [f64; 4] = [0.14, 0.12, 0.72, 0.7];
+
+/// What the pointer grabbed on a floating pane.
+#[derive(Clone, Copy, PartialEq)]
+enum Grab {
+    Move,
+    Resize,
+}
+
+/// A floating pane being dragged or resized. The rect is applied locally while
+/// the pointer moves and pushed to the server once, on release: Rex needs a
+/// `layer_id` this shell does not carry in its state, so the commit looks it up
+/// in the same round trip.
+#[derive(Clone)]
+struct Pull {
+    block_id: String,
+    grab: Grab,
+    /// Pointer position in window coordinates when the drag started.
+    start: Point<Pixels>,
+    /// The layer's rect at that moment, as window fractions.
+    rect: [f64; 4],
+    /// Where the pane should be drawn now.
+    live: [f64; 4],
+}
 
 pub struct Workspace {
     engine: Arc<Engine>,
@@ -43,6 +67,9 @@ pub struct Workspace {
     focused_once: bool,
     styled: bool,
     show_settings: bool,
+    pull: Option<Pull>,
+    /// Keeps a released pane where it was dropped until the server confirms.
+    settled: Option<(String, [f64; 4])>,
     _wake: Option<Task<()>>,
 }
 
@@ -62,6 +89,8 @@ impl Workspace {
             focused_once: false,
             styled: false,
             show_settings: false,
+            pull: None,
+            settled: None,
             _wake: None,
         };
         this.reload(cx);
@@ -131,6 +160,19 @@ impl Workspace {
             .map(|b| b.id.clone())
             .collect();
         self.terminals.retain(|id, _| live.contains(id));
+
+        // A dropped pane stops being drawn from our own copy as soon as the
+        // server reports a rect that matches it.
+        if let Some((block_id, want)) = &self.settled {
+            let blocks = self.blocks();
+            let agreed = blocks
+                .iter()
+                .find(|b| &b.id == block_id)
+                .is_some_and(|b| b.rect.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.005));
+            if agreed {
+                self.settled = None;
+            }
+        }
         cx.notify();
     }
 
@@ -362,6 +404,126 @@ impl Workspace {
             view.update(cx, |terminal, cx| terminal.set_font_size(size, cx));
         }
         cx.notify();
+    }
+
+    // ---- floating panes ----------------------------------------------------
+
+    fn begin_pull(
+        &mut self,
+        block: &BlockState,
+        grab: Grab,
+        start: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_block = Some(block.id.clone());
+        self.pull = Some(Pull {
+            block_id: block.id.clone(),
+            grab,
+            start,
+            rect: block.rect,
+            live: block.rect,
+        });
+        cx.notify();
+    }
+
+    /// Follow the pointer. Only the local copy moves; the server is told once, on
+    /// release, so a drag costs no round trips.
+    fn drag_to(&mut self, position: Point<Pixels>, area: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(pull) = &mut self.pull else { return };
+        let area_w = f64::from(area.width).max(1.0);
+        let area_h = f64::from(area.height).max(1.0);
+        let dx = f64::from(position.x - pull.start.x) / area_w;
+        let dy = f64::from(position.y - pull.start.y) / area_h;
+        let [x, y, w, h] = pull.rect;
+        pull.live = match pull.grab {
+            Grab::Move => [
+                (x + dx).clamp(0.0, (1.0 - w).max(0.0)),
+                (y + dy).clamp(0.0, (1.0 - h).max(0.0)),
+                w,
+                h,
+            ],
+            Grab::Resize => [
+                x,
+                y,
+                (w + dx).clamp(0.2, 1.0 - x),
+                (h + dy).clamp(0.2, 1.0 - y),
+            ],
+        };
+        cx.notify();
+    }
+
+    fn end_pull(&mut self, cx: &mut Context<Self>) {
+        let Some(pull) = self.pull.take() else { return };
+        if pull.live == pull.rect {
+            cx.notify();
+            return;
+        }
+        self.settled = Some((pull.block_id.clone(), pull.live));
+        let (Some(address), Some(session_id)) = (self.address(), self.session_id.clone()) else {
+            cx.notify();
+            return;
+        };
+        let engine = self.engine.clone();
+        let block_id = pull.block_id;
+        let bounds = pull.live;
+        cx.spawn(async move |this, cx| {
+            // Rex moves a *layer*, and a layer id is not part of this shell's
+            // state, so resolve it from the session view in the same trip.
+            let view = match engine
+                .call(&address, "session.view", json!({"session_id": session_id}))
+                .await
+            {
+                Ok(view) => view,
+                Err(e) => {
+                    eprintln!("rexshell: session.view: {e}");
+                    this.update(cx, |me, cx| {
+                        me.settled = None;
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let Some(layer_id) = floating_layer_id(&view, &block_id) else {
+                this.update(cx, |me, cx| {
+                    me.settled = None;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+            let payload = json!({
+                "session_id": session_id,
+                "layer_id": layer_id,
+                "bounds": bounds,
+            });
+            if let Err(e) = engine.call(&address, "session.resize_layer", payload).await {
+                eprintln!("rexshell: session.resize_layer: {e}");
+                this.update(cx, |me, cx| {
+                    me.settled = None;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The rect to draw a block at: our own copy while it is being pulled or has
+    /// just been dropped, the server's otherwise.
+    fn rect_of(&self, block: &BlockState) -> [f64; 4] {
+        if let Some(pull) = &self.pull {
+            if pull.block_id == block.id {
+                return pull.live;
+            }
+        }
+        if let Some((block_id, rect)) = &self.settled {
+            if block_id == &block.id {
+                return *rect;
+            }
+        }
+        block.rect
     }
 
     // ---- chrome ------------------------------------------------------------
@@ -603,11 +765,12 @@ impl Workspace {
         }
 
         let active = self.active_block.clone();
+        let chrome = self.chrome();
         let mut elements: Vec<AnyElement> = Vec::with_capacity(views.len());
         // Floating layers paint last, so they sit above the tiled panes.
         for floating_pass in [false, true] {
             for (block, view) in views.iter().filter(|(b, _)| b.floating == floating_pass) {
-                let [x, y, w, h] = block.rect;
+                let [x, y, w, h] = self.rect_of(block);
                 let is_active = active.as_deref() == Some(block.id.as_str());
                 let outline = if is_active {
                     theme::accent()
@@ -615,6 +778,78 @@ impl Workspace {
                     theme::border()
                 };
                 let block_id = block.id.clone();
+                let floating = block.floating;
+                let activate_id = block_id.clone();
+
+                let body = if floating {
+                    // A floating pane carries its own little title bar: that is
+                    // where it is grabbed, and the corner is where it resizes.
+                    let drag_block = block.clone();
+                    let resize_block = block.clone();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .h(px(24.0))
+                                .px_2()
+                                .bg(chrome.surface())
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .child(icons::icon(Icon::Float, px(11.0), theme::muted()))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(block.display_name()),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        this.begin_pull(&drag_block, Grab::Move, event.position, cx)
+                                    }),
+                                ),
+                        )
+                        .child(view.clone())
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .size(px(14.0))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right(px(2.0))
+                                        .bottom(px(2.0))
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .border_r_1()
+                                        .border_b_1()
+                                        .border_color(theme::muted()),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        this.begin_pull(
+                                            &resize_block,
+                                            Grab::Resize,
+                                            event.position,
+                                            cx,
+                                        )
+                                    }),
+                                ),
+                        )
+                } else {
+                    div().size_full().child(view.clone())
+                };
+
                 let pane = div()
                     .id(SharedString::from(block_id.clone()))
                     .absolute()
@@ -624,14 +859,12 @@ impl Workspace {
                     .h(relative(h as f32))
                     .border_1()
                     .border_color(outline)
-                    .when(block.floating, |el| {
-                        el.shadow_lg().rounded_md().bg(theme::bg())
-                    })
-                    .child(view.clone())
+                    .when(floating, |el| el.shadow_lg().rounded_md())
+                    .child(body)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.active_block = Some(block_id.clone());
+                            this.active_block = Some(activate_id.clone());
                             cx.notify();
                         }),
                     );
@@ -639,12 +872,40 @@ impl Workspace {
             }
         }
 
-        div()
-            .relative()
-            .flex_1()
-            .bg(theme::bg())
-            .children(elements)
-            .into_any_element()
+        let mut area = div().relative().flex_1().bg(theme::bg()).children(elements);
+
+        // While a pane is being pulled, the window reports pointer movement: a
+        // drag that leaves the pane still has to track, and the listeners only
+        // live for one frame, so they are registered from a paint callback.
+        if self.pull.is_some() {
+            let workspace = cx.entity().downgrade();
+            let mover = workspace.clone();
+            area = area.child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _cx| {
+                        let size = bounds.size;
+                        let this = mover.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseMoveEvent, _phase, _window, cx| {
+                                let _ =
+                                    this.update(cx, |me, cx| me.drag_to(event.position, size, cx));
+                            },
+                        );
+                        let this = workspace.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, _phase, _window, cx| {
+                            if event.button == MouseButton::Left {
+                                let _ = this.update(cx, |me, cx| me.end_pull(cx));
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+        }
+
+        area.into_any_element()
     }
 
     fn settings_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -958,4 +1219,30 @@ fn control(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, window, cx| action(window, cx))
         .into_any_element()
+}
+
+/// The floating layer that holds `block_id`, from a `session.view` result.
+fn floating_layer_id(view: &serde_json::Value, block_id: &str) -> Option<String> {
+    for window in view.get("windows")?.as_array()? {
+        for layer in window.get("layers")?.as_array()? {
+            if layer.get("kind").and_then(|k| k.as_str()) != Some("floating") {
+                continue;
+            }
+            let holds = layer
+                .get("blocks")
+                .and_then(|b| b.as_array())
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b.get("block_id").and_then(|v| v.as_str()) == Some(block_id))
+                });
+            if holds {
+                return layer
+                    .get("layer_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+            }
+        }
+    }
+    None
 }

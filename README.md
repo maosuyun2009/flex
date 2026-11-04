@@ -112,6 +112,13 @@ sends `session.new_split` / `session.float_block` / `session.move_block` and
 draws the blocks at the fractions it gets back. Another client sees the same
 split immediately.
 
+A floating pane carries its own title bar and a corner grip: drag the bar to
+move it, drag the corner to resize. The drag is drawn from a local copy of the
+rect and committed once on release, because Rex resizes a *layer* and the layer
+id is not part of this shell's state — the commit resolves it with a
+`session.view` call first (`session.resize_layer`). A drag therefore costs two
+round trips in total, and none while the pointer is moving.
+
 ## Icons and glass
 
 Icons are painted from divs, not shipped as SVG: GPUI would need an
@@ -148,6 +155,10 @@ gradient, and Settings offers "Acrylic" for the denser or flatter finish.
 - Splits and floats — verified end to end: `ctrl-shift-d` added a second block to
   the window, `ctrl-shift-f` moved it into a `floating` layer at the bounds the
   shell asked for.
+- Floating pane drag and resize — verified against the server: dragging the
+  title bar moved the layer from `[0.14, 0.12, …]` to `[0.28, 0.30, …]`, and
+  dragging the corner grip resized it to `[0.148, 0.112, 0.48, 0.447]` with the
+  position unchanged.
 - Settings page: font size (live on every open terminal), sidebar, finish; all
   saved and reloaded from the engine's store.
 
