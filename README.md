@@ -134,8 +134,9 @@ level deep.
 
 ### Prefix tools
 
-`Ctrl-Shift-Space` arms a prefix; the next bare key opens a tool beside the
-active pane, herdr-style:
+`Ctrl-Shift-Space` arms a prefix; the next bare key opens a tool as a **floating
+terminal** over the window (`session.new_layer`, bounds 64% × 72%, centred), so
+the layout underneath is untouched and closing it leaves no hole. herdr-style:
 
 | Key | Opens |
 | --- | --- |

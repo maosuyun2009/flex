@@ -61,6 +61,10 @@ struct PendingPick {
 /// visible around it, the way a floating terminal is usually wanted.
 const FLOAT_BOUNDS: [f64; 4] = [0.14, 0.12, 0.72, 0.7];
 
+/// Where a tool (lazygit, a picker) opens as a floating terminal: centred, with
+/// the panes still visible around it.
+const TOOL_BOUNDS: [f64; 4] = [0.18, 0.1, 0.64, 0.72];
+
 /// What the pointer grabbed on a floating pane.
 #[derive(Clone, Copy, PartialEq)]
 enum Grab {
@@ -512,12 +516,12 @@ impl Workspace {
         if !origin.pwd.is_empty() {
             options["cwd"] = json!(origin.pwd);
         }
+        // A floating terminal, not a split: it covers the work, and closing it
+        // leaves the layout exactly as it was.
         let payload = json!({
             "session_id": session_id,
-            "block_id": origin.id,
-            "side": "after",
-            "direction": "horizontal",
-            "ratio": 0.42,
+            "window_id": self.window_id,
+            "bounds": TOOL_BOUNDS,
             "layout": {
                 "block": {
                     "flavor": "com.superlogical.terminal.shell",
@@ -529,7 +533,7 @@ impl Workspace {
         let engine = self.engine.clone();
         let origin_block = origin.id;
         cx.spawn(async move |this, cx| {
-            match engine.call(&address, "session.new_split", payload).await {
+            match engine.call(&address, "session.new_layer", payload).await {
                 Ok(view) => {
                     let block = view
                         .pointer("/block_ids/0")
@@ -552,7 +556,7 @@ impl Workspace {
                         .ok();
                     }
                 }
-                Err(e) => eprintln!("rexshell: session.new_split: {e}"),
+                Err(e) => eprintln!("rexshell: session.new_layer: {e}"),
             }
         })
         .detach();
