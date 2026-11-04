@@ -15,7 +15,13 @@ use crate::{keymap, paint, shortcuts};
 
 const PAD: f32 = 4.0;
 
+/// Line height in em, i.e. a multiple of the font size. The glyph box
+/// (ascent + descent) is only ~0.78 em, so using it alone sets lines almost
+/// touching; 1.3 em is a comfortable terminal pitch. Raise this for more air.
+const LINE_HEIGHT_EM: f32 = 1.3;
+
 pub struct TerminalView {
+    block_id: String,
     session: Option<Arc<TerminalSession>>,
     error: Option<String>,
     frame: Frame,
@@ -60,6 +66,7 @@ impl TerminalView {
             .detach();
         }
         Self {
+            block_id: block.to_owned(),
             session,
             error,
             frame: empty_frame(),
@@ -131,6 +138,9 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _cx| {
+                    if std::env::var_os("REXSHELL_DEBUG").is_some() {
+                        eprintln!("[hit] terminal {}", this.block_id);
+                    }
                     window.focus(&this.focus);
                     // Claim the size so the server reflows this terminal to this window.
                     if let Some(session) = &this.session {
@@ -148,8 +158,8 @@ impl Render for TerminalView {
                         prepaint_session.set_device_grid(
                             cols,
                             rows,
-                            metrics.cell_w as u32,
-                            metrics.cell_h as u32,
+                            metrics.cell_w.round() as u32,
+                            metrics.cell_h.round() as u32,
                         );
                         metrics
                     },
@@ -179,9 +189,11 @@ fn measure(cx: &mut App, palette: &paint::Palette) -> Metrics {
         .unwrap_or(8.0);
     let ascent: f32 = text_system.ascent(font_id, palette.font_size).into();
     let descent: f32 = text_system.descent(font_id, palette.font_size).into();
+    let glyph_box = ascent + descent;
+    let font_size: f32 = palette.font_size.into();
     Metrics {
         cell_w: advance as f64,
-        cell_h: (ascent + descent + 1.0) as f64,
+        cell_h: (font_size * LINE_HEIGHT_EM).max(glyph_box + 1.0) as f64,
     }
 }
 

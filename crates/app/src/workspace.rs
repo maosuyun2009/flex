@@ -865,6 +865,11 @@ impl Workspace {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             this.active_block = Some(activate_id.clone());
+                            // GPUI walks every hitbox under the pointer until one
+                            // stops the event. A floating pane sits over a tiled
+                            // one, so without this the tiled terminal below also
+                            // got the click and took focus from the floating one.
+                            cx.stop_propagation();
                             cx.notify();
                         }),
                     );
