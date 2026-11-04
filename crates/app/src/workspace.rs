@@ -153,28 +153,9 @@ impl Workspace {
         .detach();
     }
 
-    fn status_line(&self) -> String {
-        let server = self
-            .state
-            .server(self.server_id.as_deref().unwrap_or_default())
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
-        let session = self
-            .sessions()
-            .into_iter()
-            .find(|s| Some(&s.id) == self.session_id.as_ref())
-            .map(|s| s.label)
-            .unwrap_or_default();
-        match (server.is_empty(), session.is_empty()) {
-            (false, false) => format!("{server} · {session}"),
-            (false, true) => server,
-            _ => String::new(),
-        }
-    }
-
     /// A window of ours, since GPUI draws no system title bar on Windows.
     /// Everything but the buttons drags the window.
-    fn title_bar(&self) -> AnyElement {
+    fn title_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let maximized = crate::win32::is_maximized();
         let drag =
             |el: gpui::Div| el.on_mouse_down(MouseButton::Left, |_, _, _| crate::win32::drag());
@@ -201,10 +182,17 @@ impl Workspace {
                     ),
             )
             .child(
-                drag(div().flex_1().h_full().flex().items_center().pl_2())
+                div()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .mx_2()
+                    .bg(theme::color(theme::BORDER)),
+            )
+            .children(self.tab_chips(cx))
+            .child(
+                drag(div().flex_1().h_full())
                     .text_xs()
-                    .text_color(theme::color(theme::MUTED))
-                    .child(self.status_line()),
+                    .text_color(theme::color(theme::MUTED)),
             )
             .child(control("min", Shape::Minimize, false, |_, _| {
                 crate::win32::minimize()
@@ -299,7 +287,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn tab_chips(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let selected = self.window_id.clone();
         let chips: Vec<AnyElement> = self
             .windows()
@@ -309,7 +297,7 @@ impl Workspace {
                 let active = selected.as_deref() == Some(id.as_str());
                 div()
                     .id(SharedString::from(id.clone()))
-                    .h(px(24.0))
+                    .h(px(22.0))
                     .px_3()
                     .rounded_md()
                     .flex()
@@ -334,18 +322,7 @@ impl Workspace {
                     .into_any_element()
             })
             .collect();
-
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .h(theme::TAB_H)
-            .px_2()
-            .bg(theme::color(theme::SURFACE))
-            .border_b_1()
-            .border_color(theme::color(theme::BORDER))
-            .children(chips)
-            .into_any_element()
+        chips
     }
 
     fn panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -422,9 +399,8 @@ impl Render for Workspace {
                 eprintln!("[window] {:?} x{:?}", b.origin, b.size);
             }
         }
-        let title_bar = self.title_bar();
+        let title_bar = self.title_bar(cx);
         let sidebar = self.sidebar(cx);
-        let tabs = self.tabs(cx);
         let panes = self.panes(window, cx);
 
         div()
@@ -436,15 +412,12 @@ impl Render for Workspace {
             .text_sm()
             .child(title_bar)
             .child(
-                div().flex().flex_1().min_h(px(0.0)).child(sidebar).child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(tabs)
-                        .child(panes),
-                ),
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(sidebar)
+                    .child(div().flex().flex_col().flex_1().min_w(px(0.0)).child(panes)),
             )
     }
 }

@@ -15,7 +15,6 @@ pub const ACCENT: u32 = 0xf0b429; // the star in Pebrel's title bar
 pub const DANGER: u32 = 0xc4564f; // close button hover
 
 pub const TITLE_H: Pixels = px(36.0);
-pub const TAB_H: Pixels = px(34.0);
 pub const SIDEBAR_W: Pixels = px(208.0);
 
 pub fn color(v: u32) -> Hsla {
