@@ -106,6 +106,10 @@ impl Render for TerminalView {
                 MouseButton::Left,
                 cx.listener(|this, _, window, _cx| {
                     window.focus(&this.focus);
+                    // Claim the size so the server reflows this terminal to this window.
+                    if let Some(session) = &this.session {
+                        session.clone().take_control();
+                    }
                 }),
             )
             .child(
