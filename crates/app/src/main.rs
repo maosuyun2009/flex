@@ -7,6 +7,8 @@
 mod keymap;
 mod paint;
 mod terminal;
+mod theme;
+mod win32;
 mod workspace;
 
 use std::path::PathBuf;
@@ -51,13 +53,34 @@ fn main() {
             }
         }
 
-        let bounds = Bounds::centered(None, size(px(1280.0), px(760.0)), cx);
+        // We draw the title bar ourselves, so the system one is turned off; the
+        // shell then gets the whole window to paint and its own min/max/close.
+        // A fixed logical size overflows a scaled display: at 150% a 1400pt
+        // window is 2100px, wider than the screen, and centering then pushes the
+        // title bar off the top. Take a fraction of the display instead.
+        let (aw, ah) = cx
+            .primary_display()
+            .map(|d| {
+                let s = d.bounds().size;
+                (f32::from(s.width), f32::from(s.height))
+            })
+            .unwrap_or((1920.0, 1080.0));
+        let bounds = Bounds::centered(
+            None,
+            size(
+                px((aw * 0.86).clamp(720.0, 1500.0)),
+                px((ah * 0.88).clamp(460.0, 1000.0)),
+            ),
+            cx,
+        );
         let options = WindowOptions {
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("rexshell".into()),
+                appears_transparent: true,
                 ..Default::default()
             }),
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(720.0), px(460.0))),
             ..Default::default()
         };
         let rx = wake_rx.clone();

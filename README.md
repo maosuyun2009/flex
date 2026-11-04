@@ -25,7 +25,9 @@ of the multiplexer.
 | Path | What |
 |---|---|
 | `crates/engine` | Toolkit-free glue over `shrew_core::Shrew`: connects, reconnects, opens terminals, and the pixel→cell arithmetic. **This crate compiles and tests without a GPU.** |
-| `crates/app/src/workspace.rs` | The window: sidebar, tab bar, pane area |
+| `crates/app/src/workspace.rs` | The chrome: title bar, sidebar, tabs, pane area |
+| `crates/app/src/theme.rs` | Palette and metrics, styled after [Pebrel](https://github.com/Kuddev/pebrel) |
+| `crates/app/src/win32.rs` | The four Win32 calls GPUI has no API for: drag, maximize/restore, minimize, round corners |
 | `crates/app/src/terminal.rs` | One block as an entity: the terminal stream, focus, input |
 | `crates/app/src/paint.rs` | `shrew_core::Frame` → GPUI quads and shaped text runs |
 | `crates/app/src/keymap.rs` | GPUI keystroke → Rex key |
@@ -78,6 +80,23 @@ rex server start --tailscale
 rex server start --extra-listen :7297 --allow-anonymous
 ```
 
+## Chrome
+
+GPUI 0.2.2 draws no system title bar on Windows (`dwstyle` gets `WS_SYSMENU`,
+`WS_THICKFRAME`, `WS_MAXIMIZEBOX`, `WS_MINIMIZEBOX` — but never `WS_CAPTION`), so
+the shell draws its own and asks Windows for the missing verbs:
+
+| Part | Behaviour |
+| --- | --- |
+| Title bar | drags the window (`WM_NCLBUTTONDOWN` + `HTCAPTION`), shows the server and session |
+| `—` `□` `×` | minimize, maximize/restore, close — drawn as shapes, not glyphs |
+| Corners | `DWMWA_WINDOW_CORNER_PREFERENCE` rounds them, as on Pebrel |
+| Initial size | a fraction of the real display, because a fixed logical size overflows a scaled screen |
+
+Window controls are drawn with divs on purpose: `─`, `□` and `✕` are not in
+GPUI's Windows fallback chain, and rendering them as text produced nothing at
+all (found by screenshotting the title bar).
+
 ## What works
 
 - Sidebar of servers → sessions; tab bar of windows; panes laid out from the
@@ -88,6 +107,8 @@ rex server start --extra-listen :7297 --allow-anonymous
   through. The window tells the server its cell grid and takes ownership of a
   terminal's size.
 - Reconnect after a drop: the engine resumes the stream and forces a repaint.
+- Window drag, minimize, maximize/restore and close — verified by moving the
+  window over synthetic mouse input and reading its rect back.
 
 ## What is not there yet
 

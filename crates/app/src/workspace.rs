@@ -1,8 +1,9 @@
-//! The window: a sidebar of servers and sessions, a tab bar of windows, and the
-//! pane area of the window you picked.
+//! The window: a title bar of our own (GPUI draws no system one on Windows),
+//! the session list beside it, tabs for the session's windows, and the panes of
+//! the window you picked.
 //!
 //! Every pane is placed from `BlockState::rect`, which the server sends as
-//! fractions of its window, so splits, floats and zoom all come for free.
+//! fractions of its window, so splits, floats and zoom need no layout code here.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,12 +11,13 @@ use std::sync::Arc;
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    div, px, relative, rgb, AnyElement, Context, Entity, IntoElement, Render, SharedString, Task,
-    Window,
+    div, px, relative, AnyElement, App, Context, Entity, IntoElement, MouseButton, Render,
+    SharedString, Task, Window,
 };
-use rexshell_engine::{AppState, BlockState, Engine, SessionState, WindowState};
+use rexshell_engine::{AppState, BlockState, Connectivity, Engine, SessionState, WindowState};
 
 use crate::terminal::TerminalView;
+use crate::theme;
 
 pub struct Workspace {
     engine: Arc<Engine>,
@@ -25,6 +27,7 @@ pub struct Workspace {
     window_id: Option<String>,
     terminals: HashMap<String, Entity<TerminalView>>,
     focused_once: bool,
+    styled: bool,
     _wake: Option<Task<()>>,
 }
 
@@ -38,6 +41,7 @@ impl Workspace {
             window_id: None,
             terminals: HashMap::new(),
             focused_once: false,
+            styled: false,
             _wake: None,
         };
         this.reload(cx);
@@ -149,45 +153,130 @@ impl Workspace {
         .detach();
     }
 
+    fn status_line(&self) -> String {
+        let server = self
+            .state
+            .server(self.server_id.as_deref().unwrap_or_default())
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let session = self
+            .sessions()
+            .into_iter()
+            .find(|s| Some(&s.id) == self.session_id.as_ref())
+            .map(|s| s.label)
+            .unwrap_or_default();
+        match (server.is_empty(), session.is_empty()) {
+            (false, false) => format!("{server} · {session}"),
+            (false, true) => server,
+            _ => String::new(),
+        }
+    }
+
+    /// A window of ours, since GPUI draws no system title bar on Windows.
+    /// Everything but the buttons drags the window.
+    fn title_bar(&self) -> AnyElement {
+        let maximized = crate::win32::is_maximized();
+        let drag =
+            |el: gpui::Div| el.on_mouse_down(MouseButton::Left, |_, _, _| crate::win32::drag());
+
+        div()
+            .flex()
+            .items_center()
+            .h(theme::TITLE_H)
+            .bg(theme::color(theme::SURFACE))
+            .border_b_1()
+            .border_color(theme::color(theme::BORDER))
+            .child(
+                drag(div().flex().items_center().h_full().pl_3().pr_2().gap_2())
+                    .child(
+                        div()
+                            .size(px(8.0))
+                            .rounded_sm()
+                            .bg(theme::color(theme::ACCENT)),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme::color(theme::MUTED))
+                            .child("rexshell"),
+                    ),
+            )
+            .child(
+                drag(div().flex_1().h_full().flex().items_center().pl_2())
+                    .text_xs()
+                    .text_color(theme::color(theme::MUTED))
+                    .child(self.status_line()),
+            )
+            .child(control("min", Shape::Minimize, false, |_, _| {
+                crate::win32::minimize()
+            }))
+            .child(control(
+                "max",
+                if maximized {
+                    Shape::Restore
+                } else {
+                    Shape::Maximize
+                },
+                false,
+                |_, _| crate::win32::toggle_maximize(),
+            ))
+            .child(control("close", Shape::Close, true, |window, _| {
+                window.remove_window()
+            }))
+            .child(div().w(px(6.0)).h_full())
+            .into_any_element()
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut rows: Vec<AnyElement> = vec![theme::section("SESSIONS").into_any_element()];
         for server in &self.state.servers {
-            let status = match server.connectivity {
-                rexshell_engine::Connectivity::Online => format!(
-                    "{} · {}",
-                    server.name,
-                    server.version.clone().unwrap_or_default()
-                ),
-                rexshell_engine::Connectivity::Connecting => {
-                    format!("{} · connecting", server.name)
-                }
-                rexshell_engine::Connectivity::Offline { .. } => {
-                    format!("{} · offline", server.name)
-                }
-                rexshell_engine::Connectivity::Idle => server.name.clone(),
+            let dot = match server.connectivity {
+                Connectivity::Online => theme::ACCENT,
+                Connectivity::Connecting => theme::MUTED,
+                Connectivity::Offline { .. } => theme::DANGER,
+                Connectivity::Idle => theme::BORDER,
             };
             rows.push(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_3()
-                    .pt_3()
-                    .pb_1()
+                    .py_2()
                     .text_xs()
-                    .child(status)
+                    .text_color(theme::color(theme::MUTED))
+                    .child(div().size(px(6.0)).rounded_full().bg(theme::color(dot)))
+                    .child(server.name.clone())
                     .into_any_element(),
             );
 
             for session in &server.sessions {
                 let id = session.id.clone();
-                let selected = self.session_id.as_deref() == Some(id.as_str());
-                let label = format!("{}  ({})", session.label, session.block_count());
+                let active = self.session_id.as_deref() == Some(id.as_str());
                 rows.push(
                     div()
                         .id(SharedString::from(id.clone()))
-                        .px_3()
+                        .mx_2()
+                        .px_2()
                         .py_1()
-                        .when(selected, |el| el.bg(rgb(0x2a2f38)))
-                        .hover(|el| el.bg(rgb(0x22262d)))
-                        .child(label)
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(active, |el| {
+                            el.bg(theme::color(theme::ACTIVE))
+                                .text_color(theme::color(theme::TEXT))
+                        })
+                        .when(!active, |el| {
+                            el.text_color(theme::color(theme::TEXT))
+                                .hover(|el| el.bg(theme::color(theme::HOVER)))
+                        })
+                        .child(div().flex_1().truncate().child(session.label.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::color(theme::MUTED))
+                                .child(session.block_count().to_string()),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.session_id = Some(id.clone());
                             this.window_id = None;
@@ -197,33 +286,22 @@ impl Workspace {
                 );
             }
         }
+
         div()
             .flex()
             .flex_col()
-            .w(px(240.0))
+            .w(theme::SIDEBAR_W)
             .h_full()
+            .bg(theme::color(theme::SURFACE))
             .border_r_1()
-            .border_color(rgb(0x2a2f38))
+            .border_color(theme::color(theme::BORDER))
             .children(rows)
             .into_any_element()
     }
 
-    fn panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(session_id) = self.session_id.clone() else {
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child("No session")
-                .into_any_element();
-        };
-        let Some(server_id) = self.server_id.clone() else {
-            return div().size_full().into_any_element();
-        };
-
+    fn tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.window_id.clone();
-        let tabs: Vec<AnyElement> = self
+        let chips: Vec<AnyElement> = self
             .windows()
             .into_iter()
             .map(|window| {
@@ -231,10 +309,22 @@ impl Workspace {
                 let active = selected.as_deref() == Some(id.as_str());
                 div()
                     .id(SharedString::from(id.clone()))
+                    .h(px(24.0))
                     .px_3()
-                    .py_1()
-                    .when(active, |el| el.bg(rgb(0x2a2f38)))
-                    .hover(|el| el.bg(rgb(0x22262d)))
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .text_xs()
+                    .when(active, |el| {
+                        el.bg(theme::color(theme::ACTIVE))
+                            .text_color(theme::color(theme::TEXT))
+                    })
+                    .when(!active, |el| {
+                        el.text_color(theme::color(theme::MUTED)).hover(|el| {
+                            el.bg(theme::color(theme::HOVER))
+                                .text_color(theme::color(theme::TEXT))
+                        })
+                    })
                     .child(window.label.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.window_id = Some(id.clone());
@@ -245,19 +335,48 @@ impl Workspace {
             })
             .collect();
 
-        let views: Vec<([f64; 4], Entity<TerminalView>)> = self
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(theme::TAB_H)
+            .px_2()
+            .bg(theme::color(theme::SURFACE))
+            .border_b_1()
+            .border_color(theme::color(theme::BORDER))
+            .children(chips)
+            .into_any_element()
+    }
+
+    fn panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(session_id) = self.session_id.clone() else {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme::color(theme::MUTED))
+                .child("Waiting for a session")
+                .into_any_element();
+        };
+        let Some(server_id) = self.server_id.clone() else {
+            return div().flex_1().into_any_element();
+        };
+
+        let views: Vec<([f64; 4], Entity<TerminalView>, bool)> = self
             .blocks()
             .into_iter()
             .map(|block| {
                 let view = self.terminal(&server_id, &session_id, &block.id, cx);
-                (block.rect, view)
+                let focused = view.read(cx).handle().is_focused(window);
+                (block.rect, view, focused)
             })
             .collect();
 
         // A window with nothing focused swallows every keystroke, and nothing
         // else here can take focus, so give it to the first pane.
         if !self.focused_once {
-            if let Some((_, view)) = views.first() {
+            if let Some((_, view, _)) = views.first() {
                 window.focus(&view.read(cx).handle());
                 self.focused_once = true;
             }
@@ -265,7 +384,7 @@ impl Workspace {
 
         let panes: Vec<AnyElement> = views
             .into_iter()
-            .map(|(rect, view)| {
+            .map(|(rect, view, focused)| {
                 let [x, y, w, h] = rect;
                 div()
                     .absolute()
@@ -273,40 +392,137 @@ impl Workspace {
                     .top(relative(y as f32))
                     .w(relative(w as f32))
                     .h(relative(h as f32))
+                    .border_1()
+                    .border_color(theme::color(if focused {
+                        theme::ACCENT
+                    } else {
+                        theme::BORDER
+                    }))
                     .child(view)
                     .into_any_element()
             })
             .collect();
 
         div()
-            .flex()
-            .flex_col()
+            .relative()
             .flex_1()
-            .h_full()
-            .child(
-                div()
-                    .flex()
-                    .h(px(30.0))
-                    .border_b_1()
-                    .border_color(rgb(0x2a2f38))
-                    .children(tabs),
-            )
-            .child(div().relative().flex_1().children(panes))
+            .bg(theme::color(theme::BG))
+            .children(panes)
             .into_any_element()
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.styled {
+            self.styled = true;
+            crate::win32::round_corners();
+            if std::env::var_os("REXSHELL_DEBUG").is_some() {
+                let b = window.bounds();
+                eprintln!("[window] {:?} x{:?}", b.origin, b.size);
+            }
+        }
+        let title_bar = self.title_bar();
         let sidebar = self.sidebar(cx);
+        let tabs = self.tabs(cx);
         let panes = self.panes(window, cx);
+
         div()
             .flex()
+            .flex_col()
             .size_full()
-            .bg(rgb(0x14161a))
-            .text_color(rgb(0xd8dee9))
+            .bg(theme::color(theme::BG))
+            .text_color(theme::color(theme::TEXT))
             .text_sm()
-            .child(sidebar)
-            .child(panes)
+            .child(title_bar)
+            .child(
+                div().flex().flex_1().min_h(px(0.0)).child(sidebar).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(tabs)
+                        .child(panes),
+                ),
+            )
     }
+}
+
+/// Window controls are drawn, not typed: `─ □ ✕` live in fonts that GPUI's
+/// Windows text system does not always fall back to, and drew nothing.
+#[derive(Clone, Copy)]
+enum Shape {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+fn shape(shape: Shape) -> AnyElement {
+    let stroke = theme::color(theme::MUTED);
+    match shape {
+        Shape::Minimize => div().w(px(10.0)).h(px(1.0)).bg(stroke).into_any_element(),
+        Shape::Maximize => div()
+            .size(px(9.0))
+            .border_1()
+            .border_color(stroke)
+            .into_any_element(),
+        Shape::Restore => div()
+            .relative()
+            .size(px(10.0))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(2.0))
+                    .top(px(2.0))
+                    .size(px(7.0))
+                    .border_1()
+                    .border_color(stroke),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .size(px(7.0))
+                    .border_1()
+                    .border_color(stroke),
+            )
+            .into_any_element(),
+        Shape::Close => div().text_size(px(15.0)).child("×").into_any_element(),
+    }
+}
+
+/// A title bar button: no drag, hover highlight, close goes red.
+fn control(
+    id: &'static str,
+    glyph: Shape,
+    danger: bool,
+    action: impl Fn(&mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .h_full()
+        .w(px(44.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(theme::color(theme::MUTED))
+        .hover(move |el| {
+            let el = el.bg(theme::color(if danger {
+                theme::DANGER
+            } else {
+                theme::HOVER
+            }));
+            if danger {
+                el.text_color(theme::color(theme::TEXT))
+            } else {
+                el
+            }
+        })
+        .child(shape(glyph))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, window, cx| action(window, cx))
+        .into_any_element()
 }
