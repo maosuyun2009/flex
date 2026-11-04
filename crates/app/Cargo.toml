@@ -1,0 +1,16 @@
+[package]
+name = "rexshell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A Windows shell for Rex servers, on shrew-core and GPUI"
+
+[[bin]]
+name = "rexshell"
+path = "src/main.rs"
+
+[dependencies]
+async-channel = "2"
+gpui = "0.2.2"
+rexshell-engine = { workspace = true }
+shrew-core = { workspace = true }
