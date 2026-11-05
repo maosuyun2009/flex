@@ -1,3 +1,7 @@
+// Release builds have no console: double-clicking the shell opens the window and
+// nothing else. Debug builds keep it, because that is where the logs go.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! flex: a Windows shell for Rex servers.
 //!
 //! Usage: `flex [SERVER]`, or set `FLEX_SERVER`. Without either, the
