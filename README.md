@@ -1,5 +1,8 @@
 # flex
 
+[github.com/maosuyun2009/flex](https://github.com/maosuyun2009/flex) ·
+[releases](https://github.com/maosuyun2009/flex/releases)
+
 A Windows shell for [Rex](https://superlogical.com/rex) servers, built on
 [shrew-core](https://github.com/teddytennant/shrew) (the MIT engine behind
 Shrew's iOS/Android/Linux clients) and [GPUI](https://crates.io/crates/gpui).
@@ -43,7 +46,8 @@ the window, so server-side splits, floats and zoom need no layout code here.
 
 ## Install
 
-Download `flex-0.0.1-setup.exe` from the releases page and run it. It installs
+Download [`flex-0.0.1-setup.exe`](https://github.com/maosuyun2009/flex/releases/download/v0.0.1/flex-0.0.1-setup.exe)
+and run it. It installs
 for the current user only, adds **flex** to the Start menu and the desktop, and
 registers an uninstaller in *Apps & features*; no administrator rights, nothing
 written outside `%LOCALAPPDATA%\Programs\flex` and `%APPDATA%\flex`.
@@ -64,6 +68,13 @@ build.bat build --release
 `build.bat` points `RUSTUP_HOME` / `CARGO_HOME` at D:, adds Zig to `PATH`, and
 calls MSVC's `vcvars64.bat` before handing its arguments to `cargo`. First
 build compiles Ghostty and ~460 crates: **18m 37s** here, 17.7 MB exe.
+
+The installer is NSIS, built from `installer/flex.nsi` after the release build:
+
+```powershell
+mkdir dist
+makensis /DAPP_VERSION=0.0.1 installer\flex.nsi   # → dist\flex-0.0.1-setup.exe
+```
 
 On Linux, `cargo check` currently trips over `xattr v0.2.3` vs `libc v0.2.191`
 (`ENOATTR` was dropped), a known-upstream mismatch pulled in by
