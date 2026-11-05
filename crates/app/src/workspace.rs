@@ -100,6 +100,21 @@ struct Divider {
     after_rect: [f64; 4],
 }
 
+/// What a one-line prompt is renaming.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rename {
+    Tab,
+    Pane,
+}
+
+/// A one-line text prompt: Rex names windows and blocks, and the shell has no
+/// text field, so this is the smallest thing that can type a name.
+struct Prompt {
+    what: Rename,
+    label: String,
+    value: String,
+}
+
 /// One notification on screen, and when it should go away.
 struct Toast {
     kind: shrew_core::NotificationKind,
@@ -166,6 +181,11 @@ pub struct Workspace {
     area_geometry: Arc<std::sync::Mutex<Option<(Point<Pixels>, Size<Pixels>)>>>,
     /// A divider being dragged between two tiled panes.
     divider: Option<Divider>,
+    /// A name being typed.
+    prompt: Option<Prompt>,
+    /// Floating layers this shell tucked away. Rex keeps the state, but
+    /// shrew-core's snapshot drops it, so the shell remembers its own.
+    minimized: std::collections::HashSet<String>,
     notices: Arc<std::sync::Mutex<Vec<Notification>>>,
     toasts: std::collections::VecDeque<Toast>,
     /// A press on the title bar with the window not moved yet. The drag only
@@ -219,6 +239,8 @@ impl Workspace {
             tinted: None,
             area_geometry: Arc::default(),
             divider: None,
+            prompt: None,
+            minimized: std::collections::HashSet::new(),
             notices,
             toasts: std::collections::VecDeque::new(),
             title_press: None,
@@ -502,6 +524,20 @@ impl Workspace {
             Action::PrevTab => self.step_focus("session.focus_previous_window", cx),
             Action::SwapPane => self.swap_pane(cx),
             Action::ClearPane => self.clear_pane(cx),
+            Action::RenameTab => {
+                // Empty, not prefilled: there is no select-all, so a prefilled
+                // name would just get appended to.
+                self.open_prompt(Rename::Tab, "Rename tab");
+                cx.notify();
+            }
+            Action::RenamePane => {
+                self.open_prompt(Rename::Pane, "Rename pane");
+                cx.notify();
+            }
+            Action::MoveTabLeft => self.move_tab(-1, cx),
+            Action::MoveTabRight => self.move_tab(1, cx),
+            Action::MinimizeFloat => self.toggle_minimized(cx),
+            Action::CopyTranscript => self.copy_transcript(cx),
             Action::NewTab => self.new_tab(cx),
             Action::ZoomPane => self.zoom_pane(cx),
             Action::Find => self.start_find(cx),
@@ -796,6 +832,231 @@ impl Workspace {
                 .await
             {
                 eprintln!("flex: clear: {e}");
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    fn open_prompt(&mut self, what: Rename, label: &str) {
+        self.prompt = Some(Prompt {
+            what,
+            label: label.to_owned(),
+            value: String::new(),
+        });
+    }
+
+    /// Type into the prompt. Returns true when the key belonged to it.
+    fn prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(prompt) = &mut self.prompt else {
+            return false;
+        };
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.prompt = None;
+                cx.notify();
+                true
+            }
+            "enter" => {
+                let prompt = self.prompt.take().unwrap();
+                self.commit_prompt(prompt, cx);
+                true
+            }
+            "backspace" => {
+                prompt.value.pop();
+                cx.notify();
+                true
+            }
+            _ => {
+                let typed = event
+                    .keystroke
+                    .key_char
+                    .clone()
+                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
+                match typed {
+                    Some(text) => {
+                        prompt.value.push_str(&text);
+                        cx.notify();
+                        true
+                    }
+                    // Chords with a modifier are the shell's, not the prompt's.
+                    None => {
+                        !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.alt
+                            && !event.keystroke.modifiers.platform
+                    }
+                }
+            }
+        }
+    }
+
+    fn commit_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            return;
+        };
+        let label = prompt.value.trim().to_owned();
+        if label.is_empty() {
+            cx.notify();
+            return;
+        }
+        let payload = match prompt.what {
+            Rename::Tab => match self.window_id.clone() {
+                Some(window_id) => json!({
+                    "session_id": session,
+                    "window_id": window_id,
+                    "label": label,
+                }),
+                None => return,
+            },
+            Rename::Pane => match self.active_block.clone() {
+                Some(block_id) => json!({
+                    "session_id": session,
+                    "block_id": block_id,
+                    "label": label,
+                }),
+                None => return,
+            },
+        };
+        let method = match prompt.what {
+            Rename::Tab => "session.set_window_label",
+            Rename::Pane => "session.set_block_label",
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = engine.call(&address, method, payload).await {
+                eprintln!("flex: {method}: {e}");
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// Move this tab one place along, past its neighbour.
+    fn move_tab(&mut self, step: i32, cx: &mut Context<Self>) {
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            return;
+        };
+        let windows = self.windows();
+        let Some(at) = windows
+            .iter()
+            .position(|w| Some(&w.id) == self.window_id.as_ref())
+        else {
+            return;
+        };
+        let to = at as i32 + step;
+        if to < 0 || to as usize >= windows.len() {
+            return;
+        }
+        // Where it should land: beside the window now next to it.
+        let before = if step < 0 {
+            windows.get(to as usize).map(|w| w.id.clone())
+        } else {
+            windows.get(to as usize + 1).map(|w| w.id.clone())
+        };
+        let Some(window_id) = self.window_id.clone() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({
+                "session_id": session,
+                "window_id": window_id,
+                "before_window_id": before,
+            });
+            if let Err(e) = engine.call(&address, "session.move_window", payload).await {
+                eprintln!("flex: move_window: {e}");
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// Tuck the floating layer under this pane away, or bring it back.
+    ///
+    /// Rex would move the *layer* to `minimized`, but that method needs control
+    /// API revision 9 and shrew-core (pinned) speaks 8, so the shell hides it
+    /// itself and only tells the server when the server can hear it. Another
+    /// client keeps seeing the float, which is the cost of the old protocol.
+    fn toggle_minimized(&mut self, cx: &mut Context<Self>) {
+        let Some(block) = self.active_block.clone() else {
+            return;
+        };
+        let restore = self.minimized.contains(&block);
+        if restore {
+            self.minimized.remove(&block);
+        } else {
+            self.minimized.insert(block.clone());
+            // Send focus somewhere visible, or the keyboard goes to a hidden pane.
+            if let Some(next) = self
+                .blocks()
+                .into_iter()
+                .find(|b| !self.minimized.contains(&b.id))
+            {
+                self.active_block = Some(next.id.clone());
+                self.pending_focus = Some(next.id);
+            }
+        }
+        cx.notify();
+
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            return;
+        };
+        let state = if restore { "normal" } else { "minimized" };
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, _| {
+            // Rex wants a layer id, and this shell's snapshot has only blocks.
+            let Ok(view) = engine
+                .call(&address, "session.view", json!({"session_id": session}))
+                .await
+            else {
+                return;
+            };
+            let Some(layer) = find_layer(&view, &block) else {
+                return;
+            };
+            let payload = json!({
+                "session_id": session,
+                "layer_id": layer,
+                "state": state,
+                "focus": restore,
+            });
+            if let Err(e) = engine
+                .call(&address, "session.set_layer_state", payload)
+                .await
+            {
+                eprintln!("flex: set_layer_state: {e}");
+            }
+        })
+        .detach();
+    }
+
+    /// Copy everything the pane can still show, from the server's own
+    /// scrollback rather than from the frames this shell happens to hold.
+    fn copy_transcript(&mut self, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(block)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.active_block.clone(),
+        ) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({
+                "session_id": session,
+                "block_id": block,
+                "args": {"format": "text", "trim": true},
+            });
+            match engine
+                .call(&address, "com.superlogical.terminal.format", payload)
+                .await
+            {
+                Ok(reply) => {
+                    if let Some(text) = reply.get("content").and_then(|c| c.as_str()) {
+                        crate::win32::set_clipboard_text(text);
+                    }
+                }
+                Err(e) => eprintln!("flex: format: {e}"),
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -1558,6 +1819,55 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// A one-line prompt for a name, over everything else.
+    fn prompt_overlay(&self) -> AnyElement {
+        let Some(prompt) = &self.prompt else {
+            return div().into_any_element();
+        };
+        let chrome = self.chrome();
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_center()
+            .bg(hsla(0.0, 0.0, 0.0, 0.5))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(px(360.0))
+                    .rounded_lg()
+                    .bg(theme::color(theme::SURFACE))
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_color(theme::text()).child(prompt.label.clone()))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(chrome.active())
+                            .text_color(theme::text())
+                            .child(format!("{}▌", prompt.value)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child("Enter to save · Esc to cancel"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Notifications as cards in the top right corner: a bell, a program asking
     /// for attention, an agent that stopped for a decision. Clicking one jumps
     /// to the pane it came from.
@@ -1708,6 +2018,45 @@ impl Workspace {
                         .into_any_element(),
                 );
             }
+        }
+
+        let tucked: Vec<AnyElement> = self
+            .blocks()
+            .into_iter()
+            .filter(|block| self.minimized.contains(&block.id))
+            .map(|block| {
+                let id = block.id.clone();
+                div()
+                    .id(SharedString::from(format!("tucked:{id}")))
+                    .mx_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_color(theme::text())
+                    .hover(|el| el.bg(chrome.hover()))
+                    .child(div().flex_1().truncate().child(block.display_name()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child("minimized"),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.active_block = Some(id.clone());
+                            this.toggle_minimized(cx);
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        if !tucked.is_empty() {
+            rows.push(theme::section("TUCKED AWAY").into_any_element());
+            rows.extend(tucked);
         }
 
         rows.push(theme::section("SESSIONS").into_any_element());
@@ -2043,6 +2392,9 @@ impl Workspace {
             for (block, view) in views.iter().filter(|(b, _)| b.floating == floating_pass) {
                 // A zoomed block is the only one the window shows.
                 if zoomed.is_some() && Some(&block.id) != zoomed.as_ref() {
+                    continue;
+                }
+                if self.minimized.contains(&block.id) {
                     continue;
                 }
                 let [x, y, w, h] = if Some(&block.id) == zoomed.as_ref() {
@@ -2701,6 +3053,7 @@ impl Render for Workspace {
         }
         let title_bar = self.title_bar(cx);
         let toasts = self.toast_strip(cx);
+        let prompt = self.prompt_overlay();
         let body = if self.show_settings {
             self.settings_page(cx)
         } else {
@@ -2742,6 +3095,10 @@ impl Render for Workspace {
             .text_sm()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.prompt.is_some() && this.prompt_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.show_settings && event.keystroke.key == "escape" {
                     this.close_settings(window, cx);
                     return;
@@ -2771,6 +3128,7 @@ impl Render for Workspace {
             }))
             .child(title_bar)
             .child(body)
+            .child(prompt)
             .child(toasts)
     }
 }
@@ -2913,6 +3271,26 @@ fn floating_layer_id(view: &serde_json::Value, block_id: &str) -> Option<String>
 ///
 /// `move_block` takes a side and the share the *before* half gets, so a pane on
 /// the right of a 30/70 split comes back as `after` with a ratio of 0.3.
+/// The floating layer a block sits in, which `set_layer_state` wants.
+fn find_layer(view: &serde_json::Value, block_id: &str) -> Option<String> {
+    for window in view.get("windows")?.as_array()? {
+        for layer in window.get("layers")?.as_array()? {
+            let holds = layer
+                .get("blocks")?
+                .as_array()?
+                .iter()
+                .any(|b| b.get("block_id").and_then(|id| id.as_str()) == Some(block_id));
+            if holds {
+                return layer
+                    .get("layer_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_owned);
+            }
+        }
+    }
+    None
+}
+
 fn split_hint([x, y, w, h]: [f64; 4]) -> (&'static str, &'static str, f64) {
     // Taller than wide means it was divided left/right.
     let (side, direction, ratio) = if h >= w {
