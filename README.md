@@ -141,6 +141,10 @@ surprising. The client then follows: a click publishes the pane it landed on wit
 `session.focus_block`, and a direction move starts from that pane and adopts the
 server's answer, so client and server never disagree about where the keyboard is.
 
+The amber ring marks the focused pane only when there is a choice to make: one
+pane, or a zoomed one filling the window, gets the plain hairline instead — the
+ring is a pointer, not a frame.
+
 Zoom buys the whole pane area for one block: Rex toggles it, and the shell draws a
 zoomed *floating* pane at full size because the server keeps its layer bounds and
 only reports `zoomed_block_id` (for a tiled pane the reported layout already

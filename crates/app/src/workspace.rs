@@ -1330,6 +1330,10 @@ impl Workspace {
             .find(|window| Some(&window.id) == self.window_id.as_ref())
             .and_then(|window| window.zoomed_block_id);
 
+        // The amber ring only earns its keep when there is a choice to show: with
+        // one pane, or a zoomed one filling the window, it is just a frame.
+        let ring = self.blocks().len() > 1 && zoomed.is_none();
+
         let blocks = self.blocks();
         let views: Vec<(BlockState, Entity<TerminalView>)> = blocks
             .into_iter()
@@ -1370,13 +1374,17 @@ impl Workspace {
         // Floating layers paint last, so they sit above the tiled panes.
         for floating_pass in [false, true] {
             for (block, view) in views.iter().filter(|(b, _)| b.floating == floating_pass) {
+                // A zoomed block is the only one the window shows.
+                if zoomed.is_some() && Some(&block.id) != zoomed.as_ref() {
+                    continue;
+                }
                 let [x, y, w, h] = if Some(&block.id) == zoomed.as_ref() {
                     [0.0, 0.0, 1.0, 1.0]
                 } else {
                     self.rect_of(block)
                 };
                 let is_active = active.as_deref() == Some(block.id.as_str());
-                let outline = if is_active {
+                let outline = if is_active && ring {
                     theme::accent()
                 } else {
                     theme::border()
