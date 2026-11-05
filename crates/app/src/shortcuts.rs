@@ -31,6 +31,9 @@ pub enum Action {
     MoveTabLeft,
     MoveTabRight,
     MinimizeFloat,
+    RaiseFloat,
+    LowerFloat,
+    ParkPane,
     CopyTranscript,
     NewTab,
     ToggleSidebar,
@@ -93,6 +96,21 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         "ctrl-shift-m",
         Action::MinimizeFloat,
         "Tuck the floating pane away, or bring it back",
+    ),
+    (
+        "ctrl-shift-up",
+        Action::RaiseFloat,
+        "Bring this floating pane to the front",
+    ),
+    (
+        "ctrl-shift-down",
+        Action::LowerFloat,
+        "Send this floating pane behind the others",
+    ),
+    (
+        "ctrl-shift-p",
+        Action::ParkPane,
+        "Park this pane: it keeps running, out of the layout",
     ),
     (
         "ctrl-shift-y",

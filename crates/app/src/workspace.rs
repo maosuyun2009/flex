@@ -183,6 +183,8 @@ pub struct Workspace {
     divider: Option<Divider>,
     /// A name being typed.
     prompt: Option<Prompt>,
+    /// Panes this shell parked: alive, out of every window, in this list.
+    parked: Vec<(String, String)>,
     /// Floating layers this shell tucked away. Rex keeps the state, but
     /// shrew-core's snapshot drops it, so the shell remembers its own.
     minimized: std::collections::HashSet<String>,
@@ -240,6 +242,7 @@ impl Workspace {
             area_geometry: Arc::default(),
             divider: None,
             prompt: None,
+            parked: Vec::new(),
             minimized: std::collections::HashSet::new(),
             notices,
             toasts: std::collections::VecDeque::new(),
@@ -348,6 +351,19 @@ impl Workspace {
             .any(|w| Some(&w.id) == self.window_id.as_ref())
         {
             self.window_id = windows.first().map(|w| w.id.clone());
+        }
+        // The server decides which tab is active — a new one from Ctrl-Shift-T,
+        // or a switch made in another client — and the shell has to agree, or
+        // its tab strip and its panes point at different windows.
+        if let Some(active) = self
+            .sessions()
+            .into_iter()
+            .find(|s| Some(&s.id) == self.session_id.as_ref())
+            .and_then(|s| s.active_window_id)
+        {
+            if windows.iter().any(|w| w.id == active) {
+                self.window_id = Some(active);
+            }
         }
         let blocks = self.blocks();
         if !blocks
@@ -537,6 +553,9 @@ impl Workspace {
             Action::MoveTabLeft => self.move_tab(-1, cx),
             Action::MoveTabRight => self.move_tab(1, cx),
             Action::MinimizeFloat => self.toggle_minimized(cx),
+            Action::RaiseFloat => self.stack_float(true, cx),
+            Action::LowerFloat => self.stack_float(false, cx),
+            Action::ParkPane => self.park_pane(cx),
             Action::CopyTranscript => self.copy_transcript(cx),
             Action::NewTab => self.new_tab(cx),
             Action::ZoomPane => self.zoom_pane(cx),
@@ -1026,6 +1045,99 @@ impl Workspace {
             {
                 eprintln!("flex: set_layer_state: {e}");
             }
+        })
+        .detach();
+    }
+
+    /// Move this floating pane to the front or the back of the stack.
+    fn stack_float(&mut self, front: bool, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(block)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.active_block.clone(),
+        ) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, _| {
+            let Ok(view) = engine
+                .call(&address, "session.view", json!({"session_id": session}))
+                .await
+            else {
+                return;
+            };
+            let Some(layer) = find_layer(&view, &block) else {
+                return;
+            };
+            let method = if front {
+                "session.raise_layer"
+            } else {
+                "session.lower_layer"
+            };
+            let payload = json!({"session_id": session, "layer_id": layer});
+            if let Err(e) = engine.call(&address, method, payload).await {
+                eprintln!("flex: {method}: {e}");
+            }
+        })
+        .detach();
+    }
+
+    /// Park this pane: the program keeps running, the window is out of the way.
+    fn park_pane(&mut self, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(block)) =
+            (self.address(), self.session_id.clone(), self.active())
+        else {
+            return;
+        };
+        let id = block.id.clone();
+        let label = block.display_name();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({"session_id": session, "block_id": id});
+            if let Err(e) = engine.call(&address, "session.detach_block", payload).await {
+                eprintln!("flex: detach_block: {e}");
+                return;
+            }
+            this.update(cx, |me, cx| {
+                me.parked.push((id.clone(), label.clone()));
+                if me.active_block.as_deref() == Some(id.as_str()) {
+                    me.active_block = me.blocks().first().map(|b| b.id.clone());
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Put a parked pane back beside the active one.
+    fn unpark(&mut self, id: String, cx: &mut Context<Self>) {
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            return;
+        };
+        let Some(anchor) = self.active().map(|b| b.id) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({
+                "session_id": session,
+                "block_id": id,
+                "anchor_block_id": anchor,
+                "side": "after",
+                "direction": "horizontal",
+                "ratio": 0.5,
+            });
+            if let Err(e) = engine.call(&address, "session.move_block", payload).await {
+                eprintln!("flex: move_block: {e}");
+                return;
+            }
+            this.update(cx, |me, cx| {
+                me.parked.retain(|(parked, _)| parked != &id);
+                me.pending_focus = Some(id.clone());
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -2057,6 +2169,32 @@ impl Workspace {
         if !tucked.is_empty() {
             rows.push(theme::section("TUCKED AWAY").into_any_element());
             rows.extend(tucked);
+        }
+        if !self.parked.is_empty() {
+            rows.push(theme::section("PARKED").into_any_element());
+            for (id, label) in self.parked.clone() {
+                let flat = id.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("parked:{id}")))
+                        .mx_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(theme::text())
+                        .hover(|el| el.bg(chrome.hover()))
+                        .child(div().flex_1().truncate().child(label))
+                        .child(div().text_xs().text_color(theme::muted()).child("parked"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| this.unpark(flat.clone(), cx)),
+                        )
+                        .into_any_element(),
+                );
+            }
         }
 
         rows.push(theme::section("SESSIONS").into_any_element());

@@ -280,7 +280,10 @@ impl TerminalView {
         if text.is_empty() {
             return;
         }
-        session.send_text(&text);
+        // `paste`, not `send_text`: a program that turned on bracketed paste
+        // (mode 2004 — vim, agents, readline) needs the text wrapped, or it
+        // treats every newline as Enter and runs half the paste.
+        session.paste(&text);
     }
 
     /// Open the find bar, or move to the next match if it is already open.
