@@ -17,14 +17,8 @@ pub enum Icon {
     Sidebar,
     /// Settings: sliders.
     Sliders,
-    /// Split the pane, dividing it left/right.
-    SplitRight,
-    /// Split the pane, dividing it top/bottom.
-    SplitDown,
     /// Floating pane: two offset frames.
     Float,
-    /// Close: a cross.
-    Close,
     /// New tab: a plus.
     Plus,
 }
@@ -55,36 +49,6 @@ pub fn icon(kind: Icon, size: Pixels, color: Hsla) -> AnyElement {
             .justify_center()
             .gap(px(3.0))
             .children([0.55_f32, 0.85, 0.7].map(|fraction| line(size * fraction, px(1.0)))),
-        Icon::SplitRight => div()
-            .relative()
-            .size(size)
-            .border_1()
-            .border_color(color)
-            .rounded_sm()
-            .child(
-                div()
-                    .absolute()
-                    .left(size * 0.5)
-                    .top(px(1.0))
-                    .w(px(1.0))
-                    .h(inner)
-                    .bg(color),
-            ),
-        Icon::SplitDown => div()
-            .relative()
-            .size(size)
-            .border_1()
-            .border_color(color)
-            .rounded_sm()
-            .child(
-                div()
-                    .absolute()
-                    .top(size * 0.5)
-                    .left(px(1.0))
-                    .h(px(1.0))
-                    .w(inner)
-                    .bg(color),
-            ),
         Icon::Float => div()
             .relative()
             .size(size)
@@ -106,14 +70,6 @@ pub fn icon(kind: Icon, size: Pixels, color: Hsla) -> AnyElement {
                     .border_1()
                     .border_color(color),
             ),
-        Icon::Close => div()
-            .size(size)
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(size * 0.95)
-            .text_color(color)
-            .child("×"),
         Icon::Plus => div()
             .relative()
             .size(size)

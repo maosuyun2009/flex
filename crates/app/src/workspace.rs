@@ -435,6 +435,25 @@ impl Workspace {
         .detach();
     }
 
+    /// Close a tab: the window and every pane inside it.
+    fn close_window(&mut self, window: String, cx: &mut Context<Self>) {
+        let (Some(server_id), Some(session_id)) = (self.server_id.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, _| {
+            if let Err(e) = engine
+                .shrew()
+                .close_window(&server_id, &session_id, &window)
+                .await
+            {
+                eprintln!("rexshell: close window: {e}");
+            }
+        })
+        .detach();
+    }
+
     /// Fill the window with the active pane, or put the layout back. Rex
     /// toggles when no `zoom` argument is given.
     fn zoom_pane(&mut self, cx: &mut Context<Self>) {
@@ -1106,29 +1125,6 @@ impl Workspace {
             )
             .child(div().w(px(6.0)))
             .child(
-                icons::button("split-right", Icon::SplitRight, false).on_click(
-                    cx.listener(|this, _, window, cx| this.run(Action::SplitRight, window, cx)),
-                ),
-            )
-            .child(
-                icons::button("split-down", Icon::SplitDown, false).on_click(
-                    cx.listener(|this, _, window, cx| this.run(Action::SplitDown, window, cx)),
-                ),
-            )
-            .child(
-                icons::button(
-                    "float",
-                    Icon::Float,
-                    self.active().map(|b| b.floating).unwrap_or(false),
-                )
-                .on_click(
-                    cx.listener(|this, _, window, cx| this.run(Action::ToggleFloat, window, cx)),
-                ),
-            )
-            .child(icons::button("close-pane", Icon::Close, false).on_click(
-                cx.listener(|this, _, window, cx| this.run(Action::ClosePane, window, cx)),
-            ))
-            .child(
                 div()
                     .flex_1()
                     .h_full()
@@ -1338,6 +1334,33 @@ impl Workspace {
                         el.child(theme::dot(theme::agent(state)))
                     })
                     .child(window.label.clone())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("close-{id}")))
+                            .ml_2()
+                            .size(px(13.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(11.0))
+                            .text_color(theme::muted())
+                            .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                            .child("×")
+                            // On press, not on click: choosing a tab rebuilds the
+                            // strip, and a click that spans the rebuild is lost.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, _, cx| {
+                                        this.close_window(id.clone(), cx);
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                            ),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
