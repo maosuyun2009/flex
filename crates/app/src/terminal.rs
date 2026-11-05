@@ -495,8 +495,14 @@ impl TerminalView {
     }
 
     /// Scroll by `lines` notches, never further back than the configured cap.
-    fn wheel(&mut self, notches: f32, cx: &mut Context<Self>) {
+    fn wheel(&mut self, notches: f32, at: (u16, u16), cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
+        // A program that tracks the mouse — pi, vim, less — scrolls itself, and
+        // the alternate screen it draws in has no scrollback to move anyway.
+        if session.mouse_tracking() {
+            session.wheel(at.0, at.1, -notches * 3.0);
+            return;
+        }
         let bar = self.frame.scrollbar;
         // One notch is three lines, the usual terminal step.
         let delta = -(notches * 3.0) as i64;
@@ -733,7 +739,9 @@ impl Render for TerminalView {
                     gpui::ScrollDelta::Lines(lines) => lines.y,
                     gpui::ScrollDelta::Pixels(pixels) => f32::from(pixels.y) / 44.0,
                 };
-                this.wheel(notches, cx);
+                let (origin, metrics) = *this.geometry.lock().unwrap();
+                let at = TerminalView::cell_at(origin, metrics, event.position);
+                this.wheel(notches, at, cx);
             }))
             .when(self.selecting.is_some(), |el| {
                 let view = cx.entity().downgrade();

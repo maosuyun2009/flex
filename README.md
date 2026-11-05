@@ -326,6 +326,14 @@ Drag across the text to select: the drag is tracked cell by cell
 produces, and releasing puts it on the clipboard — no shortcut needed. The wheel
 scrolls the scrollback three lines a notch.
 
+A program that turns on mouse reporting — pi, vim, less, htop — gets the wheel
+instead (`session.wheel` at the pointer's cell), because it draws in the
+alternate screen, where there is no scrollback to move: the view simply never
+changes. pi scrolls its own transcript that way; the whole transcript is
+reachable, not just what fits on screen. flex asks the engine's
+`mouse_tracking()`, the same bit the program set with `1000h`, so the switch is
+the program's decision and not a mode to configure.
+
 **Scrollback** in Settings caps how far back the wheel may go (500 to 100 000
 lines, default 10 000). The engine keeps a fixed 16 MiB of scrollback and its
 `TerminalSession` exposes no setter, so the cap is applied to the viewport: the
