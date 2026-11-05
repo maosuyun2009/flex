@@ -122,6 +122,23 @@ installed here, so bold is synthesised by the platform.
 Settings shows which family was actually picked. The shell's own chrome keeps the
 system UI font — Maple Mono is for the terminals.
 
+## Settings
+
+`Ctrl-,` opens Settings as a **tab** beside the windows, not as a dialog over
+them: a page of the workspace with its own left column (Appearance, Terminal,
+Shortcuts) and the rows on the right. `← Workspace`, the tab's `×`, `Esc` or
+`Ctrl-,` again puts you back in the pane you came from.
+
+Being a page is why the wheel works: the rows live in a scroll container with a
+`min_h(px(0.0))`, so a short window scrolls them instead of clipping them off
+both ends. A dialog cannot do that — centred content taller than the window
+loses its top and bottom to the window edge, and there is nothing to drag.
+
+Keys only reach the window's listener while something holds focus, so the page
+takes a focus handle when it opens and hands it to the active pane when it
+closes; otherwise `Esc` and every other shortcut would go dead on a page whose
+terminals are unmounted.
+
 ## Chrome
 
 GPUI 0.2.2 draws no system title bar on Windows (`dwstyle` gets `WS_SYSMENU`,

@@ -88,6 +88,14 @@ struct Pull {
     live: [f64; 4],
 }
 
+/// Which page of the Settings tab is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Appearance,
+    Terminal,
+    Keys,
+}
+
 pub struct Workspace {
     engine: Arc<Engine>,
     state: AppState,
@@ -107,6 +115,11 @@ pub struct Workspace {
     terminals: HashMap<String, Entity<TerminalView>>,
     styled: bool,
     show_settings: bool,
+    page: Page,
+    /// Keys only reach the window's listeners while something holds focus. The
+    /// panes hold it while they are up; the Settings page takes it so that Esc
+    /// and Ctrl-, keep working once they are unmounted.
+    focus: gpui::FocusHandle,
     pull: Option<Pull>,
     /// Keeps a released pane where it was dropped until the server confirms.
     settled: Option<(String, [f64; 4])>,
@@ -159,6 +172,8 @@ impl Workspace {
             terminals: HashMap::new(),
             styled: false,
             show_settings: false,
+            page: Page::Appearance,
+            focus: cx.focus_handle(),
             pull: None,
             settled: None,
             float_rects: std::collections::HashMap::new(),
@@ -346,9 +361,29 @@ impl Workspace {
         .detach();
     }
 
+    /// Leave the Settings page and hand the keyboard back to the pane that had
+    /// it, because the page unmounts every terminal while it is up.
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_settings = false;
+        if let Some(view) = self
+            .active()
+            .and_then(|block| self.terminals.get(&block.id))
+        {
+            window.focus(&view.read(cx).handle());
+        }
+        cx.notify();
+    }
+
     // ---- actions -----------------------------------------------------------
 
     fn run(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_settings {
+            // The panes are not on screen, so nothing else has anything to act on.
+            if action == Action::Settings {
+                self.close_settings(window, cx);
+            }
+            return;
+        }
         match action {
             Action::SplitRight => self.split(true, cx),
             Action::SplitDown => self.split(false, cx),
@@ -370,6 +405,9 @@ impl Workspace {
             }
             Action::Settings => {
                 self.show_settings = !self.show_settings;
+                if self.show_settings {
+                    window.focus(&self.focus);
+                }
                 cx.notify();
             }
             Action::Prefix => {
@@ -1310,11 +1348,13 @@ impl Workspace {
     fn tab_chips(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let selected = self.window_id.clone();
         let chrome = self.chrome();
-        self.windows()
+        let settings_open = self.show_settings;
+        let mut chips: Vec<AnyElement> = self
+            .windows()
             .into_iter()
             .map(|window| {
                 let id = window.id.clone();
-                let active = selected.as_deref() == Some(id.as_str());
+                let active = !settings_open && selected.as_deref() == Some(id.as_str());
                 div()
                     .id(SharedString::from(id.clone()))
                     .h(px(22.0))
@@ -1363,16 +1403,50 @@ impl Workspace {
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
                             this.window_id = Some(id.clone());
                             this.active_block = None;
                             this.focus_window(&id, cx);
-                            cx.notify();
+                            this.close_settings(window, cx);
                         }),
                     )
                     .into_any_element()
             })
-            .collect()
+            .collect();
+        if settings_open {
+            chips.push(
+                div()
+                    .id("tab-settings")
+                    .h(px(22.0))
+                    .px_3()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .text_xs()
+                    .bg(chrome.active())
+                    .text_color(theme::text())
+                    .child("Settings")
+                    .child(
+                        div()
+                            .id("close-settings")
+                            .ml_2()
+                            .size(px(13.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(11.0))
+                            .text_color(theme::muted())
+                            .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                            .child("×")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        chips
     }
 
     fn panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1690,7 +1764,10 @@ impl Workspace {
         area.into_any_element()
     }
 
-    fn settings_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The Settings tab: a page of the workspace rather than a dialog, so the
+    /// rows can run past the bottom of a short window and the wheel scrolls
+    /// them like any other list. Left column picks the page, as in Pebrel.
+    fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let row = |label: &'static str, detail: String, control: AnyElement| {
             div()
                 .flex()
@@ -1741,10 +1818,10 @@ impl Workspace {
                 .into_any_element()
         };
 
-        let stepper = |cx: &mut Context<Self>, delta: f32| {
-            let glyph = if delta > 0.0 { "+" } else { "−" };
+        let stepper = |cx: &mut Context<Self>, id: &'static str, glyph: &'static str| {
+            let delta = if glyph == "+" { 1.0 } else { -1.0 };
             div()
-                .id(if delta > 0.0 { "font-up" } else { "font-down" })
+                .id(id)
                 .size(px(24.0))
                 .flex()
                 .items_center()
@@ -1761,245 +1838,286 @@ impl Workspace {
         };
 
         let chrome = self.chrome();
+        let font = self.settings.font_size;
         let acrylic = toggle("toggle-acrylic", self.settings.acrylic, cx, |s| {
             &mut s.acrylic
         });
         let sidebar = toggle("toggle-sidebar-setting", self.settings.sidebar, cx, |s| {
             &mut s.sidebar
         });
-        let down = stepper(cx, -1.0);
-        let up = stepper(cx, 1.0);
-        let font = self.settings.font_size;
+        let down = stepper(cx, "font-down", "−");
+        let up = stepper(cx, "font-up", "+");
 
-        let shortcuts: Vec<AnyElement> = shortcuts::BINDINGS
-            .iter()
-            .map(|(keys, _, label)| {
+        let mut nav: Vec<AnyElement> = Vec::new();
+        for (page, label) in [
+            (Page::Appearance, "Appearance"),
+            (Page::Terminal, "Terminal"),
+            (Page::Keys, "Shortcuts"),
+        ] {
+            let selected = self.page == page;
+            nav.push(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_4()
-                    .py_1()
-                    .child(div().text_xs().text_color(theme::muted()).child(*label))
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(chrome.active())
-                            .text_xs()
-                            .text_color(theme::text())
-                            .child(keys.replace("ctrl", "Ctrl").replace("shift", "Shift")),
-                    )
-                    .into_any_element()
-            })
-            .collect();
+                    .id(SharedString::from(format!("settings-page-{label}")))
+                    .mx_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .when(selected, |el| {
+                        el.bg(chrome.active()).text_color(theme::text())
+                    })
+                    .when(!selected, |el| {
+                        el.text_color(theme::muted())
+                            .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.page = page;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
 
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_center()
-            .bg(hsla(0.0, 0.0, 0.0, 0.55))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .w(px(460.0))
-                    .rounded_lg()
-                    // Opaque on purpose: the chrome is translucent, but a dialog
-                    // with a terminal bleeding through it is unreadable.
-                    .bg(theme::color(theme::SURFACE))
-                    .border_1()
-                    .border_color(theme::border())
-                    .shadow_lg()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_4()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(theme::border())
-                            .child(div().text_color(theme::text()).child("Settings"))
-                            .child(
-                                div()
-                                    .id("settings-close")
-                                    .size(px(22.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_color(theme::muted())
-                                    .hover(|el| el.bg(theme::hover()).text_color(theme::text()))
-                                    .child("×")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_settings = false;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(row(
-                        "Translucent",
-                        "Layer the chrome over a gradient instead of flat colours".into(),
-                        acrylic,
-                    ))
-                    .child(row("Sidebar", "Show the session list".into(), sidebar))
-                    .child(row(
-                        "Picture opacity",
-                        format!("{:.0}%", self.settings.background_opacity * 100.0),
+        let mut rows: Vec<AnyElement> = Vec::new();
+        match self.page {
+            Page::Appearance => {
+                rows.push(row(
+                    "Translucent",
+                    "Layer the chrome over a gradient instead of flat colours".into(),
+                    acrylic,
+                ));
+                rows.push(row("Sidebar", "Show the session list".into(), sidebar));
+                rows.push(theme::section("BACKGROUND").into_any_element());
+                rows.push(row(
+                    "Picture",
+                    self.settings
+                        .background
+                        .as_deref()
+                        .and_then(|path| path.rsplit(['\\', '/']).next())
+                        .unwrap_or("None")
+                        .to_owned(),
+                    {
+                        let clear = self.settings.background.as_ref().map(|_| {
+                            div()
+                                .id("bg-clear")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                                .child("Clear")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_background(None, cx);
+                                }))
+                                .into_any_element()
+                        });
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
                             .child(
                                 div()
-                                    .id("bg-less")
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_color(theme::text())
-                                    .hover(|el| el.bg(chrome.hover()))
-                                    .child("−")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let value =
-                                            (this.settings.background_opacity - 0.1).max(0.05);
-                                        this.set_background_opacity(value, cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("bg-more")
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_color(theme::text())
-                                    .hover(|el| el.bg(chrome.hover()))
-                                    .child("+")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let value =
-                                            (this.settings.background_opacity + 0.1).min(0.95);
-                                        this.set_background_opacity(value, cx);
-                                    })),
-                            )
-                            .into_any_element(),
-                    ))
-                    .child(row(
-                        "Font size",
-                        format!("{font:.0} pt"),
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(down)
-                            .child(up)
-                            .into_any_element(),
-                    ))
-                    .child(theme::section("BACKGROUND"))
-                    .child(row(
-                        "Picture",
-                        self.settings
-                            .background
-                            .as_deref()
-                            .and_then(|path| path.rsplit(['\\', '/']).next())
-                            .unwrap_or("None")
-                            .to_owned(),
-                        {
-                            let clear = self.settings.background.as_ref().map(|_| {
-                                div()
-                                    .id("bg-clear")
+                                    .id("bg-choose")
                                     .px_2()
                                     .py_1()
                                     .rounded_md()
                                     .text_xs()
-                                    .text_color(theme::muted())
-                                    .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
-                                    .child("Clear")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_background(None, cx);
-                                    }))
-                                    .into_any_element()
-                            });
+                                    .text_color(theme::text())
+                                    .bg(chrome.active())
+                                    .hover(|el| el.bg(chrome.hover()))
+                                    .child("Choose…")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.choose_background(cx)),
+                                    ),
+                            )
+                            .children(clear)
+                            .into_any_element()
+                    },
+                ));
+                rows.push(row(
+                    "Picture opacity",
+                    format!("{:.0}%", self.settings.background_opacity * 100.0),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
                             div()
+                                .id("bg-less")
+                                .size(px(24.0))
                                 .flex()
                                 .items_center()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .id("bg-choose")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .text_xs()
-                                        .text_color(theme::text())
-                                        .bg(chrome.active())
-                                        .hover(|el| el.bg(chrome.hover()))
-                                        .child("Choose…")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.choose_background(cx)
-                                            }),
-                                        ),
-                                )
-                                .children(clear)
-                                .into_any_element()
-                        },
-                    ))
-                    .child(row(
-                        "Scrollback",
-                        format!("{} lines", self.settings.scrollback_lines),
+                                .justify_center()
+                                .rounded_md()
+                                .text_color(theme::text())
+                                .hover(|el| el.bg(chrome.hover()))
+                                .child("−")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let value = (this.settings.background_opacity - 0.1).max(0.05);
+                                    this.set_background_opacity(value, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("bg-more")
+                                .size(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .text_color(theme::text())
+                                .hover(|el| el.bg(chrome.hover()))
+                                .child("+")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let value = (this.settings.background_opacity + 0.1).min(0.95);
+                                    this.set_background_opacity(value, cx);
+                                })),
+                        )
+                        .into_any_element(),
+                ));
+            }
+            Page::Terminal => {
+                rows.push(row(
+                    "Font size",
+                    format!("{font:.0} pt"),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(down)
+                        .child(up)
+                        .into_any_element(),
+                ));
+                rows.push(row(
+                    "Scrollback",
+                    format!("{} lines", self.settings.scrollback_lines),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("scroll-less")
+                                .size(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .text_color(theme::text())
+                                .hover(|el| el.bg(chrome.hover()))
+                                .child("−")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_scrollback(this.settings.scrollback_lines / 2, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("scroll-more")
+                                .size(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .text_color(theme::text())
+                                .hover(|el| el.bg(chrome.hover()))
+                                .child("+")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_scrollback(this.settings.scrollback_lines * 2, cx);
+                                })),
+                        )
+                        .into_any_element(),
+                ));
+                rows.push(theme::section("FONT").into_any_element());
+                rows.push(row(
+                    "Terminal",
+                    "The first installed family the shell offers".into(),
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(self.font.to_string())
+                        .into_any_element(),
+                ));
+            }
+            Page::Keys => {
+                rows.push(theme::section("SHORTCUTS").into_any_element());
+                rows.extend(shortcuts::BINDINGS.iter().map(|(keys, _, label)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_4()
+                        .py_1()
+                        .child(div().text_xs().text_color(theme::muted()).child(*label))
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(chrome.active())
+                                .text_xs()
+                                .text_color(theme::text())
+                                .child(keys.replace("ctrl", "Ctrl").replace("shift", "Shift")),
+                        )
+                        .into_any_element()
+                }));
+            }
+        }
+
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .w(theme::SIDEBAR_W)
+                    .h_full()
+                    .flex_col()
+                    .bg(chrome.surface())
+                    .border_r_1()
+                    .border_color(theme::border())
+                    .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .id("scroll-less")
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_color(theme::text())
-                                    .hover(|el| el.bg(chrome.hover()))
-                                    .child("−")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_scrollback(this.settings.scrollback_lines / 2, cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("scroll-more")
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_color(theme::text())
-                                    .hover(|el| el.bg(chrome.hover()))
-                                    .child("+")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_scrollback(this.settings.scrollback_lines * 2, cx);
-                                    })),
-                            )
-                            .into_any_element(),
-                    ))
-                    .child(theme::section("FONT"))
-                    .child(row(
-                        "Terminal",
-                        self.font.to_string(),
-                        div().into_any_element(),
-                    ))
-                    .child(theme::section("SHORTCUTS"))
-                    .children(shortcuts)
-                    .child(div().h(px(10.0))),
+                            .id("settings-back")
+                            .mx_2()
+                            .mt_3()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .text_color(theme::muted())
+                            .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                            .child("← Workspace")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
+                            ),
+                    )
+                    .child(theme::section("SETTINGS"))
+                    .children(nav),
+            )
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    // Without this a flex item refuses to shrink below its
+                    // content, and the page never has anything to scroll.
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex_col()
+                            .max_w(px(720.0))
+                            .py_6()
+                            .child(div().px_4().pb_2().text_color(theme::text()).child(
+                                match self.page {
+                                    Page::Appearance => "Appearance",
+                                    Page::Terminal => "Terminal",
+                                    Page::Keys => "Shortcuts",
+                                },
+                            ))
+                            .children(rows),
+                    ),
             )
             .into_any_element()
     }
@@ -2012,16 +2130,22 @@ impl Render for Workspace {
             crate::win32::round_corners();
         }
         let title_bar = self.title_bar(cx);
-        let panes = self.panes(window, cx);
-        let sidebar = if self.settings.sidebar {
-            Some(self.sidebar(cx))
+        let body = if self.show_settings {
+            self.settings_page(cx)
         } else {
-            None
-        };
-        let settings = if self.show_settings {
-            Some(self.settings_panel(cx))
-        } else {
-            None
+            let sidebar = if self.settings.sidebar {
+                Some(self.sidebar(cx))
+            } else {
+                None
+            };
+            let panes = self.panes(window, cx);
+            div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .children(sidebar)
+                .child(div().flex().flex_col().flex_1().min_w(px(0.0)).child(panes))
+                .into_any_element()
         };
 
         // Semi-transparent, not see-through: GPUI paints opaque pixels on
@@ -2045,10 +2169,10 @@ impl Render for Workspace {
 
         root.text_color(theme::text())
             .text_sm()
+            .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.show_settings && event.keystroke.key == "escape" {
-                    this.show_settings = false;
-                    cx.notify();
+                    this.close_settings(window, cx);
                     return;
                 }
                 if let Some(action) = shortcuts::lookup(&event.keystroke) {
@@ -2075,15 +2199,7 @@ impl Render for Workspace {
                 }
             }))
             .child(title_bar)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .children(sidebar)
-                    .child(div().flex().flex_col().flex_1().min_w(px(0.0)).child(panes)),
-            )
-            .children(settings)
+            .child(body)
     }
 }
 
