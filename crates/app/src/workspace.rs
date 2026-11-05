@@ -119,6 +119,15 @@ pub struct Workspace {
     pending_pick: Option<PendingPick>,
     /// The pane a tool was opened from, dimmed while the tool is up.
     tinted: Option<String>,
+    /// The last press on the title bar, for spotting a double-click. Windows
+    /// would send `WM_NCLBUTTONDBLCLK`, but we hand the press to the shell for
+    /// dragging, which swallows the second click, so it is detected here.
+    title_press: Option<(std::time::Instant, gpui::Point<gpui::Pixels>)>,
+    /// A press on the title bar with the window not moved yet. The drag only
+    /// starts once the pointer actually moves: handing Windows
+    /// `WM_NCLBUTTONDOWN` on press restores a maximized window the moment the
+    /// pointer twitches, which made double-click-to-restore impossible.
+    title_armed: Option<gpui::Point<gpui::Pixels>>,
     _wake: Option<Task<()>>,
 }
 
@@ -156,6 +165,8 @@ impl Workspace {
             prefix: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_pick: None,
             tinted: None,
+            title_press: None,
+            title_armed: None,
             _wake: None,
         };
         this.reload(cx);
@@ -829,6 +840,21 @@ impl Workspace {
         }
     }
 
+    /// True when this press completes a double-click: same spot, twice, quickly.
+    fn is_double_press(&mut self, at: gpui::Point<gpui::Pixels>) -> bool {
+        const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+        const SLOP: f32 = 8.0;
+        let now = std::time::Instant::now();
+        let doubled = self.title_press.is_some_and(|(when, then)| {
+            now.duration_since(when) < DOUBLE_CLICK
+                && (f32::from(at.x) - f32::from(then.x)).abs() < SLOP
+                && (f32::from(at.y) - f32::from(then.y)).abs() < SLOP
+        });
+        // Reset after a double so a third click starts a new pair.
+        self.title_press = if doubled { None } else { Some((now, at)) };
+        doubled
+    }
+
     fn drop_tint(&mut self, cx: &mut Context<Self>) {
         self.tinted = None;
         cx.notify();
@@ -995,8 +1021,8 @@ impl Workspace {
     /// Everything but the buttons drags the window.
     fn title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let maximized = crate::win32::is_maximized();
-        let drag =
-            |el: gpui::Div| el.on_mouse_down(MouseButton::Left, |_, _, _| crate::win32::drag());
+        // A press drags the window, except the second press of a double-click,
+        // which maximizes or restores it — what people expect of a title bar.
         let chips = self.tab_chips(cx);
         let chrome = self.chrome();
 
@@ -1014,9 +1040,16 @@ impl Workspace {
                 ),
             )
             .child(
-                drag(div().flex().items_center().h_full().pl_1().pr_2().gap_2())
+                div()
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .pl_1()
+                    .pr_2()
+                    .gap_2()
                     .child(div().size(px(8.0)).rounded_sm().bg(theme::accent()))
-                    .child(div().text_color(theme::muted()).child("rexshell")),
+                    .child(div().text_color(theme::muted()).child("rexshell"))
+                    .on_mouse_down(MouseButton::Left, cx.listener(title_press)),
             )
             .child(div().w(px(1.0)).h(px(16.0)).mx_2().bg(theme::border()))
             .children(chips)
@@ -1049,7 +1082,12 @@ impl Workspace {
             .child(icons::button("close-pane", Icon::Close, false).on_click(
                 cx.listener(|this, _, window, cx| this.run(Action::ClosePane, window, cx)),
             ))
-            .child(drag(div().flex_1().h_full()))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .on_mouse_down(MouseButton::Left, cx.listener(title_press)),
+            )
             .child(
                 icons::button("settings", Icon::Sliders, self.show_settings).on_click(
                     cx.listener(|this, _, window, cx| this.run(Action::Settings, window, cx)),
@@ -1455,6 +1493,51 @@ impl Workspace {
         // across the whole area, before the panes, so it spans the terminal
         // instead of repeating inside every split.
         let mut area = div().relative().flex_1().overflow_hidden();
+        // Armed on the title bar: a movement starts the drag, a release without
+        // movement stays a click.
+        if let Some(start) = self.title_armed {
+            let workspace = cx.entity().downgrade();
+            let mover = workspace.clone();
+            area = area.child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _cx| {
+                        let this = mover.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseMoveEvent, _phase, _window, cx| {
+                                if let Some(from) = start.into() {
+                                    let moved = (f32::from(event.position.x) - f32::from(from.x))
+                                        .abs()
+                                        + (f32::from(event.position.y) - f32::from(from.y)).abs();
+                                    if moved > 4.0 {
+                                        let _ = this.update(cx, |me, cx| {
+                                            me.title_armed = None;
+                                            crate::win32::drag();
+                                            cx.notify();
+                                        });
+                                    }
+                                }
+                            },
+                        );
+                        let this = workspace.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, _phase, _window, cx| {
+                            if event.button == MouseButton::Left {
+                                let _ = this.update(cx, |me, cx| {
+                                    if me.title_armed.take().is_some() {
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full(),
+            );
+        }
+
         if let Some(image) = self.picture.clone() {
             area = area.child(
                 canvas(
@@ -1964,6 +2047,26 @@ fn control(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, window, cx| action(window, cx))
         .into_any_element()
+}
+
+/// A press on the title bar: drag the window, or, on the second press of a
+/// double-click, maximize or restore it. Windows would send `WM_NCLBUTTONDBLCLK`,
+/// but the first press is handed to the shell for dragging, which swallows the
+/// second, so the pair is spotted here instead.
+fn title_press(
+    this: &mut Workspace,
+    event: &MouseDownEvent,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if this.is_double_press(event.position) {
+        this.title_armed = None;
+        crate::win32::toggle_maximize();
+    } else {
+        // Wait for movement before handing the window to the drag loop.
+        this.title_armed = Some(event.position);
+    }
+    cx.notify();
 }
 
 /// The most urgent agent state among a window's panes, if any pane reports one.

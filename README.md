@@ -112,6 +112,14 @@ the shell draws its own and asks Windows for the missing verbs:
 | --- | --- |
 | Title bar | drags the window (`WM_NCLBUTTONDOWN` + `HTCAPTION`), shows the server and session |
 | `—` `□` `×` | minimize, maximize/restore, close — drawn as shapes, not glyphs |
+| Double-click the bar | maximize or restore, the Windows habit |
+
+The double-click is detected by the shell: Windows sends `WM_NCLBUTTONDBLCLK` for
+the second press only when the window class asks for it with `CS_DBLCLKS`, and
+GPUI's class does not, so two plain presses arrive instead. A press also does not
+start the drag immediately — it waits for the pointer to move — because handing
+Windows `WM_NCLBUTTONDOWN` on the press itself un-maximizes the window as soon as
+the pointer twitches, which is what made double-click-to-restore impossible.
 | Corners | `DWMWA_WINDOW_CORNER_PREFERENCE` rounds them, as on Pebrel |
 | Initial size | a fraction of the real display, because a fixed logical size overflows a scaled screen |
 
