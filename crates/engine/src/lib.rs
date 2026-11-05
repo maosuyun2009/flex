@@ -70,6 +70,36 @@ impl Engine {
         self.shrew.add_local_server_if_present()
     }
 
+    /// Where the block's programs actually are.
+    ///
+    /// `BlockState::pwd` only carries what the shell *reported* with OSC 7, and
+    /// plain zsh or bash never report anything, so a terminal sitting at a
+    /// prompt has no pwd at all. The server can read the foreground process's
+    /// directory instead, which is the one a new split or tool should start in.
+    pub async fn block_cwd(
+        &self,
+        address: &str,
+        session_id: &str,
+        block_id: &str,
+    ) -> Option<String> {
+        let reply = self
+            .call(
+                address,
+                "com.superlogical.terminal.process",
+                serde_json::json!({"session_id": session_id, "block_id": block_id}),
+            )
+            .await
+            .ok()?;
+        let field = |pointer: &str| {
+            reply
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        field("/foreground/cwd").or_else(|| field("/child/cwd"))
+    }
+
     /// Call a Rex method that `shrew-core` does not wrap — `session.float_block`
     /// and `session.move_block` today. shrew-core keeps its control connection
     /// private, so this opens a short-lived one of its own.

@@ -213,6 +213,14 @@ the layout underneath is untouched and closing it leaves no hole. herdr-style:
 | `d` | `fzf` over directories, typed in with a trailing `/` |
 | `z` | both files and directories |
 
+Tools open in **the pane's directory**, not in `$HOME`. The block only carries
+the directory the shell *reported* with OSC 7 — sometimes a `file://host/path`
+URL, and nothing at all from plain bash — so handing that to the server sent
+lazygit to the home directory and made it ask whether to create a repository
+there. The shell asks the server for the foreground process's `cwd` instead
+(`Engine::block_cwd`, one `process` call) and passes that to the layer and to
+new splits.
+
 The picker prints its choice as a marked line (`@@pick@@<path>`) instead of
 relying on fzf's screen, so the client can find it: when the picker's process
 exits, the shell reads that line out of the pane's text and sends it to the

@@ -430,10 +430,16 @@ impl Workspace {
         };
         let engine = self.engine.clone();
         let block_id = block.id;
+        let address = self.address();
         cx.spawn(async move |this, cx| {
+            // A split lands where the pane it came from is, not in `$HOME`.
+            let cwd = match &address {
+                Some(address) => engine.block_cwd(address, &session_id, &block_id).await,
+                None => None,
+            };
             match engine
                 .shrew()
-                .split(&server_id, &session_id, &block_id, vertical, None)
+                .split(&server_id, &session_id, &block_id, vertical, cwd.as_deref())
                 .await
             {
                 Ok(Some(new_block)) => {
@@ -727,28 +733,31 @@ impl Workspace {
             ),
         };
 
-        let mut options = json!({"shell": "none", "command": command});
-        if !origin.pwd.is_empty() {
-            options["cwd"] = json!(origin.pwd);
-        }
-        // A floating terminal, not a split: it covers the work, and closing it
-        // leaves the layout exactly as it was.
-        let payload = json!({
-            "session_id": session_id,
-            "window_id": self.window_id,
-            "bounds": TOOL_BOUNDS,
-            "layout": {
-                "block": {
-                    "flavor": "com.superlogical.terminal.shell",
-                    "options": options,
-                }
-            },
-        });
-
         let engine = self.engine.clone();
         let origin_block = origin.id.clone();
+        let window_id = self.window_id.clone();
 
         cx.spawn(async move |this, cx| {
+            // In the pane's own directory, not in `$HOME`: the block's reported
+            // pwd is empty unless the shell speaks OSC 7, so ask the server where
+            // the foreground process actually is.
+            let mut options = json!({"shell": "none", "command": command});
+            if let Some(cwd) = engine.block_cwd(&address, &session_id, &origin_block).await {
+                options["cwd"] = json!(cwd);
+            }
+            // A floating terminal, not a split: it covers the work, and closing it
+            // leaves the layout exactly as it was.
+            let payload = json!({
+                "session_id": session_id,
+                "window_id": window_id,
+                "bounds": TOOL_BOUNDS,
+                "layout": {
+                    "block": {
+                        "flavor": "com.superlogical.terminal.shell",
+                        "options": options,
+                    }
+                },
+            });
             let result = engine.call(&address, "session.new_layer", payload).await;
             let block = match result {
                 Ok(view) => view
