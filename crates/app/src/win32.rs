@@ -141,6 +141,24 @@ mod imp {
         }
     }
 
+    /// Open a link in whatever the user browses with.
+    pub fn open_url(url: &str) {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+
     pub fn round_corners() {
         const ROUND: u32 = 2; // DWMWCP_ROUND
         if let Some(hwnd) = hwnd() {
@@ -158,6 +176,8 @@ mod imp {
     }
 
     pub fn set_clipboard_text(_: &str) {}
+
+    pub fn open_url(_: &str) {}
 
     pub fn drag() {}
     pub fn is_maximized() -> bool {
@@ -201,6 +221,6 @@ mod imp {
 }
 
 pub use imp::{
-    clipboard_text, drag, is_maximized, minimize, round_corners, set_clipboard_text,
+    clipboard_text, drag, is_maximized, minimize, open_url, round_corners, set_clipboard_text,
     toggle_maximize,
 };

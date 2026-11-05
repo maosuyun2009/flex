@@ -132,6 +132,7 @@ enum Page {
     Appearance,
     Terminal,
     Keys,
+    Connection,
 }
 
 pub struct Workspace {
@@ -183,6 +184,12 @@ pub struct Workspace {
     divider: Option<Divider>,
     /// A name being typed.
     prompt: Option<Prompt>,
+    /// Whether this client has told the server its label yet.
+    named_client: bool,
+    /// `server.whoami` and `server.status`, fetched when Connection is opened.
+    server_info: Option<serde_json::Value>,
+    /// `client.keymap`: the bindings Rex itself would apply, from init.lua.
+    keymap: Option<serde_json::Value>,
     /// Panes this shell parked: alive, out of every window, in this list.
     parked: Vec<(String, String)>,
     /// Floating layers this shell tucked away. Rex keeps the state, but
@@ -242,6 +249,9 @@ impl Workspace {
             area_geometry: Arc::default(),
             divider: None,
             prompt: None,
+            named_client: false,
+            server_info: None,
+            keymap: None,
             parked: Vec::new(),
             minimized: std::collections::HashSet::new(),
             notices,
@@ -365,6 +375,11 @@ impl Workspace {
                 self.window_id = Some(active);
             }
         }
+        if !self.named_client && self.session_id.is_some() && self.address().is_some() {
+            self.named_client = true;
+            let label = format!("flex on {}", self.device());
+            self.name_client(label, cx);
+        }
         let blocks = self.blocks();
         if !blocks
             .iter()
@@ -445,6 +460,13 @@ impl Workspace {
             .find(|b| Some(&b.id) == self.active_block.as_ref())
             .or_else(|| blocks.first())
             .cloned()
+    }
+
+    /// What this machine calls itself in the strip and in the client list.
+    fn device(&self) -> String {
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "this device".into())
     }
 
     fn address(&self) -> Option<String> {
@@ -1045,6 +1067,89 @@ impl Workspace {
             {
                 eprintln!("flex: set_layer_state: {e}");
             }
+        })
+        .detach();
+    }
+
+    /// Ask the server who we are and what it is running, for the Connection page.
+    fn refresh_info(&mut self, cx: &mut Context<Self>) {
+        let Some(address) = self.address() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let whoami = engine.call(&address, "server.whoami", json!({})).await;
+            let status = engine.call(&address, "server.status", json!({})).await;
+            this.update(cx, |me, cx| {
+                me.server_info = Some(json!({
+                    "whoami": whoami.ok(),
+                    "status": status.ok(),
+                }));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask the server for the keymap it would apply, which includes whatever
+    /// the user wrote in init.lua.
+    fn refresh_keymap(&mut self, cx: &mut Context<Self>) {
+        let Some(address) = self.address() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let keymap = engine.call(&address, "client.keymap", json!({})).await;
+            this.update(cx, |me, cx| {
+                me.keymap = keymap.ok();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Turn on the server's built-in Tailscale, or ask it for a sign-in link.
+    fn tailscale(&mut self, sign_in: bool, cx: &mut Context<Self>) {
+        let Some(address) = self.address() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let method = if sign_in {
+                "server.tailscale.login"
+            } else {
+                "server.tailscale.enable"
+            };
+            match engine.call(&address, method, json!({})).await {
+                Ok(reply) => {
+                    // login answers with a URL to open; enable just starts it.
+                    if let Some(url) = reply
+                        .get("url")
+                        .or_else(|| reply.get("login_url"))
+                        .and_then(|u| u.as_str())
+                    {
+                        crate::win32::open_url(url);
+                    }
+                }
+                Err(e) => eprintln!("flex: {method}: {e}"),
+            }
+            this.update(cx, |me, cx| me.refresh_info(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Name this client, so other clients list it as something readable.
+    fn name_client(&mut self, label: String, cx: &mut Context<Self>) {
+        let Some(address) = self.address() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, _| {
+            let _ = engine
+                .call(&address, "client.set_label", json!({"label": label}))
+                .await;
         })
         .detach();
     }
@@ -2913,6 +3018,7 @@ impl Workspace {
             (Page::Appearance, "Appearance"),
             (Page::Terminal, "Terminal"),
             (Page::Keys, "Shortcuts"),
+            (Page::Connection, "Connection"),
         ] {
             let selected = self.page == page;
             nav.push(
@@ -2932,6 +3038,12 @@ impl Workspace {
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.page = page;
+                        if page == Page::Connection && this.server_info.is_none() {
+                            this.refresh_info(cx);
+                        }
+                        if page == Page::Keys && this.keymap.is_none() {
+                            this.refresh_keymap(cx);
+                        }
                         cx.notify();
                     }))
                     .into_any_element(),
@@ -3099,8 +3211,209 @@ impl Workspace {
                         .into_any_element(),
                 ));
             }
+            Page::Connection => {
+                let status = self.server_info.as_ref().and_then(|i| i.get("status"));
+                let whoami = self.server_info.as_ref().and_then(|i| i.get("whoami"));
+                let text = |value: Option<&serde_json::Value>, pointer: &str| -> String {
+                    value
+                        .and_then(|v| v.pointer(pointer))
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| "—".into())
+                };
+                rows.push(row(
+                    "Server",
+                    self.address().unwrap_or_else(|| "—".into()),
+                    div().into_any_element(),
+                ));
+                rows.push(row(
+                    "Signed in as",
+                    text(whoami, "/account"),
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(text(whoami, "/principal/kind"))
+                        .into_any_element(),
+                ));
+                rows.push(row(
+                    "Connection",
+                    text(whoami, "/principal/transport"),
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(text(whoami, "/principal/remote_addr"))
+                        .into_any_element(),
+                ));
+                rows.push(row(
+                    "Rex server",
+                    format!("API revision {}", text(status, "/api_revision")),
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(format!("{} sessions", text(status, "/session_count")))
+                        .into_any_element(),
+                ));
+                rows.push(row(
+                    "Tailscale",
+                    text(status, "/tailscale/state"),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("ts-enable")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .bg(chrome.active())
+                                .text_color(theme::text())
+                                .hover(|el| el.bg(chrome.hover()))
+                                .child("Enable")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.tailscale(false, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("ts-login")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                                .child("Sign in")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.tailscale(true, cx);
+                                })),
+                        )
+                        .into_any_element(),
+                ));
+                rows.push(row(
+                    "This client",
+                    "flex".into(),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("refresh-info")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme::text())
+                                .bg(chrome.active())
+                                .hover(|el| el.bg(chrome.hover()))
+                                .child("Refresh")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.server_info = None;
+                                    this.refresh_info(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("name-client")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                                .child("Name this client")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let label = format!("flex on {}", this.device());
+                                    this.name_client(label, cx);
+                                })),
+                        )
+                        .into_any_element(),
+                ));
+            }
             Page::Keys => {
                 rows.push(theme::section("SHORTCUTS").into_any_element());
+                if let Some(keymap) = &self.keymap {
+                    let config = keymap.get("config").cloned().unwrap_or_default();
+                    let path = config
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("init.lua")
+                        .to_owned();
+                    let exists = config
+                        .get("exists")
+                        .and_then(|e| e.as_bool())
+                        .unwrap_or(false);
+                    rows.push(theme::section("REX").into_any_element());
+                    rows.push(row(
+                        "init.lua",
+                        if exists {
+                            "loaded — its bindings are listed below".into()
+                        } else {
+                            "not found; flex's own table is what you get".into()
+                        },
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(path)
+                            .into_any_element(),
+                    ));
+                    let bindings = keymap
+                        .get("bindings")
+                        .and_then(|b| b.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    for binding in bindings {
+                        let keys = binding
+                            .get("keys")
+                            .map(|k| match k {
+                                serde_json::Value::Array(list) => list
+                                    .iter()
+                                    .filter_map(|k| k.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" · "),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                        let action = binding
+                            .get("action")
+                            .or_else(|| binding.get("name"))
+                            .map(|a| match a {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                        let binding = &binding;
+                        rows.push(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_4()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(binding.to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(chrome.active())
+                                        .text_xs()
+                                        .text_color(theme::text())
+                                        .child(format!("{keys} → {action}")),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
                 rows.extend(shortcuts::BINDINGS.iter().map(|(keys, _, label)| {
                     div()
                         .flex()
@@ -3174,6 +3487,7 @@ impl Workspace {
                                     Page::Appearance => "Appearance",
                                     Page::Terminal => "Terminal",
                                     Page::Keys => "Shortcuts",
+                                    Page::Connection => "Connection",
                                 },
                             ))
                             .children(rows),
