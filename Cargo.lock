@@ -1672,6 +1672,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "flex"
+version = "0.0.1"
+dependencies = [
+ "async-channel 2.5.0",
+ "flex-engine",
+ "gpui",
+ "image",
+ "serde_json",
+ "shrew-core",
+ "windows-sys 0.61.2",
+ "winres",
+]
+
+[[package]]
+name = "flex-engine"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "shrew-client",
+ "shrew-core",
+]
+
+[[package]]
 name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4393,28 +4416,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rexshell"
-version = "0.1.0"
-dependencies = [
- "async-channel 2.5.0",
- "gpui",
- "image",
- "rexshell-engine",
- "serde_json",
- "shrew-core",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rexshell-engine"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "shrew-client",
- "shrew-core",
-]
-
-[[package]]
 name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5657,6 +5658,15 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
@@ -6858,6 +6868,15 @@ checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.11",
 ]
 
 [[package]]

@@ -3,14 +3,14 @@ resolver = "2"
 members = ["crates/engine", "crates/app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
 # Pinned: shrew 0.1.0-dev is not on crates.io yet. Bump the rev deliberately.
 shrew-core = { git = "https://github.com/teddytennant/shrew", rev = "9cfc45ff91ab1d2283f7514f8a5d0096a0d68690" }
-rexshell-engine = { path = "crates/engine" }
+flex-engine = { path = "crates/engine" }
 
 [profile.dev]
 opt-level = 1

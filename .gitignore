@@ -1,5 +1,7 @@
+/dist
 /target
 /rxbuild.log
 /app.log*
 /shot.png
 /*.ps1
+/shot*.png

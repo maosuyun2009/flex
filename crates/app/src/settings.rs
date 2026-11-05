@@ -3,7 +3,7 @@
 //! Values live in the engine's store, which persists them next to the saved
 //! server list, so the shell opens the way it was left.
 
-use rexshell_engine::Engine;
+use flex_engine::Engine;
 use serde_json::json;
 
 #[derive(Clone, Debug)]
@@ -43,28 +43,27 @@ pub const SCROLL_MAX: u64 = 100_000;
 impl Settings {
     pub fn load(engine: &Engine) -> Self {
         let store = engine.shrew();
-        let number = |key: &str| {
+        // Settings saved before the rename still count, so nobody loses their
+        // font size to a name change.
+        let setting = |key: &str| {
             store
                 .setting(key)
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
+                .or_else(|| store.setting(&key.replace("flex.", "rexshell.")))
         };
-        let flag = |key: &str| store.setting(key).and_then(|v| v.as_bool());
+        let number = |key: &str| setting(key).and_then(|v| v.as_f64()).map(|v| v as f32);
+        let flag = |key: &str| setting(key).and_then(|v| v.as_bool());
         let default = Self::default();
         Self {
-            font_size: number("rexshell.font_size")
+            font_size: number("flex.font_size")
                 .unwrap_or(default.font_size)
                 .clamp(FONT_MIN, FONT_MAX),
-            sidebar: flag("rexshell.sidebar").unwrap_or(default.sidebar),
-            acrylic: flag("rexshell.acrylic").unwrap_or(default.acrylic),
-            background: store
-                .setting("rexshell.background")
-                .and_then(|v| v.as_str().map(str::to_owned)),
-            background_opacity: number("rexshell.background_opacity")
+            sidebar: flag("flex.sidebar").unwrap_or(default.sidebar),
+            acrylic: flag("flex.acrylic").unwrap_or(default.acrylic),
+            background: setting("flex.background").and_then(|v| v.as_str().map(str::to_owned)),
+            background_opacity: number("flex.background_opacity")
                 .unwrap_or(default.background_opacity)
                 .clamp(0.05, 0.95),
-            scrollback_lines: store
-                .setting("rexshell.scrollback_lines")
+            scrollback_lines: setting("flex.scrollback_lines")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(default.scrollback_lines)
                 .clamp(SCROLL_MIN, SCROLL_MAX),
@@ -73,20 +72,17 @@ impl Settings {
 
     pub fn save(&self, engine: &Engine) {
         let store = engine.shrew();
-        store.set_setting("rexshell.font_size", json!(self.font_size));
-        store.set_setting("rexshell.sidebar", json!(self.sidebar));
-        store.set_setting("rexshell.acrylic", json!(self.acrylic));
+        store.set_setting("flex.font_size", json!(self.font_size));
+        store.set_setting("flex.sidebar", json!(self.sidebar));
+        store.set_setting("flex.acrylic", json!(self.acrylic));
         store.set_setting(
-            "rexshell.background",
+            "flex.background",
             match &self.background {
                 Some(path) => json!(path),
                 None => json!(null),
             },
         );
-        store.set_setting(
-            "rexshell.background_opacity",
-            json!(self.background_opacity),
-        );
-        store.set_setting("rexshell.scrollback_lines", json!(self.scrollback_lines));
+        store.set_setting("flex.background_opacity", json!(self.background_opacity));
+        store.set_setting("flex.scrollback_lines", json!(self.scrollback_lines));
     }
 }

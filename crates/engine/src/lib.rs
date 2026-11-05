@@ -1,4 +1,4 @@
-//! Toolkit-free glue between a Rex server and the rexshell UI.
+//! Toolkit-free glue between a Rex server and the flex UI.
 //!
 //! Everything here is plain data and callbacks so it can be unit tested, or
 //! driven by a different UI toolkit, without a GPU or a display.
@@ -39,7 +39,7 @@ impl Engine {
     pub fn new(data_dir: Option<PathBuf>, device_label: &str, wake: Wake) -> Self {
         let config = Config {
             data_dir,
-            client_name: "rexshell".into(),
+            client_name: "flex".into(),
             device_label: Some(device_label.to_owned()),
             ..Default::default()
         };
@@ -88,7 +88,7 @@ impl Engine {
             client: ClientInfo {
                 kind: Some("app".into()),
                 platform: Some(shrew_client::platform_name().into()),
-                name: Some("rexshell".into()),
+                name: Some("flex".into()),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
                 label: None,
             },

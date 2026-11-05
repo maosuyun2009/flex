@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use async_channel::Sender;
+use flex_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, px, App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, MouseButton, Point, Render, SharedString, UTF16Selection,
     Window,
 };
-use rexshell_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
 use shrew_core::{ColorTheme, Frame, Rgb, Row, TerminalStatus};
 
 use crate::{keymap, paint, shortcuts};
@@ -559,7 +559,7 @@ impl TerminalView {
                 session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta);
             }
             None => {
-                if std::env::var_os("REXSHELL_DEBUG").is_some() {
+                if std::env::var_os("FLEX_DEBUG").is_some() {
                     let k = &event.keystroke;
                     eprintln!(
                         "[key] dropped key={:?} char={:?} mods={:?}",
@@ -582,7 +582,7 @@ impl Render for TerminalView {
         };
 
         self.frame = session.frame();
-        // REXSHELL_DEBUG=1 explains an empty pane: no frames means the stream is
+        // FLEX_DEBUG=1 explains an empty pane: no frames means the stream is
         // dead, frames with no lines means the snapshot failed to restore.
         if debug() {
             let f = &self.frame;
@@ -829,7 +829,7 @@ fn measure(cx: &mut App, palette: &paint::Palette) -> Metrics {
 }
 
 fn debug() -> bool {
-    std::env::var_os("REXSHELL_DEBUG").is_some()
+    std::env::var_os("FLEX_DEBUG").is_some()
 }
 
 fn empty_frame() -> Frame {
@@ -891,7 +891,7 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) {
         self.composing = false;
-        if std::env::var_os("REXSHELL_DEBUG").is_some() {
+        if std::env::var_os("FLEX_DEBUG").is_some() {
             eprintln!("[ime] commit {text:?}");
         }
         // ASCII already arrives as key events; sending it here would type every

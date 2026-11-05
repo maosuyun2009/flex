@@ -9,13 +9,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_channel::Receiver;
+use flex_engine::{AppState, BlockState, Connectivity, Engine, SessionState, WindowState};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, hsla, linear_color_stop, linear_gradient, point, px, relative, size, AnyElement,
     App, Bounds, Context, Entity, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Size, Task, Window,
 };
-use rexshell_engine::{AppState, BlockState, Connectivity, Engine, SessionState, WindowState};
 use serde_json::json;
 
 use crate::icons::{self, Icon};
@@ -138,11 +138,11 @@ impl Workspace {
         let picture = settings.background.as_deref().and_then(|path| {
             let image = crate::background::load(path);
             if image.is_none() {
-                eprintln!("rexshell: could not load background {path}");
+                eprintln!("flex: could not load background {path}");
             }
             image
         });
-        if std::env::var_os("REXSHELL_DEBUG").is_some() {
+        if std::env::var_os("FLEX_DEBUG").is_some() {
             eprintln!("[font] using {font}");
         }
         let mut this = Self {
@@ -407,7 +407,7 @@ impl Workspace {
                     .ok();
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("rexshell: split: {e}"),
+                Err(e) => eprintln!("flex: split: {e}"),
             }
         })
         .detach();
@@ -429,7 +429,7 @@ impl Workspace {
                 .close_block(&server_id, &session_id, &block_id)
                 .await
             {
-                eprintln!("rexshell: close: {e}");
+                eprintln!("flex: close: {e}");
             }
         })
         .detach();
@@ -448,7 +448,7 @@ impl Workspace {
                 .close_window(&server_id, &session_id, &window)
                 .await
             {
-                eprintln!("rexshell: close window: {e}");
+                eprintln!("flex: close window: {e}");
             }
         })
         .detach();
@@ -471,7 +471,7 @@ impl Workspace {
                 .zoom_block(&server, &session, &block.id)
                 .await
             {
-                eprintln!("rexshell: zoom: {e}");
+                eprintln!("flex: zoom: {e}");
             }
         })
         .detach();
@@ -498,7 +498,7 @@ impl Workspace {
                 .call(&address, "session.focus_direction", payload)
                 .await
             {
-                eprintln!("rexshell: focus_direction: {e}");
+                eprintln!("flex: focus_direction: {e}");
                 return;
             }
             // The method answers with a revision; the new focus is in the view.
@@ -579,7 +579,7 @@ impl Workspace {
                 .new_window(&server_id, &session_id, None)
                 .await
             {
-                eprintln!("rexshell: new tab: {e}");
+                eprintln!("flex: new tab: {e}");
             }
         })
         .detach();
@@ -613,7 +613,7 @@ impl Workspace {
                     "bounds": FLOAT_BOUNDS,
                 });
                 if let Err(e) = engine.call(&address, "session.float_block", payload).await {
-                    eprintln!("rexshell: session.float_block: {e}");
+                    eprintln!("flex: session.float_block: {e}");
                 }
             } else {
                 let anchor = match anchor {
@@ -633,7 +633,7 @@ impl Workspace {
                                 .and_then(|id| id.as_str())
                                 .map(str::to_owned),
                             Err(e) => {
-                                eprintln!("rexshell: session.new_window: {e}");
+                                eprintln!("flex: session.new_window: {e}");
                                 None
                             }
                         }
@@ -653,7 +653,7 @@ impl Workspace {
                     "ratio": ratio,
                 });
                 if let Err(e) = engine.call(&address, "session.move_block", payload).await {
-                    eprintln!("rexshell: session.move_block: {e}");
+                    eprintln!("flex: session.move_block: {e}");
                 }
             }
             this.update(cx, |_, cx| cx.notify()).ok();
@@ -718,7 +718,7 @@ impl Workspace {
                     .and_then(|id| id.as_str())
                     .map(str::to_owned),
                 Err(e) => {
-                    eprintln!("rexshell: session.new_layer: {e}");
+                    eprintln!("flex: session.new_layer: {e}");
                     None
                 }
             };
@@ -789,7 +789,7 @@ impl Workspace {
                     .map(|(_, path)| path.trim().to_owned())
             })
             .filter(|path| !path.is_empty());
-        if std::env::var_os("REXSHELL_DEBUG").is_some() {
+        if std::env::var_os("FLEX_DEBUG").is_some() {
             eprintln!("[pick] finished open={still_open} choice={choice:?}");
         }
         if let Some(path) = choice {
@@ -826,7 +826,7 @@ impl Workspace {
         std::mem::drop(engine.shrew().runtime().clone().spawn(async move {
             let payload = json!({"session_id": session, "block_id": block});
             if let Err(e) = engine.call(&address, "session.focus_block", payload).await {
-                eprintln!("rexshell: focus_block: {e}");
+                eprintln!("flex: focus_block: {e}");
             }
         }));
     }
@@ -854,7 +854,7 @@ impl Workspace {
             let text = path.display().to_string();
             let picture = crate::background::load(&text);
             if picture.is_none() {
-                eprintln!("rexshell: could not read {text} as an image");
+                eprintln!("flex: could not read {text} as an image");
                 return;
             }
             this.update(cx, |me, cx| {
@@ -1029,7 +1029,7 @@ impl Workspace {
             {
                 Ok(view) => view,
                 Err(e) => {
-                    eprintln!("rexshell: session.view: {e}");
+                    eprintln!("flex: session.view: {e}");
                     this.update(cx, |me, cx| {
                         me.settled = None;
                         cx.notify();
@@ -1052,7 +1052,7 @@ impl Workspace {
                 "bounds": bounds,
             });
             if let Err(e) = engine.call(&address, "session.resize_layer", payload).await {
-                eprintln!("rexshell: session.resize_layer: {e}");
+                eprintln!("flex: session.resize_layer: {e}");
                 this.update(cx, |me, cx| {
                     me.settled = None;
                     cx.notify();
@@ -1113,7 +1113,7 @@ impl Workspace {
                     .pr_2()
                     .gap_2()
                     .child(div().size(px(8.0)).rounded_sm().bg(theme::accent()))
-                    .child(div().text_color(theme::muted()).child("rexshell"))
+                    .child(div().text_color(theme::muted()).child("flex"))
                     .on_mouse_down(MouseButton::Left, cx.listener(title_press)),
             )
             .child(div().w(px(1.0)).h(px(16.0)).mx_2().bg(theme::border()))

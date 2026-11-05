@@ -1,9 +1,9 @@
 [package]
-name = "rexshell-engine"
+name = "flex-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Toolkit-free glue between a Rex server and the rexshell UI"
+description = "Toolkit-free glue between a Rex server and the flex UI"
 
 [dependencies]
 serde_json = "1"

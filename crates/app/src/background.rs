@@ -13,7 +13,7 @@ use image::Frame;
 pub fn load(path: &str) -> Option<Arc<RenderImage>> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() > 64 << 20 {
-        eprintln!("rexshell: background image is larger than 64 MiB, ignoring it");
+        eprintln!("flex: background image is larger than 64 MiB, ignoring it");
         return None;
     }
     let mut decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();

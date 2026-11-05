@@ -7,11 +7,11 @@
 //! mixed-width line can drift off the grid. `Run::widths` is there when that
 //! matters.
 
+use flex_engine::Metrics;
 use gpui::{
     fill, font, point, px, quad, size, App, BorderStyle, Bounds, Font, FontStyle, FontWeight, Hsla,
     Pixels, SharedString, StrikethroughStyle, TextRun, UnderlineStyle, Window,
 };
-use rexshell_engine::Metrics;
 use shrew_core::{CursorStyle, Frame, Rgb, Run, Underline};
 
 #[derive(Clone)]

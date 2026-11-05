@@ -1,6 +1,6 @@
-//! rexshell: a Windows shell for Rex servers.
+//! flex: a Windows shell for Rex servers.
 //!
-//! Usage: `rexshell [SERVER]`, or set `REXSHELL_SERVER`. Without either, the
+//! Usage: `flex [SERVER]`, or set `FLEX_SERVER`. Without either, the
 //! shell attaches to a local Rex server if one is running, and otherwise shows
 //! whatever server list it saved last time.
 
@@ -19,20 +19,20 @@ mod workspace;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use flex_engine::Engine;
 use gpui::{px, size, App, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};
-use rexshell_engine::Engine;
 
 fn main() {
     let address = std::env::args()
         .nth(1)
-        .or_else(|| std::env::var("REXSHELL_SERVER").ok());
+        .or_else(|| std::env::var("FLEX_SERVER").ok());
 
     Application::new().run(move |cx: &mut App| {
         // The engine calls this from its own threads; the UI wakes on its loop.
         let (wake_tx, wake_rx) = async_channel::unbounded::<()>();
         let engine = Arc::new(Engine::new(
             data_dir(),
-            "rexshell",
+            "flex",
             Arc::new(move || {
                 let _ = wake_tx.try_send(());
             }),
@@ -49,7 +49,7 @@ fn main() {
                     .any(|s| s.address.trim() == address.trim());
                 if !saved {
                     if let Err(e) = engine.add_server("", address) {
-                        eprintln!("rexshell: {address}: {e}");
+                        eprintln!("flex: {address}: {e}");
                     }
                 }
             }
@@ -80,7 +80,7 @@ fn main() {
         );
         let options = WindowOptions {
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("rexshell".into()),
+                title: Some("flex".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -103,6 +103,13 @@ fn data_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .map(|d| d.join("rexshell"))?;
+        .map(|d| d.join("flex"))?;
+    // The shell used to be called rexshell; keep the server list it saved.
+    let old = dir.with_file_name("rexshell").join("shrew.json");
+    let new = dir.join("shrew.json");
+    if !new.exists() && old.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::copy(&old, &new);
+    }
     Some(dir)
 }
