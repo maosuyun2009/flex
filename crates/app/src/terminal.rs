@@ -97,6 +97,35 @@ impl TerminalListener for Notifier {
     fn size_changed(&self, _cols: u16, _rows: u16) {}
 }
 
+/// The link that covers one character of a line, if there is one.
+fn url_token(chars: &[char], index: usize) -> Option<String> {
+    if chars.is_empty() || index >= chars.len() || chars[index].is_whitespace() {
+        return None;
+    }
+    let mut from = index;
+    while from > 0 && !chars[from - 1].is_whitespace() {
+        from -= 1;
+    }
+    let mut to = index;
+    while to + 1 < chars.len() && !chars[to + 1].is_whitespace() {
+        to += 1;
+    }
+    let token: String = chars[from..=to].iter().collect();
+    let token = token.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '>'
+        )
+    });
+    if token.starts_with("http://") || token.starts_with("https://") {
+        Some(token.to_owned())
+    } else {
+        token
+            .strip_prefix("www.")
+            .map(|rest| format!("https://www.{rest}"))
+    }
+}
+
 /// Every occurrence of the query in one row, as (first char, char count).
 /// Matching is per row, so a query never spans a line break.
 fn find_all(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
@@ -284,6 +313,31 @@ impl TerminalView {
         // (mode 2004 — vim, agents, readline) needs the text wrapped, or it
         // treats every newline as Enter and runs half the paste.
         session.paste(&text);
+    }
+
+    /// The link under a cell, if the text there is one.
+    ///
+    /// shrew-core keeps runs of styled text, not the OSC 8 hyperlink a program
+    /// may have attached, so this reads the visible line and takes the token
+    /// that looks like a URL. Ctrl-click is the usual gesture, and the shell
+    /// never grabs plain clicks for it.
+    fn url_at(&self, col: u16, row: u16) -> Option<String> {
+        let line = self.frame.lines.get(row as usize)?;
+        let (text, starts) = row_cells(line);
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        // The character under the pointer: the last cell that starts at or before it.
+        let mut index = 0;
+        for (i, start) in starts.iter().enumerate() {
+            if *start <= col {
+                index = i;
+            } else {
+                break;
+            }
+        }
+        url_token(&chars, index)
     }
 
     /// Open the find bar, or move to the next match if it is already open.
@@ -746,6 +800,13 @@ impl Render for TerminalView {
                     }
                     let (origin, metrics) = *this.geometry.lock().unwrap();
                     let cell = TerminalView::cell_at(origin, metrics, event.position);
+                    if event.modifiers.control || event.modifiers.platform {
+                        if let Some(url) = this.url_at(cell.0, cell.1) {
+                            crate::win32::open_url(&url);
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
                     this.begin_selection(cell, cx);
                 }),
             )
@@ -982,6 +1043,31 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
+    use super::url_token;
+
+    fn line(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn links_only_come_from_word_shaped_tokens() {
+        let text = "see https://example.com/a?b=1, then www.example.org.";
+        let chars = line(text);
+        let at = text.find("example.com").unwrap() + 2;
+        assert_eq!(
+            url_token(&chars, at).as_deref(),
+            Some("https://example.com/a?b=1")
+        );
+        let www = text.find("www.example.org").unwrap();
+        assert_eq!(
+            url_token(&chars, www).as_deref(),
+            Some("https://www.example.org")
+        );
+        // Not a link: plain prose.
+        assert_eq!(url_token(&chars, 0), None);
+        assert_eq!(url_token(&chars, text.find(' ').unwrap()), None);
+    }
+
     use super::find_all;
 
     #[test]

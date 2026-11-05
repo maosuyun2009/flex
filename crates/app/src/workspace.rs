@@ -207,6 +207,10 @@ pub struct Workspace {
     divider: Option<Divider>,
     /// A name being typed.
     prompt: Option<Prompt>,
+    /// `terminal.modes` for the active pane, when the Terminal page asks.
+    pane_modes: Option<serde_json::Value>,
+    /// `hosts.list`: the other Rex servers this one can reach.
+    hosts: Option<serde_json::Value>,
     /// The jump list, when it is open.
     palette: Option<Palette>,
     /// Whether this client has told the server its label yet.
@@ -274,6 +278,8 @@ impl Workspace {
             area_geometry: Arc::default(),
             divider: None,
             prompt: None,
+            pane_modes: None,
+            hosts: None,
             palette: None,
             named_client: false,
             server_info: None,
@@ -400,6 +406,9 @@ impl Workspace {
             if windows.iter().any(|w| w.id == active) {
                 self.window_id = Some(active);
             }
+        }
+        if self.hosts.is_none() && self.session_id.is_some() {
+            self.refresh_hosts(cx);
         }
         if !self.named_client && self.session_id.is_some() && self.address().is_some() {
             self.named_client = true;
@@ -1177,6 +1186,48 @@ impl Workspace {
             let _ = engine
                 .call(&address, "client.set_label", json!({"label": label}))
                 .await;
+        })
+        .detach();
+    }
+
+    /// Ask the active pane what its terminal modes are: alternate screen,
+    /// mouse reporting, bracketed paste. None of it needs the terminal awake.
+    fn refresh_modes(&mut self, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(block)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.active_block.clone(),
+        ) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({"session_id": session, "block_id": block, "args": {}});
+            let modes = engine
+                .call(&address, "com.superlogical.terminal.modes", payload)
+                .await;
+            this.update(cx, |me, cx| {
+                me.pane_modes = modes.ok();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask the server which other servers it can reach.
+    fn refresh_hosts(&mut self, cx: &mut Context<Self>) {
+        let Some(address) = self.address() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let hosts = engine.call(&address, "hosts.list", json!({})).await;
+            this.update(cx, |me, cx| {
+                me.hosts = hosts.ok();
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -2675,6 +2726,82 @@ impl Workspace {
             }
         }
 
+        let hosts: Vec<(String, String)> = self
+            .hosts
+            .as_ref()
+            .and_then(|hosts| hosts.get("hosts").or(Some(hosts)))
+            .and_then(|hosts| hosts.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|host| {
+                        let label = host.get("label").and_then(|l| l.as_str())?;
+                        let address = host
+                            .get("address")
+                            .or_else(|| host.get("endpoint"))
+                            .and_then(|a| a.as_str())?;
+                        Some((label.to_owned(), address.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !hosts.is_empty() {
+            rows.push(theme::section("HOSTS").into_any_element());
+            for (label, address) in hosts {
+                let flat = address.clone();
+                let name = label.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("host:{address}")))
+                        .mx_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(theme::text())
+                        .hover(|el| el.bg(chrome.hover()))
+                        .child(div().flex_1().truncate().child(label))
+                        .child(div().text_xs().text_color(theme::muted()).child(address))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                // Reachable through this server: save it as a
+                                // server of its own and switch to it.
+                                let saved = this
+                                    .state
+                                    .servers
+                                    .iter()
+                                    .find(|s| s.address.trim() == flat.trim())
+                                    .map(|s| s.id.clone());
+                                match saved {
+                                    Some(id) => {
+                                        this.server_id = Some(id);
+                                        this.session_id = None;
+                                        this.window_id = None;
+                                        this.active_block = None;
+                                        this.reload(cx);
+                                    }
+                                    None => {
+                                        if this.engine.add_server(&name, &flat).is_ok() {
+                                            this.state = this.engine.state();
+                                            this.server_id = this
+                                                .state
+                                                .servers
+                                                .iter()
+                                                .find(|s| s.address.trim() == flat.trim())
+                                                .map(|s| s.id.clone());
+                                            this.reload(cx);
+                                        }
+                                    }
+                                }
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
         rows.push(theme::section("SESSIONS").into_any_element());
         for server in &self.state.servers {
             let dot = match server.connectivity {
@@ -3414,6 +3541,9 @@ impl Workspace {
                         if page == Page::Connection && this.server_info.is_none() {
                             this.refresh_info(cx);
                         }
+                        if page == Page::Terminal {
+                            this.refresh_modes(cx);
+                        }
                         if page == Page::Keys && this.keymap.is_none() {
                             this.refresh_keymap(cx);
                         }
@@ -3583,6 +3713,45 @@ impl Workspace {
                         .child(self.font.to_string())
                         .into_any_element(),
                 ));
+                if let Some(modes) = &self.pane_modes {
+                    let screen = modes
+                        .get("screen")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("primary");
+                    let on = |name: &str| {
+                        modes
+                            .get("modes")
+                            .and_then(|m| m.as_array())
+                            .map(|list| {
+                                list.iter()
+                                    .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(name))
+                                    .and_then(|m| m.get("set"))
+                                    .and_then(|s| s.as_bool())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    };
+                    let state = |yes: bool| if yes { "on" } else { "off" };
+                    rows.push(theme::section("THIS PANE").into_any_element());
+                    rows.push(row(
+                        "Screen",
+                        if screen == "alternate" {
+                            "alternate — a full-screen program owns it".into()
+                        } else {
+                            "primary".into()
+                        },
+                        div().into_any_element(),
+                    ));
+                    rows.push(row(
+                        "Mouse reporting",
+                        format!(
+                            "{} · bracketed paste {}",
+                            state(on("mouse_reporting") || on("mouse_normal")),
+                            state(on("bracketed_paste"))
+                        ),
+                        div().into_any_element(),
+                    ));
+                }
             }
             Page::Connection => {
                 let status = self.server_info.as_ref().and_then(|i| i.get("status"));
