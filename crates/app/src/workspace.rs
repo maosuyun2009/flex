@@ -101,16 +101,44 @@ struct Divider {
 }
 
 /// What a one-line prompt is renaming.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Rename {
-    Tab,
-    Pane,
+#[derive(Clone, PartialEq, Eq)]
+enum Ask {
+    RenameTab,
+    RenamePane,
+    NewSession,
+    /// Session id and label.
+    DeleteSession(String, String),
+    NewHost,
+    /// Host id and label.
+    DeleteHost(String, String),
+    AddServer,
+    /// Server id and name.
+    DeleteServer(String, String),
 }
 
-/// A one-line text prompt: Rex names windows and blocks, and the shell has no
-/// text field, so this is the smallest thing that can type a name.
+impl Ask {
+    /// Whether the prompt types something, or only asks yes or no.
+    fn wants_text(&self) -> bool {
+        matches!(
+            self,
+            Ask::RenameTab | Ask::RenamePane | Ask::NewSession | Ask::NewHost | Ask::AddServer
+        )
+    }
+
+    fn hint(&self) -> &'static str {
+        match self {
+            Ask::DeleteSession(..) => "Enter to delete · Esc to cancel",
+            Ask::DeleteHost(..) | Ask::DeleteServer(..) => "Enter to remove · Esc to cancel",
+            Ask::NewHost | Ask::AddServer => "Enter to add · Esc to cancel",
+            _ => "Enter to save · Esc to cancel",
+        }
+    }
+}
+
+/// A one-line text prompt: Rex names windows, blocks, sessions and hosts, and
+/// the shell has no text field, so this is the smallest thing that can type one.
 struct Prompt {
-    what: Rename,
+    what: Ask,
     label: String,
     value: String,
 }
@@ -600,11 +628,11 @@ impl Workspace {
             Action::RenameTab => {
                 // Empty, not prefilled: there is no select-all, so a prefilled
                 // name would just get appended to.
-                self.open_prompt(Rename::Tab, "Rename tab");
+                self.open_prompt(Ask::RenameTab, "Rename tab", window);
                 cx.notify();
             }
             Action::RenamePane => {
-                self.open_prompt(Rename::Pane, "Rename pane");
+                self.open_prompt(Ask::RenamePane, "Rename pane", window);
                 cx.notify();
             }
             Action::MoveTabLeft => self.move_tab(-1, cx),
@@ -613,7 +641,7 @@ impl Workspace {
             Action::RaiseFloat => self.stack_float(true, cx),
             Action::LowerFloat => self.stack_float(false, cx),
             Action::ParkPane => self.park_pane(cx),
-            Action::Palette => self.open_palette(cx),
+            Action::Palette => self.open_palette(window, cx),
             Action::CopyTranscript => self.copy_transcript(cx),
             Action::NewTab => self.new_tab(cx),
             Action::ZoomPane => self.zoom_pane(cx),
@@ -915,12 +943,15 @@ impl Workspace {
         .detach();
     }
 
-    fn open_prompt(&mut self, what: Rename, label: &str) {
+    fn open_prompt(&mut self, what: Ask, label: &str, window: &mut Window) {
         self.prompt = Some(Prompt {
             what,
             label: label.to_owned(),
             value: String::new(),
         });
+        // The pane under the overlay would keep the keyboard otherwise, and
+        // typing a name would also type it into the shell.
+        window.focus(&self.focus);
     }
 
     /// Type into the prompt. Returns true when the key belonged to it.
@@ -929,6 +960,12 @@ impl Workspace {
             return false;
         };
         match event.keystroke.key.as_str() {
+            // Space is a named key, so it never comes with a key_char.
+            "space" if prompt.what.wants_text() => {
+                prompt.value.push(' ');
+                cx.notify();
+                true
+            }
             "escape" => {
                 self.prompt = None;
                 cx.notify();
@@ -951,11 +988,12 @@ impl Workspace {
                     .clone()
                     .filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
                 match typed {
-                    Some(text) => {
+                    Some(text) if prompt.what.wants_text() => {
                         prompt.value.push_str(&text);
                         cx.notify();
                         true
                     }
+                    Some(_) => true,
                     // Chords with a modifier are the shell's, not the prompt's.
                     None => {
                         !event.keystroke.modifiers.control
@@ -968,42 +1006,130 @@ impl Workspace {
     }
 
     fn commit_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
-        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
-            return;
-        };
-        let label = prompt.value.trim().to_owned();
-        if label.is_empty() {
+        let value = prompt.value.trim().to_owned();
+        if prompt.what.wants_text() && value.is_empty() {
             cx.notify();
             return;
         }
-        let payload = match prompt.what {
-            Rename::Tab => match self.window_id.clone() {
-                Some(window_id) => json!({
-                    "session_id": session,
-                    "window_id": window_id,
-                    "label": label,
-                }),
-                None => return,
-            },
-            Rename::Pane => match self.active_block.clone() {
-                Some(block_id) => json!({
-                    "session_id": session,
-                    "block_id": block_id,
-                    "label": label,
-                }),
-                None => return,
-            },
-        };
-        let method = match prompt.what {
-            Rename::Tab => "session.set_window_label",
-            Rename::Pane => "session.set_block_label",
+
+        // Servers are this client's own list, not something Rex keeps.
+        match &prompt.what {
+            Ask::AddServer => {
+                let mut words: Vec<&str> = value.split_whitespace().collect();
+                let Some(address) = words.pop() else {
+                    return;
+                };
+                let name = words.join(" ");
+                if let Err(e) = self.engine.add_server(&name, address) {
+                    eprintln!("flex: add_server: {e}");
+                }
+                self.state = self.engine.state();
+                self.server_id = self
+                    .state
+                    .servers
+                    .iter()
+                    .find(|s| s.address.trim() == address.trim())
+                    .map(|s| s.id.clone());
+                self.reload(cx);
+                return;
+            }
+            Ask::DeleteServer(id, _) => {
+                self.engine.shrew().remove_server(id);
+                self.state = self.engine.state();
+                if self.server_id.as_deref() == Some(id.as_str()) {
+                    self.server_id = self.state.servers.first().map(|s| s.id.clone());
+                    self.session_id = None;
+                    self.window_id = None;
+                    self.active_block = None;
+                }
+                self.reload(cx);
+                return;
+            }
+            _ => {}
+        }
+
+        let fresh_session = matches!(&prompt.what, Ask::NewSession);
+        let touched_hosts = matches!(&prompt.what, Ask::NewHost | Ask::DeleteHost(..));
+        let deleted_session = matches!(&prompt.what, Ask::DeleteSession(..));
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            return;
         };
         let engine = self.engine.clone();
+        let (method, payload) = match &prompt.what {
+            Ask::RenameTab => {
+                let Some(window_id) = self.window_id.clone() else {
+                    return;
+                };
+                (
+                    "session.set_window_label",
+                    json!({"session_id": session, "window_id": window_id, "label": value}),
+                )
+            }
+            Ask::RenamePane => {
+                let Some(block_id) = self.active_block.clone() else {
+                    return;
+                };
+                (
+                    "session.set_block_label",
+                    json!({"session_id": session, "block_id": block_id, "label": value}),
+                )
+            }
+            Ask::NewSession => ("session.create", json!({"label": value})),
+            Ask::DeleteSession(id, _) => ("session.destroy", json!({"session_id": id})),
+            Ask::NewHost => {
+                // "studio studio.tail1234.ts.net": the last word is the address.
+                let mut words: Vec<&str> = value.split_whitespace().collect();
+                let Some(endpoint) = words.pop() else {
+                    return;
+                };
+                let label = words.join(" ");
+                let label = if label.is_empty() {
+                    endpoint.to_owned()
+                } else {
+                    label
+                };
+                (
+                    "hosts.put",
+                    json!({"host": {"label": label, "endpoints": [endpoint]}}),
+                )
+            }
+            Ask::DeleteHost(id, _) => ("hosts.remove", json!({"id": id})),
+            Ask::AddServer | Ask::DeleteServer(..) => return,
+        };
         cx.spawn(async move |this, cx| {
-            if let Err(e) = engine.call(&address, method, payload).await {
+            let reply = engine.call(&address, method, payload).await;
+            if let Err(e) = &reply {
                 eprintln!("flex: {method}: {e}");
             }
-            this.update(cx, |_, cx| cx.notify()).ok();
+            let created = reply.ok().and_then(|reply| {
+                reply
+                    .get("session_id")
+                    .or_else(|| reply.pointer("/session/session_id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_owned)
+            });
+            this.update(cx, |me, cx| {
+                if touched_hosts {
+                    me.hosts = None;
+                    me.refresh_hosts(cx);
+                }
+                if fresh_session {
+                    if let Some(created) = created {
+                        // A brand-new session has no window yet; give it one,
+                        // and switch to it so the tab bar follows.
+                        me.session_id = Some(created);
+                        me.window_id = None;
+                        me.active_block = None;
+                        me.new_tab(cx);
+                    }
+                }
+                if deleted_session {
+                    me.window_id = None;
+                    me.active_block = None;
+                }
+                me.reload(cx);
+            })
+            .ok();
         })
         .detach();
     }
@@ -1233,12 +1359,13 @@ impl Workspace {
     }
 
     /// Open the jump list and ask the pane for the files next to it.
-    fn open_palette(&mut self, cx: &mut Context<Self>) {
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = Some(Palette {
             query: String::new(),
             cursor: 0,
             files: Vec::new(),
         });
+        window.focus(&self.focus);
         cx.notify();
 
         let (Some(address), Some(session), Some(block)) = (
@@ -1348,6 +1475,14 @@ impl Workspace {
             return false;
         }
         match event.keystroke.key.as_str() {
+            "space" => {
+                if let Some(palette) = &mut self.palette {
+                    palette.query.push(' ');
+                    palette.cursor = 0;
+                }
+                cx.notify();
+                true
+            }
             "escape" => {
                 self.palette = None;
                 cx.notify();
@@ -2367,22 +2502,62 @@ impl Workspace {
                     .flex_col()
                     .gap_2()
                     .child(div().text_color(theme::text()).child(prompt.label.clone()))
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(chrome.active())
-                            .text_color(theme::text())
-                            .child(format!("{}▌", prompt.value)),
-                    )
+                    .when(prompt.what.wants_text(), |el| {
+                        el.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(chrome.active())
+                                .text_color(theme::text())
+                                .child(format!("{}▌", prompt.value)),
+                        )
+                    })
                     .child(
                         div()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child("Enter to save · Esc to cancel"),
+                            .child(prompt.what.hint()),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// A sidebar section title with a small `+`, for the lists that grow.
+    fn sidebar_header(
+        &self,
+        title: &'static str,
+        add: Option<(&'static str, Ask, &'static str)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chrome = self.chrome();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .pt_3()
+            .pb_1()
+            .child(div().text_xs().text_color(theme::muted()).child(title))
+            .when_some(add, |el, (id, what, label)| {
+                el.child(
+                    div()
+                        .id(id)
+                        .size(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                        .child("+")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_prompt(what.clone(), label, window);
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -2726,7 +2901,7 @@ impl Workspace {
             }
         }
 
-        let hosts: Vec<(String, String)> = self
+        let hosts: Vec<(String, String, String)> = self
             .hosts
             .as_ref()
             .and_then(|hosts| hosts.get("hosts").or(Some(hosts)))
@@ -2735,23 +2910,37 @@ impl Workspace {
                 list.iter()
                     .filter_map(|host| {
                         let label = host.get("label").and_then(|l| l.as_str())?;
+                        let id = host
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("host:{label}"));
                         let address = host
-                            .get("address")
-                            .or_else(|| host.get("endpoint"))
-                            .and_then(|a| a.as_str())?;
-                        Some((label.to_owned(), address.to_owned()))
+                            .get("endpoints")
+                            .and_then(|e| e.as_array())
+                            .and_then(|list| list.first())
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        Some((label.to_owned(), address, id))
                     })
                     .collect()
             })
             .unwrap_or_default();
-        if !hosts.is_empty() {
-            rows.push(theme::section("HOSTS").into_any_element());
-            for (label, address) in hosts {
+        if self.hosts.is_some() {
+            rows.push(self.sidebar_header(
+                "HOSTS",
+                Some(("host-add", Ask::NewHost, "Add a host — name and address")),
+                cx,
+            ));
+            for (label, address, host_id) in hosts {
                 let flat = address.clone();
                 let name = label.clone();
+                let del_id = host_id.clone();
+                let del_label = label.clone();
                 rows.push(
                     div()
-                        .id(SharedString::from(format!("host:{address}")))
+                        .id(SharedString::from(format!("host:{host_id}")))
                         .mx_2()
                         .px_2()
                         .py_1()
@@ -2763,6 +2952,31 @@ impl Workspace {
                         .hover(|el| el.bg(chrome.hover()))
                         .child(div().flex_1().truncate().child(label))
                         .child(div().text_xs().text_color(theme::muted()).child(address))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("host-del:{host_id}")))
+                                .size(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .text_size(px(11.0))
+                                .text_color(theme::muted())
+                                .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
+                                .child("×")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.open_prompt(
+                                            Ask::DeleteHost(del_id.clone(), del_label.clone()),
+                                            &format!("Remove host {del_label}?"),
+                                            window,
+                                        );
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -2802,7 +3016,16 @@ impl Workspace {
             }
         }
 
-        rows.push(theme::section("SESSIONS").into_any_element());
+        rows.push(self.sidebar_header(
+            "SERVERS",
+            Some((
+                "server-add",
+                Ask::AddServer,
+                "Add a server — name and address",
+            )),
+            cx,
+        ));
+        let mut session_rows: Vec<AnyElement> = Vec::new();
         for server in &self.state.servers {
             let dot = match server.connectivity {
                 Connectivity::Online => theme::accent(),
@@ -2820,14 +3043,43 @@ impl Workspace {
                     .text_xs()
                     .text_color(theme::muted())
                     .child(div().size(px(6.0)).rounded_full().bg(dot))
-                    .child(server.name.clone())
+                    .child(div().flex_1().truncate().child(server.name.clone()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("server-del:{}", server.id)))
+                            .size(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(11.0))
+                            .text_color(theme::muted())
+                            .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let id = server.id.clone();
+                                    let name = server.name.clone();
+                                    move |this, _, window, cx| {
+                                        this.open_prompt(
+                                            Ask::DeleteServer(id.clone(), name.clone()),
+                                            &format!("Remove server {name}?"),
+                                            window,
+                                        );
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                            ),
+                    )
                     .into_any_element(),
             );
 
             for session in &server.sessions {
                 let id = session.id.clone();
                 let active = self.session_id.as_deref() == Some(id.as_str());
-                rows.push(
+                session_rows.push(
                     div()
                         .id(SharedString::from(id.clone()))
                         .mx_2()
@@ -2854,6 +3106,38 @@ impl Workspace {
                                 .text_color(theme::muted())
                                 .child(session.block_count().to_string()),
                         )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("session-del:{id}")))
+                                .size(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .text_size(px(11.0))
+                                .text_color(theme::muted())
+                                .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
+                                .child("×")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let label = session.label.clone();
+                                        let delete_id = id.clone();
+                                        move |this, _, window, cx| {
+                                            this.open_prompt(
+                                                Ask::DeleteSession(
+                                                    delete_id.clone(),
+                                                    label.clone(),
+                                                ),
+                                                &format!("Delete session {label}?"),
+                                                window,
+                                            );
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                        }
+                                    }),
+                                ),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -2867,6 +3151,13 @@ impl Workspace {
                 );
             }
         }
+
+        rows.push(self.sidebar_header(
+            "SESSIONS",
+            Some(("session-add", Ask::NewSession, "New session — name it")),
+            cx,
+        ));
+        rows.extend(session_rows);
 
         div()
             .flex()
