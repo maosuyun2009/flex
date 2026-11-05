@@ -1454,7 +1454,7 @@ impl Workspace {
         // opaque layer here would flatten the glass. One picture is painted
         // across the whole area, before the panes, so it spans the terminal
         // instead of repeating inside every split.
-        let mut area = div().relative().flex_1();
+        let mut area = div().relative().flex_1().overflow_hidden();
         if let Some(image) = self.picture.clone() {
             area = area.child(
                 canvas(
