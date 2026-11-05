@@ -9,8 +9,14 @@ mod imp {
     use std::sync::atomic::{AtomicIsize, Ordering};
 
     use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::HGLOBAL;
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -75,6 +81,38 @@ mod imp {
 
     /// Windows 11 rounds a decorated window's corners; ours has no decorations,
     /// so ask DWM for the same rounding (DWMWA_WINDOW_CORNER_PREFERENCE = 33).
+    /// Text on the Win32 clipboard. GPUI's own reader came back empty for text
+    /// another process put there, so read the format directly.
+    pub fn clipboard_text() -> Option<String> {
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return None;
+            }
+            let mut text = None;
+            if IsClipboardFormatAvailable(CF_UNICODETEXT as u32) != 0 {
+                let handle = GetClipboardData(CF_UNICODETEXT as u32);
+                if !handle.is_null() {
+                    let global = handle as HGLOBAL;
+                    let bytes = GlobalSize(global);
+                    let wide = GlobalLock(global) as *const u16;
+                    if !wide.is_null() {
+                        let limit = bytes / 2;
+                        let mut len = 0;
+                        while len < limit && *wide.add(len) != 0 {
+                            len += 1;
+                        }
+                        text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                            wide, len,
+                        )));
+                        GlobalUnlock(global);
+                    }
+                }
+            }
+            CloseClipboard();
+            text
+        }
+    }
+
     pub fn round_corners() {
         const ROUND: u32 = 2; // DWMWCP_ROUND
         if let Some(hwnd) = hwnd() {
@@ -87,13 +125,49 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
+    pub fn clipboard_text() -> Option<String> {
+        None
+    }
+
     pub fn drag() {}
     pub fn is_maximized() -> bool {
         false
     }
     pub fn toggle_maximize() {}
     pub fn minimize() {}
+    /// Text on the Win32 clipboard. GPUI's own reader came back empty for text
+    /// another process put there, so read the format directly.
+    pub fn clipboard_text() -> Option<String> {
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return None;
+            }
+            let mut text = None;
+            if IsClipboardFormatAvailable(CF_UNICODETEXT as u32) != 0 {
+                let handle = GetClipboardData(CF_UNICODETEXT as u32);
+                if !handle.is_null() {
+                    let global = handle as HGLOBAL;
+                    let bytes = GlobalSize(global);
+                    let wide = GlobalLock(global) as *const u16;
+                    if !wide.is_null() {
+                        let limit = bytes / 2;
+                        let mut len = 0;
+                        while len < limit && *wide.add(len) != 0 {
+                            len += 1;
+                        }
+                        text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                            wide, len,
+                        )));
+                        GlobalUnlock(global);
+                    }
+                }
+            }
+            CloseClipboard();
+            text
+        }
+    }
+
     pub fn round_corners() {}
 }
 
-pub use imp::{drag, is_maximized, minimize, round_corners, toggle_maximize};
+pub use imp::{clipboard_text, drag, is_maximized, minimize, round_corners, toggle_maximize};

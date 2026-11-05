@@ -312,115 +312,15 @@ lines, default 10 000). The engine keeps a fixed 16 MiB of scrollback and its
 scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 `len`) rather than the buffer being trimmed.
 
-## Finding text
+## Copying and pasting
 
-`Ctrl-Shift-H` opens the find bar over the top of the pane, and the same chord,
-`Esc`, `×` or a click in the text closes it: type to search, `Enter` or `↓` for
-the next match, `↑` for the previous, `Aa` for case sensitivity. Chords with
-Ctrl still reach the window while the bar is open, so no other shortcut goes
-dead behind it. The count reads `n / m` and the view scrolls
-to the match, which is highlighted character by character — only the matched
-cells, not the whole row.
+Dragging over the text copies what you selected as soon as you let go;
+`Ctrl-Shift-C` copies the current selection too, which is how you lift the text a
+find highlighted. `Ctrl-Shift-V` pastes the clipboard into the shell.
 
-The core has no search call, so the bar walks the scrollback a screen at a time
-and reads the rows of each page. That costs one frame per screen — 300 pages for
-the 10 000-line default — but it searches what is actually on screen, in order,
-and gives every match a scroll position to jump to.
-
-## Terminal theme## Input methods
-
-Chinese, Japanese and Korean text never arrives as a keystroke: the IME hands the
-composed string to the focused element's *input handler*. So `TerminalView`
-implements `EntityInputHandler` and registers it during paint with
-`window.handle_input`; `replace_text_in_range` types the committed text into the
-pty with `session.send_text`.
-
-Three things had to line up:
-
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| Composed text never appeared | nothing registered an input handler, so the IME had nowhere to deliver | `EntityInputHandler` + `handle_input` in the paint callback |
-| Every ASCII character arrived twice | with a handler registered, GPUI delivers characters *both* as keys and as input-handler text | only accept text with a non-ASCII character in it |
-| pinyin letters leaked before the commit | the first letters arrive before the composition starts | swallow keys while composing, and retract the ones already sent when the composition starts |
-
-`REXSHELL_DEBUG=1` logs each commit, and F12 exercises the commit path without
-an IME, which is how this was verified.
-
-## Agent status
-
-Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
-terraform and anything else that adopts it — report what they are doing, and the
-server keeps the record. The shell reads it from `BlockState::agent`:
-
-| State | Dot |
-| --- | --- |
-| idle | white |
-| working | green |
-| blocked | red |
-| error | amber |
-| done | blue |
-
-The sidebar opens with an **AGENTS** section, ordered most urgent first by the
-engine (`AppState::attention`), listing every pane that reports a status with its
-app name, state word, and — when blocked — what it is waiting for:
-
-```
-AGENTS
-  ● claude   blocked · permission
-  ● codex    working · Demo
-SESSIONS
-  ● Demo  3
-```
-
-Clicking a row jumps to that pane: it selects the pane's server, session and
-window, and hands it focus. Below it, sessions aggregate with the most urgent
-state among their panes (GPUI's `max()` over the state order), so a session with
-one blocked agent shows red even while three others are idle, and each tab chip
-carries the same dot so a split still says which pane needs you.
-
-Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
-on the server installs that for the harnesses Rex knows (claude, codex, opencode,
-pi); anything else can print it, e.g.
-`printf '\033]7501;state=working:app=codex\033\\'`.
-
-## Background picture
-
-Settings → **Background** → *Choose…* picks an image (png, jpeg, webp, gif) that
-is drawn **once, across the whole terminal area** — not once per pane — under the
-text, cover-fitted and clipped to the terminal so the title bar and its buttons
-stay visible.
-**Picture opacity** decides how much of it survives: the terminal paints its own
-colour over the picture at `1 - opacity`, so 35% leaves a clear watermark and 80%
-is nearly the picture with text on top.
-
-While a picture is set the chrome goes opaque: a translucent title bar over a
-bright photo would wash out its own buttons. The pane area also clips
-(`overflow_hidden`), so nothing painted inside it can reach the title bar even in
-the maximized geometry, where the window origin sits off-screen.
-
-Two details that were wrong at first and are worth keeping:
-
-- The renderer takes **BGRA, premultiplied**, not RGBA. Feeding it RGBA swaps red
-  and blue, which turned a blue picture brown — that was the "colour difference".
-- `paint_image` escapes the element bounds unless it is wrapped in
-  `paint_layer(bounds, ..)`. Without the clip it painted over the title bar and
-  hid the window buttons.
-
-Decoded once into a `RenderImage` (`background.rs`). Clearing the row removes it
-and returns the flat finish.
-
-## Selecting and scrolling
-
-Drag across the text to select: the drag is tracked cell by cell
-(`select_range`), the selection is drawn by the same runs the terminal already
-produces, and releasing puts it on the clipboard — no shortcut needed. The wheel
-scrolls the scrollback three lines a notch.
-
-**Scrollback** in Settings caps how far back the wheel may go (500 to 100 000
-lines, default 10 000). The engine keeps a fixed 16 MiB of scrollback and its
-`TerminalSession` exposes no setter, so the cap is applied to the viewport: the
-scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
-`len`) rather than the buffer being trimmed.
+Paste reads the Win32 clipboard directly (`win32::clipboard_text`). GPUI's own
+reader returned `None` for text another process had put there, and a terminal
+that cannot paste is not worth arguing with.
 
 ## Finding text
 
@@ -531,6 +431,136 @@ lines, default 10 000). The engine keeps a fixed 16 MiB of scrollback and its
 `TerminalSession` exposes no setter, so the cap is applied to the viewport: the
 scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 `len`) rather than the buffer being trimmed.
+
+## Copying and pasting
+
+Dragging over the text copies what you selected as soon as you let go;
+`Ctrl-Shift-C` copies the current selection too, which is how you lift the text a
+find highlighted. `Ctrl-Shift-V` pastes the clipboard into the shell.
+
+Paste reads the Win32 clipboard directly (`win32::clipboard_text`). GPUI's own
+reader returned `None` for text another process had put there, and a terminal
+that cannot paste is not worth arguing with.
+
+## Finding text
+
+`Ctrl-Shift-H` opens the find bar over the top of the pane, and the same chord,
+`Esc`, `×` or a click in the text closes it: type to search, `Enter` or `↓` for
+the next match, `↑` for the previous, `Aa` for case sensitivity. Chords with
+Ctrl still reach the window while the bar is open, so no other shortcut goes
+dead behind it. The count reads `n / m` and the view scrolls
+to the match, which is highlighted character by character — only the matched
+cells, not the whole row.
+
+The core has no search call, so the bar walks the scrollback a screen at a time
+and reads the rows of each page. That costs one frame per screen — 300 pages for
+the 10 000-line default — but it searches what is actually on screen, in order,
+and gives every match a scroll position to jump to.
+
+## Terminal theme## Input methods
+
+Chinese, Japanese and Korean text never arrives as a keystroke: the IME hands the
+composed string to the focused element's *input handler*. So `TerminalView`
+implements `EntityInputHandler` and registers it during paint with
+`window.handle_input`; `replace_text_in_range` types the committed text into the
+pty with `session.send_text`.
+
+Three things had to line up:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Composed text never appeared | nothing registered an input handler, so the IME had nowhere to deliver | `EntityInputHandler` + `handle_input` in the paint callback |
+| Every ASCII character arrived twice | with a handler registered, GPUI delivers characters *both* as keys and as input-handler text | only accept text with a non-ASCII character in it |
+| pinyin letters leaked before the commit | the first letters arrive before the composition starts | swallow keys while composing, and retract the ones already sent when the composition starts |
+
+`REXSHELL_DEBUG=1` logs each commit, and F12 exercises the commit path without
+an IME, which is how this was verified.
+
+## Agent status
+
+Programs that speak the Program Status Protocol (OSC 7501) — codex, claude, pi,
+terraform and anything else that adopts it — report what they are doing, and the
+server keeps the record. The shell reads it from `BlockState::agent`:
+
+| State | Dot |
+| --- | --- |
+| idle | white |
+| working | green |
+| blocked | red |
+| error | amber |
+| done | blue |
+
+The sidebar opens with an **AGENTS** section, ordered most urgent first by the
+engine (`AppState::attention`), listing every pane that reports a status with its
+app name, state word, and — when blocked — what it is waiting for:
+
+```
+AGENTS
+  ● claude   blocked · permission
+  ● codex    working · Demo
+SESSIONS
+  ● Demo  3
+```
+
+Clicking a row jumps to that pane: it selects the pane's server, session and
+window, and hands it focus. Below it, sessions aggregate with the most urgent
+state among their panes (GPUI's `max()` over the state order), so a session with
+one blocked agent shows red even while three others are idle, and each tab chip
+carries the same dot so a split still says which pane needs you.
+
+Nothing reports by itself: an agent has to emit the sequence. `rex skill setup`
+on the server installs that for the harnesses Rex knows (claude, codex, opencode,
+pi); anything else can print it, e.g.
+`printf '\033]7501;state=working:app=codex\033\\'`.
+
+## Background picture
+
+Settings → **Background** → *Choose…* picks an image (png, jpeg, webp, gif) that
+is drawn **once, across the whole terminal area** — not once per pane — under the
+text, cover-fitted and clipped to the terminal so the title bar and its buttons
+stay visible.
+**Picture opacity** decides how much of it survives: the terminal paints its own
+colour over the picture at `1 - opacity`, so 35% leaves a clear watermark and 80%
+is nearly the picture with text on top.
+
+While a picture is set the chrome goes opaque: a translucent title bar over a
+bright photo would wash out its own buttons. The pane area also clips
+(`overflow_hidden`), so nothing painted inside it can reach the title bar even in
+the maximized geometry, where the window origin sits off-screen.
+
+Two details that were wrong at first and are worth keeping:
+
+- The renderer takes **BGRA, premultiplied**, not RGBA. Feeding it RGBA swaps red
+  and blue, which turned a blue picture brown — that was the "colour difference".
+- `paint_image` escapes the element bounds unless it is wrapped in
+  `paint_layer(bounds, ..)`. Without the clip it painted over the title bar and
+  hid the window buttons.
+
+Decoded once into a `RenderImage` (`background.rs`). Clearing the row removes it
+and returns the flat finish.
+
+## Selecting and scrolling
+
+Drag across the text to select: the drag is tracked cell by cell
+(`select_range`), the selection is drawn by the same runs the terminal already
+produces, and releasing puts it on the clipboard — no shortcut needed. The wheel
+scrolls the scrollback three lines a notch.
+
+**Scrollback** in Settings caps how far back the wheel may go (500 to 100 000
+lines, default 10 000). The engine keeps a fixed 16 MiB of scrollback and its
+`TerminalSession` exposes no setter, so the cap is applied to the viewport: the
+scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
+`len`) rather than the buffer being trimmed.
+
+## Copying and pasting
+
+Dragging over the text copies what you selected as soon as you let go;
+`Ctrl-Shift-C` copies the current selection too, which is how you lift the text a
+find highlighted. `Ctrl-Shift-V` pastes the clipboard into the shell.
+
+Paste reads the Win32 clipboard directly (`win32::clipboard_text`). GPUI's own
+reader returned `None` for text another process had put there, and a terminal
+that cannot paste is not worth arguing with.
 
 ## Finding text
 

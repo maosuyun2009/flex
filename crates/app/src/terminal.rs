@@ -241,6 +241,31 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Put the selection on the clipboard. Releasing the mouse already copies,
+    /// so this is for a keyboard-only copy of a selection made earlier.
+    pub fn copy(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        let Some(text) = session.selection_text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    /// Type the clipboard into the terminal, line breaks and all.
+    pub fn paste(&mut self, _cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        let Some(text) = crate::win32::clipboard_text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        session.send_text(&text);
+    }
+
     /// Open the find bar, or move to the next match if it is already open.
     pub fn start_find(&mut self, cx: &mut Context<Self>) {
         match &mut self.find {

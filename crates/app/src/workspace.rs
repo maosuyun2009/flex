@@ -357,6 +357,8 @@ impl Workspace {
             Action::NewTab => self.new_tab(cx),
             Action::ZoomPane => self.zoom_pane(cx),
             Action::Find => self.start_find(cx),
+            Action::Copy => self.copy(cx),
+            Action::Paste => self.paste(cx),
             Action::FocusLeft => self.focus_direction("left", cx),
             Action::FocusDown => self.focus_direction("down", cx),
             Action::FocusUp => self.focus_direction("up", cx),
@@ -525,6 +527,25 @@ impl Workspace {
             view.update(cx, |terminal, cx| terminal.start_find(cx));
         }
         cx.notify();
+    }
+
+    /// Copy the focused pane's selection, or paste into it.
+    fn copy(&mut self, cx: &mut Context<Self>) {
+        let Some(block) = self.active_block.clone() else {
+            return;
+        };
+        if let Some(view) = self.terminals.get(&block) {
+            view.update(cx, |terminal, cx| terminal.copy(cx));
+        }
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(block) = self.active_block.clone() else {
+            return;
+        };
+        if let Some(view) = self.terminals.get(&block) {
+            view.update(cx, |terminal, cx| terminal.paste(cx));
+        }
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
