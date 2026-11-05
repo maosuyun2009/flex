@@ -34,6 +34,7 @@ pub enum Action {
     RaiseFloat,
     LowerFloat,
     ParkPane,
+    Palette,
     CopyTranscript,
     NewTab,
     ToggleSidebar,
@@ -106,6 +107,11 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         "ctrl-shift-down",
         Action::LowerFloat,
         "Send this floating pane behind the others",
+    ),
+    (
+        "ctrl-shift-o",
+        Action::Palette,
+        "Jump to a tab, a pane or a file",
     ),
     (
         "ctrl-shift-p",

@@ -115,6 +115,29 @@ struct Prompt {
     value: String,
 }
 
+/// Where a palette entry takes you.
+enum Jump {
+    Block {
+        server: String,
+        session: String,
+        window: String,
+        block: String,
+    },
+    Window {
+        session: String,
+        window: String,
+    },
+    File(String),
+}
+
+/// The jump list: tabs, panes and the files beside the pane, filtered as you type.
+struct Palette {
+    query: String,
+    cursor: usize,
+    /// Files from `list_dir`, for the pane the palette was opened on.
+    files: Vec<String>,
+}
+
 /// One notification on screen, and when it should go away.
 struct Toast {
     kind: shrew_core::NotificationKind,
@@ -184,6 +207,8 @@ pub struct Workspace {
     divider: Option<Divider>,
     /// A name being typed.
     prompt: Option<Prompt>,
+    /// The jump list, when it is open.
+    palette: Option<Palette>,
     /// Whether this client has told the server its label yet.
     named_client: bool,
     /// `server.whoami` and `server.status`, fetched when Connection is opened.
@@ -249,6 +274,7 @@ impl Workspace {
             area_geometry: Arc::default(),
             divider: None,
             prompt: None,
+            palette: None,
             named_client: false,
             server_info: None,
             keymap: None,
@@ -578,6 +604,7 @@ impl Workspace {
             Action::RaiseFloat => self.stack_float(true, cx),
             Action::LowerFloat => self.stack_float(false, cx),
             Action::ParkPane => self.park_pane(cx),
+            Action::Palette => self.open_palette(cx),
             Action::CopyTranscript => self.copy_transcript(cx),
             Action::NewTab => self.new_tab(cx),
             Action::ZoomPane => self.zoom_pane(cx),
@@ -1152,6 +1179,229 @@ impl Workspace {
                 .await;
         })
         .detach();
+    }
+
+    /// Open the jump list and ask the pane for the files next to it.
+    fn open_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette = Some(Palette {
+            query: String::new(),
+            cursor: 0,
+            files: Vec::new(),
+        });
+        cx.notify();
+
+        let (Some(address), Some(session), Some(block)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.active_block.clone(),
+        ) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({
+                "session_id": session,
+                "block_id": block,
+                "args": {"files": true, "limit": 400},
+            });
+            let Ok(reply) = engine
+                .call(&address, "com.superlogical.terminal.list_dir", payload)
+                .await
+            else {
+                return;
+            };
+            let root = reply
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let files: Vec<String> = reply
+                .get("entries")
+                .and_then(|e| e.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let name = entry.get("name").and_then(|n| n.as_str())?;
+                            let is_file =
+                                entry.get("file").and_then(|f| f.as_bool()).unwrap_or(false);
+                            Some(if is_file {
+                                format!("{root}/{name}")
+                            } else {
+                                format!("{root}/{name}/")
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            this.update(cx, |me, cx| {
+                if let Some(palette) = &mut me.palette {
+                    palette.files = files;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the palette would show right now, filtered by the query.
+    fn palette_items(&self) -> Vec<(String, Jump)> {
+        let Some(palette) = &self.palette else {
+            return Vec::new();
+        };
+        let needle = palette.query.to_lowercase();
+        let keep = |text: &str| needle.is_empty() || text.to_lowercase().contains(&needle);
+        let mut items: Vec<(String, Jump)> = Vec::new();
+        for server in &self.state.servers {
+            for session in &server.sessions {
+                for window in &session.windows {
+                    if keep(&window.label) {
+                        items.push((
+                            format!("{} · {}", session.label, window.label),
+                            Jump::Window {
+                                session: session.id.clone(),
+                                window: window.id.clone(),
+                            },
+                        ));
+                    }
+                    for block in &window.blocks {
+                        let name = block.display_name();
+                        if !keep(&name) && !keep(&window.label) {
+                            continue;
+                        }
+                        items.push((
+                            format!("{} · {}", window.label, name),
+                            Jump::Block {
+                                server: server.id.clone(),
+                                session: session.id.clone(),
+                                window: window.id.clone(),
+                                block: block.id.clone(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        for file in &palette.files {
+            if keep(file) {
+                items.push((file.clone(), Jump::File(file.clone())));
+            }
+        }
+        items
+    }
+
+    /// Type into the palette. Returns true when the key belonged to it.
+    fn palette_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.palette.is_none() {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.palette = None;
+                cx.notify();
+                true
+            }
+            "up" => {
+                if let Some(palette) = &mut self.palette {
+                    palette.cursor = palette.cursor.saturating_sub(1);
+                }
+                cx.notify();
+                true
+            }
+            "down" => {
+                let count = self.palette_items().len();
+                if let Some(palette) = &mut self.palette {
+                    palette.cursor = (palette.cursor + 1).min(count.saturating_sub(1));
+                }
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                if let Some(palette) = &mut self.palette {
+                    palette.query.pop();
+                    palette.cursor = 0;
+                }
+                cx.notify();
+                true
+            }
+            "enter" => {
+                let items = self.palette_items();
+                let cursor = self.palette.as_ref().map(|p| p.cursor).unwrap_or(0);
+                self.palette = None;
+                if let Some((_, jump)) = items.into_iter().nth(cursor) {
+                    self.take_jump(jump, cx);
+                }
+                cx.notify();
+                true
+            }
+            _ => {
+                let typed = event
+                    .keystroke
+                    .key_char
+                    .clone()
+                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
+                match typed {
+                    Some(text) => {
+                        if let Some(palette) = &mut self.palette {
+                            palette.query.push_str(&text);
+                            palette.cursor = 0;
+                        }
+                        cx.notify();
+                        true
+                    }
+                    None => {
+                        !event.keystroke.modifiers.control
+                            && !event.keystroke.modifiers.alt
+                            && !event.keystroke.modifiers.platform
+                    }
+                }
+            }
+        }
+    }
+
+    fn take_jump(&mut self, jump: Jump, cx: &mut Context<Self>) {
+        match jump {
+            Jump::Block {
+                server,
+                session,
+                window,
+                block,
+            } => {
+                self.server_id = Some(server.clone());
+                self.session_id = Some(session.clone());
+                self.window_id = Some(window);
+                self.jump_to_block(&server, &session, &block, cx);
+            }
+            Jump::Window { session, window } => {
+                self.session_id = Some(session);
+                self.window_id = Some(window);
+                self.show_settings = false;
+                self.reload(cx);
+            }
+            Jump::File(path) => {
+                // Type it into the pane, the way the fzf picker does.
+                let (Some(address), Some(session), Some(block)) = (
+                    self.address(),
+                    self.session_id.clone(),
+                    self.active_block.clone(),
+                ) else {
+                    return;
+                };
+                let engine = self.engine.clone();
+                cx.spawn(async move |_, _| {
+                    let payload = json!({
+                        "session_id": session,
+                        "block_id": block,
+                        "args": {"data": path},
+                    });
+                    let _ = engine
+                        .call(&address, "com.superlogical.terminal.write", payload)
+                        .await;
+                })
+                .detach();
+            }
+        }
     }
 
     /// Move this floating pane to the front or the back of the stack.
@@ -2080,6 +2330,129 @@ impl Workspace {
                             .text_xs()
                             .text_color(theme::muted())
                             .child("Enter to save · Esc to cancel"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The jump list, over everything else.
+    fn palette_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(palette) = &self.palette else {
+            return div().into_any_element();
+        };
+        let chrome = self.chrome();
+        let items = self.palette_items();
+        let rows: Vec<AnyElement> = items
+            .iter()
+            .take(12)
+            .enumerate()
+            .map(|(index, (label, jump))| {
+                let selected = index == palette.cursor;
+                let (session, window, block, server) = match jump {
+                    Jump::Block {
+                        server,
+                        session,
+                        window,
+                        block,
+                    } => (
+                        session.clone(),
+                        window.clone(),
+                        block.clone(),
+                        server.clone(),
+                    ),
+                    Jump::Window { session, window } => (
+                        session.clone(),
+                        window.clone(),
+                        String::new(),
+                        String::new(),
+                    ),
+                    Jump::File(path) => (String::new(), String::new(), path.clone(), String::new()),
+                };
+                div()
+                    .id(SharedString::from(format!("palette-{index}")))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .when(selected, |el| {
+                        el.bg(chrome.active()).text_color(theme::text())
+                    })
+                    .when(!selected, |el| el.text_color(theme::muted()))
+                    .child(div().flex_1().truncate().child(label.clone()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.palette = None;
+                            if !session.is_empty() && !window.is_empty() && !block.is_empty() {
+                                this.server_id = Some(server.clone());
+                                this.session_id = Some(session.clone());
+                                this.jump_to_block(&server, &session, &block, cx);
+                            } else if !session.is_empty() {
+                                this.session_id = Some(session.clone());
+                                this.window_id = Some(window.clone());
+                                this.show_settings = false;
+                                this.reload(cx);
+                            } else {
+                                this.take_jump(Jump::File(block.clone()), cx);
+                            }
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let more = items.len().saturating_sub(12);
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_center()
+            .bg(hsla(0.0, 0.0, 0.0, 0.5))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(px(520.0))
+                    .rounded_lg()
+                    .bg(theme::color(theme::SURFACE))
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(chrome.active())
+                            .text_color(theme::text())
+                            .child(format!("{}▌", palette.query)),
+                    )
+                    .children(rows)
+                    .when(more > 0, |el| {
+                        el.child(
+                            div()
+                                .px_3()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(format!("{more} more — keep typing")),
+                        )
+                    })
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child("↑↓ to pick · Enter to go · Esc to close"),
                     ),
             )
             .into_any_element()
@@ -3506,6 +3879,7 @@ impl Render for Workspace {
         let title_bar = self.title_bar(cx);
         let toasts = self.toast_strip(cx);
         let prompt = self.prompt_overlay();
+        let palette = self.palette_overlay(cx);
         let body = if self.show_settings {
             self.settings_page(cx)
         } else {
@@ -3547,6 +3921,10 @@ impl Render for Workspace {
             .text_sm()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.palette.is_some() && this.palette_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.prompt.is_some() && this.prompt_key(event, cx) {
                     cx.stop_propagation();
                     return;
@@ -3581,6 +3959,7 @@ impl Render for Workspace {
             .child(title_bar)
             .child(body)
             .child(prompt)
+            .child(palette)
             .child(toasts)
     }
 }
