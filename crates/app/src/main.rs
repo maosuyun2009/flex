@@ -17,7 +17,7 @@ mod win32;
 mod workspace;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flex_engine::Engine;
 use gpui::{px, size, App, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};
@@ -30,11 +30,20 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         // The engine calls this from its own threads; the UI wakes on its loop.
         let (wake_tx, wake_rx) = async_channel::unbounded::<()>();
+        // Bells, program notifications and agents that stopped for a decision
+        // arrive on an engine thread; they queue here and the UI drains them.
+        let notices: Arc<Mutex<Vec<flex_engine::Notification>>> = Arc::default();
+        let inbox = notices.clone();
         let engine = Arc::new(Engine::new(
             data_dir(),
             "flex",
             Arc::new(move || {
                 let _ = wake_tx.try_send(());
+            }),
+            Arc::new(move |notification| {
+                if let Ok(mut queue) = inbox.lock() {
+                    queue.push(notification);
+                }
             }),
         ));
 
@@ -89,8 +98,9 @@ fn main() {
             ..Default::default()
         };
         let rx = wake_rx.clone();
+        let notices = notices.clone();
         cx.open_window(options, move |_window, cx| {
-            cx.new(|cx| workspace::Workspace::new(engine.clone(), rx.clone(), cx))
+            cx.new(|cx| workspace::Workspace::new(engine.clone(), rx.clone(), notices.clone(), cx))
         })
         .expect("open window");
         cx.activate(true);

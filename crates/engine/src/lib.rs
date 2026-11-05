@@ -19,24 +19,35 @@ use shrew_core::{Config, Listener, Shrew};
 /// Called on an engine thread whenever [`Engine::state`] may be stale.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// Called on an engine thread when something is worth showing the user: a bell,
+/// a program asking for attention, an agent that stopped for a decision.
+pub type Notifier = Arc<dyn Fn(Notification) + Send + Sync>;
+
 /// One connection to Rex's engine. Keep it alive: dropping it closes every
 /// connection and stream it owns.
 pub struct Engine {
     shrew: Shrew,
 }
 
-struct Waker(Wake);
+struct Waker(Wake, Notifier);
 
 impl Listener for Waker {
     fn state_changed(&self) {
         (self.0)()
     }
-    fn notify(&self, _: Notification) {}
+    fn notify(&self, notification: Notification) {
+        (self.1)(notification)
+    }
 }
 
 impl Engine {
     /// `data_dir` keeps the saved server list; `None` keeps nothing on disk.
-    pub fn new(data_dir: Option<PathBuf>, device_label: &str, wake: Wake) -> Self {
+    pub fn new(
+        data_dir: Option<PathBuf>,
+        device_label: &str,
+        wake: Wake,
+        notify: Notifier,
+    ) -> Self {
         let config = Config {
             data_dir,
             client_name: "flex".into(),
@@ -44,7 +55,7 @@ impl Engine {
             ..Default::default()
         };
         Self {
-            shrew: Shrew::new(config, Arc::new(Waker(wake))),
+            shrew: Shrew::new(config, Arc::new(Waker(wake, notify))),
         }
     }
 

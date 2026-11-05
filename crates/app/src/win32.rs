@@ -13,9 +13,12 @@ mod imp {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        OpenClipboard, SetClipboardData,
     };
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    };
     use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
@@ -113,6 +116,31 @@ mod imp {
         }
     }
 
+    /// Put text on the clipboard. A program copying with OSC 52 (vim, tmux, an
+    /// agent's copy button) never reaches GPUI's clipboard API, because the text
+    /// arrives on a stream callback, not in a UI action.
+    pub fn set_clipboard_text(text: &str) {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return;
+            }
+            EmptyClipboard();
+            let bytes = wide.len() * std::mem::size_of::<u16>();
+            let global = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if !global.is_null() {
+                let dest = GlobalLock(global) as *mut u16;
+                if !dest.is_null() {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), dest, wide.len());
+                    GlobalUnlock(global);
+                    // The clipboard owns the block now; freeing it would be a bug.
+                    SetClipboardData(CF_UNICODETEXT as u32, global as *mut _);
+                }
+            }
+            CloseClipboard();
+        }
+    }
+
     pub fn round_corners() {
         const ROUND: u32 = 2; // DWMWCP_ROUND
         if let Some(hwnd) = hwnd() {
@@ -128,6 +156,8 @@ mod imp {
     pub fn clipboard_text() -> Option<String> {
         None
     }
+
+    pub fn set_clipboard_text(_: &str) {}
 
     pub fn drag() {}
     pub fn is_maximized() -> bool {
@@ -170,4 +200,7 @@ mod imp {
     pub fn round_corners() {}
 }
 
-pub use imp::{clipboard_text, drag, is_maximized, minimize, round_corners, toggle_maximize};
+pub use imp::{
+    clipboard_text, drag, is_maximized, minimize, round_corners, set_clipboard_text,
+    toggle_maximize,
+};

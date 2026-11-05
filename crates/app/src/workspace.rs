@@ -23,6 +23,7 @@ use crate::settings::{Settings, FONT_MAX, FONT_MIN};
 use crate::shortcuts::{self, Action};
 use crate::terminal::TerminalView;
 use crate::theme;
+use flex_engine::Notification;
 
 /// Printed by a picker pane once it has a choice, so the client can find it in
 /// the pane's text without guessing at fzf's redraws.
@@ -88,6 +89,17 @@ struct Pull {
     live: [f64; 4],
 }
 
+/// One notification on screen, and when it should go away.
+struct Toast {
+    kind: shrew_core::NotificationKind,
+    title: String,
+    body: String,
+    server_id: String,
+    session_id: String,
+    block_id: String,
+    until: std::time::Instant,
+}
+
 /// Which page of the Settings tab is showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -136,6 +148,10 @@ pub struct Workspace {
     /// would send `WM_NCLBUTTONDBLCLK`, but we hand the press to the shell for
     /// dragging, which swallows the second click, so it is detected here.
     title_press: Option<(std::time::Instant, gpui::Point<gpui::Pixels>)>,
+    /// Notifications the engine queued: bells, program messages, agents that
+    /// stopped. Drained on every reload and shown as toasts.
+    notices: Arc<std::sync::Mutex<Vec<Notification>>>,
+    toasts: std::collections::VecDeque<Toast>,
     /// A press on the title bar with the window not moved yet. The drag only
     /// starts once the pointer actually moves: handing Windows
     /// `WM_NCLBUTTONDOWN` on press restores a maximized window the moment the
@@ -145,7 +161,12 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(engine: Arc<Engine>, wake: Receiver<()>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        engine: Arc<Engine>,
+        wake: Receiver<()>,
+        notices: Arc<std::sync::Mutex<Vec<Notification>>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let settings = Settings::load(&engine);
         let font = crate::fonts::resolve(cx);
         let picture = settings.background.as_deref().and_then(|path| {
@@ -180,6 +201,8 @@ impl Workspace {
             prefix: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_pick: None,
             tinted: None,
+            notices,
+            toasts: std::collections::VecDeque::new(),
             title_press: None,
             title_armed: None,
             _wake: None,
@@ -195,8 +218,74 @@ impl Workspace {
         this
     }
 
+    /// Take what the engine queued while we were not looking.
+    fn absorb_notices(&mut self, cx: &mut Context<Self>) {
+        let queued: Vec<Notification> = self
+            .notices
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default();
+        if queued.is_empty() {
+            return;
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(7);
+        for notice in queued {
+            self.toasts.push_back(Toast {
+                kind: notice.kind,
+                title: notice.title,
+                body: notice.body,
+                server_id: notice.server_id,
+                session_id: notice.session_id,
+                block_id: notice.block_id,
+                until,
+            });
+        }
+        // Three at a time: more than that is a wall, not a hint.
+        while self.toasts.len() > 3 {
+            self.toasts.pop_front();
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(7))
+                .await;
+            this.update(cx, |me, cx| {
+                let now = std::time::Instant::now();
+                me.toasts.retain(|toast| toast.until > now);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Go to the pane a notification came from.
+    fn jump_to_block(&mut self, server: &str, session: &str, block: &str, cx: &mut Context<Self>) {
+        let window = self
+            .state
+            .servers
+            .iter()
+            .flat_map(|server| server.sessions.iter())
+            .find(|s| s.id == session)
+            .and_then(|s| {
+                s.windows
+                    .iter()
+                    .find(|w| w.blocks.iter().any(|b| b.id == block))
+            })
+            .map(|w| w.id.clone());
+        self.server_id = Some(server.to_owned());
+        self.session_id = Some(session.to_owned());
+        if let Some(window) = window {
+            self.window_id = Some(window);
+        }
+        self.active_block = Some(block.to_owned());
+        self.pending_focus = Some(block.to_owned());
+        self.show_settings = false;
+        self.reload(cx);
+    }
+
     /// Re-read the engine's state and drop selections and terminals that went away.
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.absorb_notices(cx);
         self.state = self.engine.state();
 
         if self
@@ -1202,6 +1291,84 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Notifications as cards in the top right corner: a bell, a program asking
+    /// for attention, an agent that stopped for a decision. Clicking one jumps
+    /// to the pane it came from.
+    fn toast_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.toasts.is_empty() {
+            return div().into_any_element();
+        }
+        let chrome = self.chrome();
+        let cards: Vec<AnyElement> = self
+            .toasts
+            .iter()
+            .map(|toast| {
+                let colour = match toast.kind {
+                    shrew_core::NotificationKind::AgentBlocked => theme::danger(),
+                    shrew_core::NotificationKind::AgentError => {
+                        theme::agent(shrew_core::AgentState::Error)
+                    }
+                    shrew_core::NotificationKind::AgentDone => {
+                        theme::agent(shrew_core::AgentState::Done)
+                    }
+                    shrew_core::NotificationKind::Program => theme::accent(),
+                    shrew_core::NotificationKind::Bell => theme::accent(),
+                    shrew_core::NotificationKind::ProcessExited => theme::muted(),
+                };
+                let (server, session, block) = (
+                    toast.server_id.clone(),
+                    toast.session_id.clone(),
+                    toast.block_id.clone(),
+                );
+                div()
+                    .id(SharedString::from(format!("toast-{block}")))
+                    .w(px(300.0))
+                    .rounded_md()
+                    .bg(chrome.surface())
+                    .border_1()
+                    .border_color(colour)
+                    .shadow_lg()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(theme::dot(colour))
+                            .child(div().flex_1().truncate().child(toast.title.clone())),
+                    )
+                    .when(!toast.body.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(toast.body.clone()),
+                        )
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.jump_to_block(&server, &session, &block, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .absolute()
+            .top(theme::TITLE_H + px(10.0))
+            .right(px(12.0))
+            .flex_col()
+            .gap_2()
+            .children(cards)
+            .into_any_element()
+    }
+
     fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let chrome = self.chrome();
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -1364,25 +1531,97 @@ impl Workspace {
             .map(|window| {
                 let id = window.id.clone();
                 let active = !settings_open && selected.as_deref() == Some(id.as_str());
+                // What the programs in this tab are doing: a shell leaves
+                // `Window 1495d30d` behind, an editor or a build does not.
+                let head = window
+                    .focused_block_id
+                    .as_ref()
+                    .and_then(|id| window.blocks.iter().find(|b| &b.id == id))
+                    .or_else(|| window.blocks.first());
+                let shell = ["zsh", "bash", "sh", "fish", "nu", "pwsh", "powershell"];
+                let name = match head {
+                    Some(block) if window.label.starts_with("Window ") => {
+                        // Shells title themselves `user@host:~/dir`, which as a
+                        // tab name is noise; the directory's own name is not.
+                        let shown = block.display_name();
+                        if shown.contains('/') || shown.contains('@') || shown.contains('\\') {
+                            shown
+                                .rsplit('/')
+                                .next()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(&shown)
+                                .to_owned()
+                        } else {
+                            shown
+                        }
+                    }
+                    _ => window.label.clone(),
+                };
+                let process = head
+                    .map(|block| block.process.clone())
+                    .filter(|p| !p.is_empty() && !shell.contains(&p.as_str()) && *p != name)
+                    .unwrap_or_default();
+                let progress = head.and_then(|block| block.progress);
+                let bell = head.is_some_and(|block| block.has_bell);
+                let mut tint = theme::accent();
+                tint.a = 0.16;
                 div()
                     .id(SharedString::from(id.clone()))
+                    .relative()
                     .h(px(22.0))
                     .px_3()
                     .rounded_md()
                     .flex()
                     .items_center()
+                    .gap_1()
                     .text_xs()
                     .when(active, |el| {
                         el.bg(chrome.active()).text_color(theme::text())
                     })
-                    .when(!active, |el| {
+                    .when(!active && bell, |el| {
+                        el.bg(tint).text_color(theme::accent())
+                    })
+                    .when(!active && !bell, |el| {
                         el.text_color(theme::muted())
                             .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
                     })
                     .when_some(window_agent(&window), |el, state| {
                         el.child(theme::dot(theme::agent(state)))
                     })
-                    .child(window.label.clone())
+                    .child(
+                        // A shell titles itself with whatever is running, which
+                        // can be a whole command line; the strip still has to fit.
+                        div().max_w(px(220.0)).truncate().child(name),
+                    )
+                    .when(!process.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_color(theme::muted())
+                                .child(format!("· {process}")),
+                        )
+                    })
+                    .when_some(progress, |el, percent| {
+                        let mut fill = theme::accent();
+                        fill.a = 0.85;
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(px(4.0))
+                                .right(px(4.0))
+                                .bottom(px(1.0))
+                                .h(px(2.0))
+                                .rounded_full()
+                                .bg(theme::border())
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(percent as f32 / 100.0))
+                                        .rounded_full()
+                                        .bg(fill),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id(SharedString::from(format!("close-{id}")))
@@ -2148,6 +2387,7 @@ impl Render for Workspace {
             crate::win32::round_corners();
         }
         let title_bar = self.title_bar(cx);
+        let toasts = self.toast_strip(cx);
         let body = if self.show_settings {
             self.settings_page(cx)
         } else {
@@ -2218,6 +2458,7 @@ impl Render for Workspace {
             }))
             .child(title_bar)
             .child(body)
+            .child(toasts)
     }
 }
 

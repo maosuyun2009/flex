@@ -88,7 +88,12 @@ impl TerminalListener for Notifier {
         let _ = self.0.try_send(());
     }
     fn status_changed(&self, _: TerminalStatus) {}
-    fn clipboard(&self, _: String) {}
+    /// A program copied text with OSC 52, or another client selected some. The
+    /// text never passes through a GPUI action, so it goes to the clipboard the
+    /// direct way.
+    fn clipboard(&self, text: String) {
+        crate::win32::set_clipboard_text(&text);
+    }
     fn size_changed(&self, _cols: u16, _rows: u16) {}
 }
 
