@@ -187,6 +187,13 @@ zoomed *floating* pane at full size because the server keeps its layer bounds an
 only reports `zoomed_block_id` (for a tiled pane the reported layout already
 collapses to that one block).
 
+Drawing it bigger is half the job — the terminal inside has to be told, or the
+content stays at the old grid in a corner of the new box. A remote terminal uses
+the size of the client that *owns* it, and owning is a separate call
+(`own_block`); the shell gives ownership to whichever pane holds the keyboard,
+not just to the pane that was clicked. Without that, a pane opened from the
+prefix menu — never clicked — keeps its small grid when it is zoomed.
+
 Floating a pane remembers the rect it had, so tiling it again puts it back on
 the same side with roughly its old share (`split_hint`): a pane from the right of
 a 30/70 split returns as `after` with a ratio of 0.3, not a flat 50/50. Rex takes

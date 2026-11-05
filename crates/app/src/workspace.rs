@@ -1511,6 +1511,15 @@ impl Workspace {
             }
         }
 
+        // The pane with the keyboard owns its terminal's size, so zooming it or
+        // opening it from a shortcut reflows the remote side to the new box.
+        for (_, view) in &views {
+            let view = view.read(cx);
+            if view.handle().is_focused(window) {
+                view.take_control();
+            }
+        }
+
         let active = self.active_block.clone();
         let chrome = self.chrome();
         let mut elements: Vec<AnyElement> = Vec::with_capacity(views.len());

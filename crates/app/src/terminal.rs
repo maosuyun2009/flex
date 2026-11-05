@@ -225,6 +225,18 @@ impl TerminalView {
         self.focus.clone()
     }
 
+    /// Size the remote terminal from this view. Called for the pane that holds
+    /// the keyboard rather than from a click, because a pane opened by a
+    /// shortcut — a tool from the prefix menu, a fresh split — never sees one,
+    /// and a terminal without control is never resized when it is zoomed.
+    pub fn take_control(&self) {
+        if let Some(session) = &self.session {
+            if !session.has_control() {
+                session.clone().take_control();
+            }
+        }
+    }
+
     pub fn set_background(&mut self, over_picture: bool, opacity: f32, cx: &mut Context<Self>) {
         self.over_picture = over_picture;
         self.background_opacity = opacity;
