@@ -11,9 +11,9 @@ use std::sync::Arc;
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, hsla, linear_color_stop, linear_gradient, px, relative, AnyElement, App, Context,
-    Entity, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, Render, SharedString, Size, Task, Window,
+    canvas, div, hsla, linear_color_stop, linear_gradient, point, px, relative, size, AnyElement,
+    App, Bounds, Context, Entity, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Size, Task, Window,
 };
 use rexshell_engine::{AppState, BlockState, Connectivity, Engine, SessionState, WindowState};
 use serde_json::json;
@@ -126,10 +126,13 @@ impl Workspace {
     pub fn new(engine: Arc<Engine>, wake: Receiver<()>, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load(&engine);
         let font = crate::fonts::resolve(cx);
-        let picture = settings
-            .background
-            .as_deref()
-            .and_then(crate::background::load);
+        let picture = settings.background.as_deref().and_then(|path| {
+            let image = crate::background::load(path);
+            if image.is_none() {
+                eprintln!("rexshell: could not load background {path}");
+            }
+            image
+        });
         if std::env::var_os("REXSHELL_DEBUG").is_some() {
             eprintln!("[font] using {font}");
         }
@@ -293,7 +296,7 @@ impl Workspace {
         let font_size = self.settings.font_size;
         let font = self.font.clone();
         let prefix = self.prefix.clone();
-        let picture = self.picture.clone();
+        let over_picture = self.picture.is_some();
         let picture_opacity = self.settings.background_opacity;
         let view = cx.new(|cx| {
             TerminalView::new(
@@ -304,7 +307,7 @@ impl Workspace {
                 font,
                 font_size,
                 prefix,
-                picture,
+                over_picture,
                 picture_opacity,
                 cx,
             )
@@ -817,11 +820,11 @@ impl Workspace {
     }
 
     fn apply_background(&mut self, cx: &mut Context<Self>) {
-        let picture = self.picture.clone();
+        let over_picture = self.picture.is_some();
         let opacity = self.settings.background_opacity;
         for view in self.terminals.values() {
             view.update(cx, |terminal, cx| {
-                terminal.set_background(picture.clone(), opacity, cx)
+                terminal.set_background(over_picture, opacity, cx)
             });
         }
     }
@@ -1448,8 +1451,50 @@ impl Workspace {
         }
 
         // Left transparent so the window's gradient reaches the terminal: an
-        // opaque layer here would flatten the glass.
-        let mut area = div().relative().flex_1().children(elements);
+        // opaque layer here would flatten the glass. One picture is painted
+        // across the whole area, before the panes, so it spans the terminal
+        // instead of repeating inside every split.
+        let mut area = div().relative().flex_1();
+        if let Some(image) = self.picture.clone() {
+            area = area.child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _cx| {
+                        let natural = image.size(0);
+                        let (iw, ih) = (natural.width.0 as f32, natural.height.0 as f32);
+                        if iw < 1.0 || ih < 1.0 {
+                            return;
+                        }
+                        let (bw, bh) =
+                            (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                        // Cover fit to the whole area, cropped, never distorted.
+                        let scale = (bw / iw).max(bh / ih);
+                        let (w, h) = (px(iw * scale), px(ih * scale));
+                        let cover = Bounds::new(
+                            point(
+                                bounds.origin.x + (px(bw) - w) * 0.5,
+                                bounds.origin.y + (px(bh) - h) * 0.5,
+                            ),
+                            size(w, h),
+                        );
+                        window.paint_layer(bounds, |window| {
+                            let _ = window.paint_image(
+                                cover,
+                                gpui::Corners::default(),
+                                image.clone(),
+                                0,
+                                false,
+                            );
+                        });
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full(),
+            );
+        }
+        let mut area = area.children(elements);
 
         // While a pane is being pulled, the window reports pointer movement: a
         // drag that leaves the pane still has to track, and the listeners only

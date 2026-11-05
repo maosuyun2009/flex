@@ -16,6 +16,18 @@ pub fn load(path: &str) -> Option<Arc<RenderImage>> {
         eprintln!("rexshell: background image is larger than 64 MiB, ignoring it");
         return None;
     }
-    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let mut decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    // The renderer takes BGRA, premultiplied. Feeding it RGBA swaps red and blue,
+    // which is what made a blue picture render brown.
+    for pixel in decoded.pixels_mut() {
+        let [r, g, b, a] = pixel.0;
+        let alpha = a as f32 / 255.0;
+        pixel.0 = [
+            (b as f32 * alpha) as u8,
+            (g as f32 * alpha) as u8,
+            (r as f32 * alpha) as u8,
+            a,
+        ];
+    }
     Some(Arc::new(RenderImage::new([Frame::new(decoded)])))
 }

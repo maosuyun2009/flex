@@ -264,14 +264,23 @@ pi); anything else can print it, e.g.
 ## Background picture
 
 Settings → **Background** → *Choose…* picks an image (png, jpeg, webp, gif) that
-is drawn behind the terminal text, cover-fitted so it always fills the pane.
+is drawn **once, across the whole terminal area** — not once per pane — under the
+text, cover-fitted and clipped to the terminal so the title bar and its buttons
+stay visible.
 **Picture opacity** decides how much of it survives: the terminal paints its own
 colour over the picture at `1 - opacity`, so 35% leaves a clear watermark and 80%
 is nearly the picture with text on top.
 
-Decoded once into a `RenderImage` (`background.rs`) and shared by every pane, so
-switching tabs costs nothing. Clearing the row removes it and returns the flat
-finish.
+Two details that were wrong at first and are worth keeping:
+
+- The renderer takes **BGRA, premultiplied**, not RGBA. Feeding it RGBA swaps red
+  and blue, which turned a blue picture brown — that was the "colour difference".
+- `paint_image` escapes the element bounds unless it is wrapped in
+  `paint_layer(bounds, ..)`. Without the clip it painted over the title bar and
+  hid the window buttons.
+
+Decoded once into a `RenderImage` (`background.rs`). Clearing the row removes it
+and returns the flat finish.
 
 ## Terminal theme## Input methods
 
@@ -332,14 +341,23 @@ pi); anything else can print it, e.g.
 ## Background picture
 
 Settings → **Background** → *Choose…* picks an image (png, jpeg, webp, gif) that
-is drawn behind the terminal text, cover-fitted so it always fills the pane.
+is drawn **once, across the whole terminal area** — not once per pane — under the
+text, cover-fitted and clipped to the terminal so the title bar and its buttons
+stay visible.
 **Picture opacity** decides how much of it survives: the terminal paints its own
 colour over the picture at `1 - opacity`, so 35% leaves a clear watermark and 80%
 is nearly the picture with text on top.
 
-Decoded once into a `RenderImage` (`background.rs`) and shared by every pane, so
-switching tabs costs nothing. Clearing the row removes it and returns the flat
-finish.
+Two details that were wrong at first and are worth keeping:
+
+- The renderer takes **BGRA, premultiplied**, not RGBA. Feeding it RGBA swaps red
+  and blue, which turned a blue picture brown — that was the "colour difference".
+- `paint_image` escapes the element bounds unless it is wrapped in
+  `paint_layer(bounds, ..)`. Without the clip it painted over the title bar and
+  hid the window buttons.
+
+Decoded once into a `RenderImage` (`background.rs`). Clearing the row removes it
+and returns the flat finish.
 
 ## Terminal theme## Input methods
 
@@ -400,14 +418,23 @@ pi); anything else can print it, e.g.
 ## Background picture
 
 Settings → **Background** → *Choose…* picks an image (png, jpeg, webp, gif) that
-is drawn behind the terminal text, cover-fitted so it always fills the pane.
+is drawn **once, across the whole terminal area** — not once per pane — under the
+text, cover-fitted and clipped to the terminal so the title bar and its buttons
+stay visible.
 **Picture opacity** decides how much of it survives: the terminal paints its own
 colour over the picture at `1 - opacity`, so 35% leaves a clear watermark and 80%
 is nearly the picture with text on top.
 
-Decoded once into a `RenderImage` (`background.rs`) and shared by every pane, so
-switching tabs costs nothing. Clearing the row removes it and returns the flat
-finish.
+Two details that were wrong at first and are worth keeping:
+
+- The renderer takes **BGRA, premultiplied**, not RGBA. Feeding it RGBA swaps red
+  and blue, which turned a blue picture brown — that was the "colour difference".
+- `paint_image` escapes the element bounds unless it is wrapped in
+  `paint_layer(bounds, ..)`. Without the clip it painted over the title bar and
+  hid the window buttons.
+
+Decoded once into a `RenderImage` (`background.rs`). Clearing the row removes it
+and returns the flat finish.
 
 ## Terminal theme
 
