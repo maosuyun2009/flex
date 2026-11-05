@@ -97,6 +97,25 @@ impl TerminalListener for Notifier {
     fn size_changed(&self, _cols: u16, _rows: u16) {}
 }
 
+/// How much of what we already sent the IME is about to take back.
+///
+/// Pinyin letters arrive as key events before the composition starts, so the
+/// text is already in the pty. Only the letters this composition actually
+/// typed belong to it — the longest tail of `sent` that the composition
+/// begins with. Retracting all of `sent` deleted text typed in another input
+/// mode, e.g. English typed before switching back to Chinese.
+fn retract_len(sent: &str, composition: &str) -> usize {
+    let sent: Vec<char> = sent.chars().flat_map(|c| c.to_lowercase()).collect();
+    let composition: Vec<char> = composition.chars().flat_map(|c| c.to_lowercase()).collect();
+    let max = sent.len().min(composition.len());
+    for n in (1..=max).rev() {
+        if composition.starts_with(&sent[sent.len() - n..]) {
+            return n;
+        }
+    }
+    0
+}
+
 /// The link that covers one character of a line, if there is one.
 fn url_token(chars: &[char], index: usize) -> Option<String> {
     if chars.is_empty() || index >= chars.len() || chars[index].is_whitespace() {
@@ -1008,14 +1027,15 @@ impl EntityInputHandler for TerminalView {
             return;
         }
         if !self.composing {
-            // The composition has just started, and the pinyin letters sent
-            // before this message are the last thing on the line: take them back.
-            if !self.leaked.is_empty() {
+            // The composition has just started. Take back the letters it typed
+            // before this message arrived — and only those.
+            let take = retract_len(&self.leaked, _new_text);
+            if take > 0 {
                 if let Some(session) = &self.session {
-                    session.send_text(&"\u{7f}".repeat(self.leaked.len()));
+                    session.send_text(&"\u{7f}".repeat(take));
                 }
-                self.leaked.clear();
             }
+            self.leaked.clear();
         }
         // Composition in progress: swallow key events until it commits.
         self.composing = true;
@@ -1043,10 +1063,25 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::url_token;
+    use super::{retract_len, url_token};
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
+    }
+
+    #[test]
+    fn only_the_compositions_own_letters_are_retracted() {
+        // Nothing of the pinyin is ours yet.
+        assert_eq!(retract_len("", "n"), 0);
+        // The usual case: one letter leaked before the composition started.
+        assert_eq!(retract_len("n", "n"), 1);
+        assert_eq!(retract_len("ni", "nihao"), 2);
+        // English typed in between is not the composition's, so it stays.
+        assert_eq!(retract_len("abc", "n"), 0);
+        assert_eq!(retract_len("abcni", "nihao"), 2);
+        // A commit in between clears the run, so only the tail can match.
+        assert_eq!(retract_len("abcnihao", "nihao"), 5);
+        assert_eq!(retract_len("abc", "abcd"), 3);
     }
 
     #[test]
