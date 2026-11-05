@@ -314,9 +314,11 @@ scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 
 ## Finding text
 
-`Ctrl-Shift-H` opens the find bar over the top of the pane: type to search,
-`Enter` or `↓` for the next match, `↑` for the previous, `Aa` for case
-sensitivity, `Esc` or `×` to close. The count reads `n / m` and the view scrolls
+`Ctrl-Shift-H` opens the find bar over the top of the pane, and the same chord,
+`Esc`, `×` or a click in the text closes it: type to search, `Enter` or `↓` for
+the next match, `↑` for the previous, `Aa` for case sensitivity. Chords with
+Ctrl still reach the window while the bar is open, so no other shortcut goes
+dead behind it. The count reads `n / m` and the view scrolls
 to the match, which is highlighted character by character — only the matched
 cells, not the whole row.
 
@@ -422,9 +424,11 @@ scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 
 ## Finding text
 
-`Ctrl-Shift-H` opens the find bar over the top of the pane: type to search,
-`Enter` or `↓` for the next match, `↑` for the previous, `Aa` for case
-sensitivity, `Esc` or `×` to close. The count reads `n / m` and the view scrolls
+`Ctrl-Shift-H` opens the find bar over the top of the pane, and the same chord,
+`Esc`, `×` or a click in the text closes it: type to search, `Enter` or `↓` for
+the next match, `↑` for the previous, `Aa` for case sensitivity. Chords with
+Ctrl still reach the window while the bar is open, so no other shortcut goes
+dead behind it. The count reads `n / m` and the view scrolls
 to the match, which is highlighted character by character — only the matched
 cells, not the whole row.
 
@@ -530,9 +534,11 @@ scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 
 ## Finding text
 
-`Ctrl-Shift-H` opens the find bar over the top of the pane: type to search,
-`Enter` or `↓` for the next match, `↑` for the previous, `Aa` for case
-sensitivity, `Esc` or `×` to close. The count reads `n / m` and the view scrolls
+`Ctrl-Shift-H` opens the find bar over the top of the pane, and the same chord,
+`Esc`, `×` or a click in the text closes it: type to search, `Enter` or `↓` for
+the next match, `↑` for the previous, `Aa` for case sensitivity. Chords with
+Ctrl still reach the window while the bar is open, so no other shortcut goes
+dead behind it. The count reads `n / m` and the view scrolls
 to the match, which is highlighted character by character — only the matched
 cells, not the whole row.
 

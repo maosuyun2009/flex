@@ -244,8 +244,8 @@ impl TerminalView {
     /// Open the find bar, or move to the next match if it is already open.
     pub fn start_find(&mut self, cx: &mut Context<Self>) {
         match &mut self.find {
-            Some(find) if !find.query.is_empty() => self.find_next(cx),
-            Some(_) => cx.notify(),
+            // The bar is open, so the same chord closes it.
+            Some(_) => self.close_find(cx),
             None => {
                 self.find = Some(Find {
                     query: String::new(),
@@ -387,12 +387,19 @@ impl TerminalView {
             self.find_step(true, cx);
             return true;
         }
+        // Anything with control or command is a shortcut for the app, not a
+        // character for the query; let it through so the window keeps working.
+        // Ctrl-Shift-H reaches the window's own handler, which toggles the bar
+        // closed; closing it here as well would only reopen it.
+        if modifiers.control || modifiers.platform {
+            return false;
+        }
         if key == "backspace" {
             find.query.pop();
             self.refind(cx);
             return true;
         }
-        if !modifiers.control && !modifiers.alt && !modifiers.platform {
+        if !modifiers.alt {
             if let Some(text) = event.keystroke.key_char.as_deref().or(Some(key)) {
                 let printable: String = text.chars().filter(|c| !c.is_control()).collect();
                 if !printable.is_empty() && printable != "space" {
@@ -679,6 +686,9 @@ impl Render for TerminalView {
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
+                    if this.find.is_some() {
+                        this.close_find(cx);
+                    }
                     // Claim the size so the server reflows this terminal to this window.
                     if let Some(session) = &this.session {
                         session.clone().take_control();
