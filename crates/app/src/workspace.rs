@@ -105,7 +105,8 @@ struct Divider {
 enum Ask {
     RenameTab,
     RenamePane,
-    NewSession,
+    /// The address of the machine the session is created on.
+    NewSession(String),
     /// Session id and label.
     DeleteSession(String, String),
     NewHost,
@@ -121,7 +122,7 @@ impl Ask {
     fn wants_text(&self) -> bool {
         matches!(
             self,
-            Ask::RenameTab | Ask::RenamePane | Ask::NewSession | Ask::NewHost | Ask::AddServer
+            Ask::RenameTab | Ask::RenamePane | Ask::NewSession(..) | Ask::NewHost | Ask::AddServer
         )
     }
 
@@ -1048,13 +1049,19 @@ impl Workspace {
             _ => {}
         }
 
-        let fresh_session = matches!(&prompt.what, Ask::NewSession);
+        let fresh_session = matches!(&prompt.what, Ask::NewSession(..));
         let touched_hosts = matches!(&prompt.what, Ask::NewHost | Ask::DeleteHost(..));
         let deleted_session = matches!(&prompt.what, Ask::DeleteSession(..));
         let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
             return;
         };
         let engine = self.engine.clone();
+        // A new session can be asked for on any machine in the list, not only
+        // the one this window is showing.
+        let target = match &prompt.what {
+            Ask::NewSession(address) => address.clone(),
+            _ => address.clone(),
+        };
         let (method, payload) = match &prompt.what {
             Ask::RenameTab => {
                 let Some(window_id) = self.window_id.clone() else {
@@ -1074,7 +1081,10 @@ impl Workspace {
                     json!({"session_id": session, "block_id": block_id, "label": value}),
                 )
             }
-            Ask::NewSession => ("session.create", json!({"label": value})),
+            Ask::NewSession(address) => (
+                "session.create",
+                json!({"label": value, "address": address}),
+            ),
             Ask::DeleteSession(id, _) => ("session.destroy", json!({"session_id": id})),
             Ask::NewHost => {
                 // "studio studio.tail1234.ts.net": the last word is the address.
@@ -1097,7 +1107,7 @@ impl Workspace {
             Ask::AddServer | Ask::DeleteServer(..) => return,
         };
         cx.spawn(async move |this, cx| {
-            let reply = engine.call(&address, method, payload).await;
+            let reply = engine.call(&target, method, payload).await;
             if let Err(e) = &reply {
                 eprintln!("flex: {method}: {e}");
             }
@@ -1117,6 +1127,14 @@ impl Workspace {
                     if let Some(created) = created {
                         // A brand-new session has no window yet; give it one,
                         // and switch to it so the tab bar follows.
+                        if let Some(server) = me
+                            .state
+                            .servers
+                            .iter()
+                            .find(|s| s.address.trim() == target.trim())
+                        {
+                            me.server_id = Some(server.id.clone());
+                        }
                         me.session_id = Some(created);
                         me.window_id = None;
                         me.active_block = None;
@@ -2901,7 +2919,7 @@ impl Workspace {
             }
         }
 
-        let hosts: Vec<(String, String, String)> = self
+        let hosts_left: Vec<(String, String, String)> = self
             .hosts
             .as_ref()
             .and_then(|hosts| hosts.get("hosts").or(Some(hosts)))
@@ -2927,101 +2945,12 @@ impl Workspace {
                     .collect()
             })
             .unwrap_or_default();
-        if self.hosts.is_some() {
-            rows.push(self.sidebar_header(
-                "HOSTS",
-                Some(("host-add", Ask::NewHost, "Add a host — name and address")),
-                cx,
-            ));
-            for (label, address, host_id) in hosts {
-                let flat = address.clone();
-                let name = label.clone();
-                let del_id = host_id.clone();
-                let del_label = label.clone();
-                rows.push(
-                    div()
-                        .id(SharedString::from(format!("host:{host_id}")))
-                        .mx_2()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(theme::text())
-                        .hover(|el| el.bg(chrome.hover()))
-                        .child(div().flex_1().truncate().child(label))
-                        .child(div().text_xs().text_color(theme::muted()).child(address))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("host-del:{host_id}")))
-                                .size(px(14.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_sm()
-                                .text_size(px(11.0))
-                                .text_color(theme::muted())
-                                .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
-                                .child("×")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        this.open_prompt(
-                                            Ask::DeleteHost(del_id.clone(), del_label.clone()),
-                                            &format!("Remove host {del_label}?"),
-                                            window,
-                                        );
-                                        cx.notify();
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                // Reachable through this server: save it as a
-                                // server of its own and switch to it.
-                                let saved = this
-                                    .state
-                                    .servers
-                                    .iter()
-                                    .find(|s| s.address.trim() == flat.trim())
-                                    .map(|s| s.id.clone());
-                                match saved {
-                                    Some(id) => {
-                                        this.server_id = Some(id);
-                                        this.session_id = None;
-                                        this.window_id = None;
-                                        this.active_block = None;
-                                        this.reload(cx);
-                                    }
-                                    None => {
-                                        if this.engine.add_server(&name, &flat).is_ok() {
-                                            this.state = this.engine.state();
-                                            this.server_id = this
-                                                .state
-                                                .servers
-                                                .iter()
-                                                .find(|s| s.address.trim() == flat.trim())
-                                                .map(|s| s.id.clone());
-                                            this.reload(cx);
-                                        }
-                                    }
-                                }
-                            }),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-
         rows.push(self.sidebar_header(
-            "SERVERS",
+            "MACHINES",
             Some((
                 "server-add",
                 Ask::AddServer,
-                "Add a server — name and address",
+                "Add a machine — name and address",
             )),
             cx,
         ));
@@ -3044,6 +2973,34 @@ impl Workspace {
                     .text_color(theme::muted())
                     .child(div().size(px(6.0)).rounded_full().bg(dot))
                     .child(div().flex_1().truncate().child(server.name.clone()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("session-add:{}", server.id)))
+                            .size(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(12.0))
+                            .text_color(theme::muted())
+                            .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                            .child("+")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let address = server.address.clone();
+                                    move |this, _, window, cx| {
+                                        this.open_prompt(
+                                            Ask::NewSession(address.clone()),
+                                            "New session — name it",
+                                            window,
+                                        );
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                            ),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(format!("server-del:{}", server.id)))
@@ -3150,14 +3107,82 @@ impl Workspace {
                         .into_any_element(),
                 );
             }
+            rows.append(&mut session_rows);
         }
 
-        rows.push(self.sidebar_header(
-            "SESSIONS",
-            Some(("session-add", Ask::NewSession, "New session — name it")),
-            cx,
-        ));
-        rows.extend(session_rows);
+        // Hosts the server knows about but this client has not connected to:
+        // same list, dimmer, and one click adds them as a machine of their own.
+        for (label, address, host_id) in hosts_left {
+            if self
+                .state
+                .servers
+                .iter()
+                .any(|server| server.address.trim() == address.trim())
+            {
+                continue;
+            }
+            let connect = address.clone();
+            let host_name = label.clone();
+            let del_id = host_id.clone();
+            let del_label = label.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("host:{host_id}")))
+                    .mx_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_color(theme::muted())
+                    .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                    .child(theme::dot(theme::border()))
+                    .child(div().flex_1().truncate().child(label))
+                    .child(div().text_xs().text_color(theme::muted()).child("host"))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("host-del:{host_id}")))
+                            .size(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(11.0))
+                            .text_color(theme::muted())
+                            .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.open_prompt(
+                                        Ask::DeleteHost(del_id.clone(), del_label.clone()),
+                                        &format!("Remove host {del_label}?"),
+                                        window,
+                                    );
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if this.engine.add_server(&host_name, &connect).is_ok() {
+                                this.state = this.engine.state();
+                                this.server_id = this
+                                    .state
+                                    .servers
+                                    .iter()
+                                    .find(|s| s.address.trim() == connect.trim())
+                                    .map(|s| s.id.clone());
+                                this.reload(cx);
+                            }
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         div()
             .flex()
