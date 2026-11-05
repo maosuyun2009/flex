@@ -121,10 +121,17 @@ all (found by screenshotting the title bar).
 
 ## Shortcuts
 
-`Ctrl-Shift-d` split right · `Ctrl-Shift-e` split down · `Ctrl-Shift-w` close pane
+`Ctrl-h/j/k/l` move focus between panes (vim/tmux-navigator style, geometrically:
+no move when nothing lies that way) · `Ctrl-Shift-d` split right · `Ctrl-Shift-e` split down · `Ctrl-Shift-w` close pane
 · `Ctrl-Shift-f` float the pane or tile it again · `Ctrl-Shift-t` new tab ·
 `Ctrl-Shift-Enter` zoom · `Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
 matcher and the settings page, so the list you read is the list that works.
+
+Pane focus moves geometrically — Rex picks the nearest block in that direction,
+so pressing left at the left edge does nothing rather than jumping somewhere
+surprising. The client then follows: a click publishes the pane it landed on with
+`session.focus_block`, and a direction move starts from that pane and adopts the
+server's answer, so client and server never disagree about where the keyboard is.
 
 Zoom buys the whole pane area for one block: Rex toggles it, and the shell draws a
 zoomed *floating* pane at full size because the server keeps its layer bounds and

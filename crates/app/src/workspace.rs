@@ -115,6 +115,8 @@ pub struct Workspace {
     prefix: Arc<std::sync::atomic::AtomicBool>,
     /// A picker pane that has not answered yet.
     pending_pick: Option<PendingPick>,
+    /// The pane a tool was opened from, dimmed while the tool is up.
+    tinted: Option<String>,
     _wake: Option<Task<()>>,
 }
 
@@ -143,6 +145,7 @@ impl Workspace {
             float_rects: std::collections::HashMap::new(),
             prefix: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_pick: None,
+            tinted: None,
             _wake: None,
         };
         this.reload(cx);
@@ -319,6 +322,10 @@ impl Workspace {
             Action::ToggleFloat => self.toggle_float(cx),
             Action::NewTab => self.new_tab(cx),
             Action::ZoomPane => self.zoom_pane(cx),
+            Action::FocusLeft => self.focus_direction("left", cx),
+            Action::FocusDown => self.focus_direction("down", cx),
+            Action::FocusUp => self.focus_direction("up", cx),
+            Action::FocusRight => self.focus_direction("right", cx),
             Action::ToggleSidebar => {
                 self.settings.sidebar = !self.settings.sidebar;
                 self.settings.save(&self.engine);
@@ -410,6 +417,66 @@ impl Workspace {
             {
                 eprintln!("rexshell: zoom: {e}");
             }
+        })
+        .detach();
+    }
+
+    /// Move focus one pane over, the way vim and tmux-navigator do. Rex picks the
+    /// neighbour from the layout and reports it in the session view; the shell
+    /// then moves its own focus handle, which is what actually routes keystrokes.
+    fn focus_direction(&mut self, direction: &'static str, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(from)) =
+            (self.address(), self.session_id.clone(), self.active())
+        else {
+            return;
+        };
+        let engine = self.engine.clone();
+        let from = from.id;
+        cx.spawn(async move |this, cx| {
+            // Start from this client's pane: the server's idea of the focused
+            // block may be stale, and moving from the wrong one goes nowhere.
+            let here = json!({"session_id": session, "block_id": from});
+            let _ = engine.call(&address, "session.focus_block", here).await;
+            let payload = json!({"session_id": session, "direction": direction});
+            if let Err(e) = engine
+                .call(&address, "session.focus_direction", payload)
+                .await
+            {
+                eprintln!("rexshell: focus_direction: {e}");
+                return;
+            }
+            // The method answers with a revision; the new focus is in the view.
+            let view = engine
+                .call(&address, "session.view", json!({"session_id": session}))
+                .await;
+            let Ok(view) = view else { return };
+            let to = view
+                .get("windows")
+                .and_then(|w| w.as_array())
+                .and_then(|windows| {
+                    let active = view.get("active_window_id").and_then(|id| id.as_str());
+                    windows
+                        .iter()
+                        .find(|w| w.get("window_id").and_then(|id| id.as_str()) == active)
+                        .or_else(|| windows.first())
+                })
+                .and_then(|w| w.get("focused_block_id"))
+                .and_then(|id| id.as_str())
+                .map(str::to_owned);
+            let Some(to) = to else { return };
+            let to_window = view
+                .get("active_window_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned);
+            this.update(cx, |me, cx| {
+                me.active_block = Some(to.clone());
+                me.pending_focus = Some(to);
+                if let Some(window) = to_window {
+                    me.window_id = Some(window);
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -555,33 +622,47 @@ impl Workspace {
         });
 
         let engine = self.engine.clone();
-        let origin_block = origin.id;
+        let origin_block = origin.id.clone();
+
         cx.spawn(async move |this, cx| {
-            match engine.call(&address, "session.new_layer", payload).await {
-                Ok(view) => {
-                    let block = view
-                        .pointer("/block_ids/0")
-                        .and_then(|id| id.as_str())
-                        .map(str::to_owned);
-                    let Some(block) = block else { return };
-                    if keep_open {
-                        let pick = PendingPick {
-                            origin_block,
-                            pick_block: block,
-                            suffix,
-                        };
-                        this.update(cx, |me, cx| {
-                            // The picker takes the keyboard: it is what you type into.
-                            me.active_block = Some(pick.pick_block.clone());
-                            me.pending_focus = Some(pick.pick_block.clone());
-                            me.pending_pick = Some(pick);
-                            cx.notify();
-                        })
-                        .ok();
-                    }
+            let result = engine.call(&address, "session.new_layer", payload).await;
+            let block = match result {
+                Ok(view) => view
+                    .pointer("/block_ids/0")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_owned),
+                Err(e) => {
+                    eprintln!("rexshell: session.new_layer: {e}");
+                    None
                 }
-                Err(e) => eprintln!("rexshell: session.new_layer: {e}"),
-            }
+            };
+            let Some(block) = block else {
+                this.update(cx, |me, cx| {
+                    me.drop_tint(cx);
+                })
+                .ok();
+                return;
+            };
+            // Whatever the tool, it takes the keyboard: it is what you type into.
+            // The server gives a new block focus on its own, but this client also
+            // has to move its own focus handle, or keystrokes keep going to the
+            // pane the tool was opened from.
+            let pick = keep_open.then(|| PendingPick {
+                origin_block: origin_block.clone(),
+                pick_block: block.clone(),
+                suffix,
+            });
+            this.update(cx, |me, cx| {
+                me.active_block = Some(block.clone());
+                me.pending_focus = Some(block.clone());
+                // Dim the pane the tool covers: the floating one has the keyboard.
+                me.tinted = Some(origin_block);
+                if let Some(pick) = pick {
+                    me.pending_pick = Some(pick);
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -607,6 +688,7 @@ impl Workspace {
         }
         let still_open = present.is_some();
         self.pending_pick = None;
+        self.tinted = None;
 
         let text = self
             .terminals
@@ -643,6 +725,29 @@ impl Workspace {
                 .detach();
             }
         }
+    }
+
+    /// Tell the server which pane this client is on, so focus changes and splits
+    /// start from the right place.
+    fn publish_focus(&self, block_id: &str) {
+        let (Some(address), Some(session), block) =
+            (self.address(), self.session_id.clone(), block_id.to_owned())
+        else {
+            return;
+        };
+        let engine = self.engine.clone();
+        // Fire and forget on the engine's own runtime; the click must not wait.
+        std::mem::drop(engine.shrew().runtime().clone().spawn(async move {
+            let payload = json!({"session_id": session, "block_id": block});
+            if let Err(e) = engine.call(&address, "session.focus_block", payload).await {
+                eprintln!("rexshell: focus_block: {e}");
+            }
+        }));
+    }
+
+    fn drop_tint(&mut self, cx: &mut Context<Self>) {
+        self.tinted = None;
+        cx.notify();
     }
 
     /// A tiled block to place `block_id` beside: this window first, then any
@@ -1237,11 +1342,18 @@ impl Workspace {
                     .border_1()
                     .border_color(outline)
                     .when(floating, |el| el.shadow_lg().rounded_md())
+                    .when(
+                        self.tinted.as_deref() == Some(block.id.as_str()) && floating_pass,
+                        |el| el.opacity(0.45),
+                    )
                     .child(body)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             this.active_block = Some(activate_id.clone());
+                            // The server keeps the authoritative focus; a click has
+                            // to reach it too, or focus moves from the wrong pane.
+                            this.publish_focus(&activate_id);
                             // GPUI walks every hitbox under the pointer until one
                             // stops the event. A floating pane sits over a tiled
                             // one, so without this the tiled terminal below also
