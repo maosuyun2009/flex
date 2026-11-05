@@ -94,6 +94,8 @@ pub struct Workspace {
     settings: Settings,
     /// The terminal font, resolved once at startup from what is installed.
     font: SharedString,
+    /// The picture behind the terminals, decoded once when the setting changes.
+    picture: Option<Arc<gpui::RenderImage>>,
     server_id: Option<String>,
     session_id: Option<String>,
     window_id: Option<String>,
@@ -124,6 +126,10 @@ impl Workspace {
     pub fn new(engine: Arc<Engine>, wake: Receiver<()>, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load(&engine);
         let font = crate::fonts::resolve(cx);
+        let picture = settings
+            .background
+            .as_deref()
+            .and_then(crate::background::load);
         if std::env::var_os("REXSHELL_DEBUG").is_some() {
             eprintln!("[font] using {font}");
         }
@@ -132,6 +138,7 @@ impl Workspace {
             state: AppState::default(),
             settings,
             font,
+            picture,
             server_id: None,
             session_id: None,
             window_id: None,
@@ -286,9 +293,20 @@ impl Workspace {
         let font_size = self.settings.font_size;
         let font = self.font.clone();
         let prefix = self.prefix.clone();
+        let picture = self.picture.clone();
+        let picture_opacity = self.settings.background_opacity;
         let view = cx.new(|cx| {
             TerminalView::new(
-                &engine, server_id, session_id, block_id, font, font_size, prefix, cx,
+                &engine,
+                server_id,
+                session_id,
+                block_id,
+                font,
+                font_size,
+                prefix,
+                picture,
+                picture_opacity,
+                cx,
             )
         });
         self.terminals.insert(block_id.to_owned(), view.clone());
@@ -743,6 +761,69 @@ impl Workspace {
                 eprintln!("rexshell: focus_block: {e}");
             }
         }));
+    }
+
+    /// Ask for a picture, then show it behind every terminal.
+    fn choose_background(&mut self, cx: &mut Context<Self>) {
+        let options = gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a background picture".into()),
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            // `prompt_for_paths` lives on App, not on the async context.
+            let Ok(receiver) = cx.update(|cx| cx.prompt_for_paths(options)) else {
+                return;
+            };
+            let picked = receiver.await;
+            let path = match picked {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(path) = path else { return };
+            let text = path.display().to_string();
+            let picture = crate::background::load(&text);
+            if picture.is_none() {
+                eprintln!("rexshell: could not read {text} as an image");
+                return;
+            }
+            this.update(cx, |me, cx| {
+                me.picture = picture;
+                me.settings.background = Some(text);
+                me.settings.save(&engine);
+                me.apply_background(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_background(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        self.picture = path.as_deref().and_then(crate::background::load);
+        self.settings.background = path;
+        self.settings.save(&self.engine);
+        self.apply_background(cx);
+        cx.notify();
+    }
+
+    fn set_background_opacity(&mut self, value: f32, cx: &mut Context<Self>) {
+        self.settings.background_opacity = value.clamp(0.05, 0.95);
+        self.settings.save(&self.engine);
+        self.apply_background(cx);
+        cx.notify();
+    }
+
+    fn apply_background(&mut self, cx: &mut Context<Self>) {
+        let picture = self.picture.clone();
+        let opacity = self.settings.background_opacity;
+        for view in self.terminals.values() {
+            view.update(cx, |terminal, cx| {
+                terminal.set_background(picture.clone(), opacity, cx)
+            });
+        }
     }
 
     fn drop_tint(&mut self, cx: &mut Context<Self>) {
@@ -1563,6 +1644,49 @@ impl Workspace {
                     ))
                     .child(row("Sidebar", "Show the session list".into(), sidebar))
                     .child(row(
+                        "Picture opacity",
+                        format!("{:.0}%", self.settings.background_opacity * 100.0),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("bg-less")
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_color(theme::text())
+                                    .hover(|el| el.bg(chrome.hover()))
+                                    .child("−")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let value =
+                                            (this.settings.background_opacity - 0.1).max(0.05);
+                                        this.set_background_opacity(value, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("bg-more")
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_color(theme::text())
+                                    .hover(|el| el.bg(chrome.hover()))
+                                    .child("+")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let value =
+                                            (this.settings.background_opacity + 0.1).min(0.95);
+                                        this.set_background_opacity(value, cx);
+                                    })),
+                            )
+                            .into_any_element(),
+                    ))
+                    .child(row(
                         "Font size",
                         format!("{font:.0} pt"),
                         div()
@@ -1572,6 +1696,56 @@ impl Workspace {
                             .child(down)
                             .child(up)
                             .into_any_element(),
+                    ))
+                    .child(theme::section("BACKGROUND"))
+                    .child(row(
+                        "Picture",
+                        self.settings
+                            .background
+                            .as_deref()
+                            .and_then(|path| path.rsplit(['\\', '/']).next())
+                            .unwrap_or("None")
+                            .to_owned(),
+                        {
+                            let clear = self.settings.background.as_ref().map(|_| {
+                                div()
+                                    .id("bg-clear")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                                    .child("Clear")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_background(None, cx);
+                                    }))
+                                    .into_any_element()
+                            });
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id("bg-choose")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .text_color(theme::text())
+                                        .bg(chrome.active())
+                                        .hover(|el| el.bg(chrome.hover()))
+                                        .child("Choose…")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.choose_background(cx)
+                                            }),
+                                        ),
+                                )
+                                .children(clear)
+                                .into_any_element()
+                        },
                     ))
                     .child(theme::section("FONT"))
                     .child(row(

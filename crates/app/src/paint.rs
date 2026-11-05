@@ -8,8 +8,8 @@
 //! matters.
 
 use gpui::{
-    fill, font, point, px, quad, size, App, BorderStyle, Bounds, Font, FontStyle, FontWeight, Hsla,
-    Pixels, SharedString, StrikethroughStyle, TextRun, UnderlineStyle, Window,
+    fill, font, point, px, quad, size, App, BorderStyle, Bounds, Corners, Font, FontStyle,
+    FontWeight, Hsla, Pixels, SharedString, StrikethroughStyle, TextRun, UnderlineStyle, Window,
 };
 use rexshell_engine::Metrics;
 use shrew_core::{CursorStyle, Frame, Rgb, Run, Underline};
@@ -20,12 +20,15 @@ pub struct Palette {
     pub font_size: Pixels,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     frame: &Frame,
     bounds: Bounds<Pixels>,
     metrics: Metrics,
     pad: Pixels,
     palette: &Palette,
+    background: Option<&std::sync::Arc<gpui::RenderImage>>,
+    background_opacity: f32,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -39,14 +42,41 @@ pub fn paint(
         )
     };
 
-    // Translucent, not opaque: the window background (acrylic, or the shell's
-    // own gradient) is what the terminal sits on, so the whole window reads as
-    // one sheet instead of a dark rectangle with a glass border.
+    // A picture behind the text, if one is set. The terminal's own colour is
+    // painted over it below, so the text keeps its contrast and the picture reads
+    // as a watermark rather than as a background that fights the code.
+    if let Some(image) = background {
+        // Cover fit: fill the pane without distorting, cropping what overflows.
+        let natural = image.size(0);
+        let (iw, ih) = (natural.width.0 as f32, natural.height.0 as f32);
+        let (bw, bh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        if iw > 1.0 && ih > 1.0 {
+            let scale = (bw / iw).max(bh / ih);
+            let (w, h) = (px(iw * scale), px(ih * scale));
+            let cover = Bounds::new(
+                point(
+                    bounds.origin.x + (px(bw) - w) * 0.5,
+                    bounds.origin.y + (px(bh) - h) * 0.5,
+                ),
+                size(w, h),
+            );
+            let _ = window.paint_image(cover, Corners::default(), image.clone(), 0, false);
+        }
+    }
+
+    // Translucent, not opaque: the window background (the shell's gradient) is
+    // what the terminal sits on, so the whole window reads as one sheet. With a
+    // picture behind it, more of it shows through.
     let backdrop: Hsla = color(frame.background);
+    let alpha = if background.is_some() {
+        (1.0 - background_opacity).clamp(0.15, 0.92)
+    } else {
+        0.72
+    };
     window.paint_quad(fill(
         bounds,
         Hsla {
-            a: 0.72,
+            a: alpha,
             ..backdrop
         },
     ));

@@ -56,6 +56,9 @@ pub struct TerminalView {
     composing: bool,
     /// The shell's prefix key is armed, so the next key belongs to the chrome.
     prefix: Arc<std::sync::atomic::AtomicBool>,
+    /// A picture drawn behind the text, and how much of it shows.
+    background: Option<Arc<gpui::RenderImage>>,
+    background_opacity: f32,
     /// ASCII letters sent since the last non-letter key. The first pinyin
     /// letters arrive before the composition starts, so they have already
     /// reached the terminal by the time we know better; the composition start
@@ -88,6 +91,8 @@ impl TerminalView {
         font: SharedString,
         font_size: f32,
         prefix: Arc<std::sync::atomic::AtomicBool>,
+        background: Option<Arc<gpui::RenderImage>>,
+        background_opacity: f32,
         cx: &mut Context<Self>,
     ) -> Self {
         let (tx, rx) = async_channel::unbounded();
@@ -113,6 +118,8 @@ impl TerminalView {
             block_id: block.to_owned(),
             composing: false,
             prefix,
+            background,
+            background_opacity,
             leaked: String::new(),
             session,
             error,
@@ -127,6 +134,17 @@ impl TerminalView {
 
     pub fn handle(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    pub fn set_background(
+        &mut self,
+        picture: Option<Arc<gpui::RenderImage>>,
+        opacity: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.background = picture;
+        self.background_opacity = opacity;
+        cx.notify();
     }
 
     pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
@@ -223,6 +241,8 @@ impl Render for TerminalView {
         let prepaint_session = session.clone();
         let view = cx.entity();
         let focus = self.focus.clone();
+        let picture = self.background.clone();
+        let picture_opacity = self.background_opacity;
 
         div()
             .size_full()
@@ -273,7 +293,17 @@ impl Render for TerminalView {
                             ElementInputHandler::new(bounds, view.clone()),
                             cx,
                         );
-                        paint::paint(&frame, bounds, metrics, px(PAD), &palette, window, cx)
+                        paint::paint(
+                            &frame,
+                            bounds,
+                            metrics,
+                            px(PAD),
+                            &palette,
+                            picture.as_ref(),
+                            picture_opacity,
+                            window,
+                            cx,
+                        )
                     },
                 )
                 .size_full(),

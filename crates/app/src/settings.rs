@@ -11,6 +11,11 @@ pub struct Settings {
     pub font_size: f32,
     pub sidebar: bool,
     pub acrylic: bool,
+    /// A picture drawn behind the terminal text, if any.
+    pub background: Option<String>,
+    /// How much of it shows through, 0..1. The terminal's own background is
+    /// painted over the picture at this opacity, so higher means more picture.
+    pub background_opacity: f32,
 }
 
 impl Default for Settings {
@@ -19,6 +24,8 @@ impl Default for Settings {
             font_size: 14.0,
             sidebar: true,
             acrylic: true,
+            background: None,
+            background_opacity: 0.35,
         }
     }
 }
@@ -43,6 +50,12 @@ impl Settings {
                 .clamp(FONT_MIN, FONT_MAX),
             sidebar: flag("rexshell.sidebar").unwrap_or(default.sidebar),
             acrylic: flag("rexshell.acrylic").unwrap_or(default.acrylic),
+            background: store
+                .setting("rexshell.background")
+                .and_then(|v| v.as_str().map(str::to_owned)),
+            background_opacity: number("rexshell.background_opacity")
+                .unwrap_or(default.background_opacity)
+                .clamp(0.05, 0.95),
         }
     }
 
@@ -51,5 +64,16 @@ impl Settings {
         store.set_setting("rexshell.font_size", json!(self.font_size));
         store.set_setting("rexshell.sidebar", json!(self.sidebar));
         store.set_setting("rexshell.acrylic", json!(self.acrylic));
+        store.set_setting(
+            "rexshell.background",
+            match &self.background {
+                Some(path) => json!(path),
+                None => json!(null),
+            },
+        );
+        store.set_setting(
+            "rexshell.background_opacity",
+            json!(self.background_opacity),
+        );
     }
 }
