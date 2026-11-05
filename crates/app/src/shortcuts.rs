@@ -13,6 +13,7 @@ pub enum Action {
     ClosePane,
     ToggleFloat,
     ZoomPane,
+    Find,
     FocusLeft,
     FocusDown,
     FocusUp,
@@ -53,6 +54,7 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
     ("ctrl-k", Action::FocusUp, "Focus the pane above"),
     ("ctrl-l", Action::FocusRight, "Focus the pane to the right"),
     ("ctrl-shift-t", Action::NewTab, "Open a new tab"),
+    ("ctrl-shift-h", Action::Find, "Find in the terminal"),
     ("ctrl-b", Action::ToggleSidebar, "Show or hide the sidebar"),
     ("ctrl-,", Action::Settings, "Settings"),
     (

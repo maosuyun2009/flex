@@ -62,6 +62,8 @@ pub struct TerminalView {
     geometry: Arc<std::sync::Mutex<(gpui::Point<gpui::Pixels>, Metrics)>>,
     /// How many lines above the screen scrolling may reach.
     scrollback_lines: u64,
+    /// The find bar is open, with its query and the lines that match it.
+    find: Option<Find>,
     /// Whether a picture is painted behind the pane, and how much of it shows.
     /// The picture itself is drawn once by the pane area, so it spans the whole
     /// terminal instead of repeating in every split.
@@ -88,6 +90,24 @@ impl TerminalListener for Notifier {
     fn status_changed(&self, _: TerminalStatus) {}
     fn clipboard(&self, _: String) {}
     fn size_changed(&self, _cols: u16, _rows: u16) {}
+}
+
+/// Does this row of the buffer contain the query?
+fn line_matches(line: &str, needle: &str, folded_needle: &str, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        line.contains(needle)
+    } else {
+        line.to_lowercase().contains(folded_needle)
+    }
+}
+
+/// An open find bar: the query, the buffer lines that contain it, and which one
+/// is being shown.
+struct Find {
+    query: String,
+    lines: Vec<u64>,
+    current: usize,
+    case_sensitive: bool,
 }
 
 impl TerminalView {
@@ -135,6 +155,7 @@ impl TerminalView {
                 },
             ))),
             scrollback_lines: scrollback_lines.max(1),
+            find: None,
             over_picture,
             background_opacity,
             leaked: String::new(),
@@ -167,6 +188,165 @@ impl TerminalView {
     pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         self.palette.font_size = px(size);
         cx.notify();
+    }
+
+    /// Open the find bar, or move to the next match if it is already open.
+    pub fn start_find(&mut self, cx: &mut Context<Self>) {
+        match &mut self.find {
+            Some(find) if !find.query.is_empty() => self.find_next(cx),
+            Some(_) => cx.notify(),
+            None => {
+                self.find = Some(Find {
+                    query: String::new(),
+                    lines: Vec::new(),
+                    current: 0,
+                    case_sensitive: false,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    fn close_find(&mut self, cx: &mut Context<Self>) {
+        self.find = None;
+        if let Some(session) = &self.session {
+            session.clear_selection();
+        }
+        cx.notify();
+    }
+
+    /// Re-run the query over the buffer. The core has no search, so walk the
+    /// scrollback a screen at a time and read each page's rows.
+    fn refind(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let Some(find) = &self.find else { return };
+        let (needle, case) = (find.query.clone(), find.case_sensitive);
+        let mut lines = Vec::new();
+        if !needle.is_empty() {
+            let folded = needle.to_lowercase();
+            session.scroll_to_bottom();
+            let mut bar = session.frame().scrollbar;
+            let latest = bar.total.saturating_sub(bar.len);
+            let top = latest.saturating_sub(self.scrollback_lines.min(latest));
+            loop {
+                let frame = session.frame();
+                bar = frame.scrollbar;
+                for (index, row) in frame.lines.iter().enumerate() {
+                    let text: String = row.runs.iter().map(|run| run.text.as_str()).collect();
+                    if line_matches(&text, &needle, &folded, case) {
+                        lines.push(bar.offset + index as u64);
+                    }
+                }
+                if bar.offset <= top || bar.len == 0 {
+                    break;
+                }
+                let step = (bar.offset - top).min(bar.len) as i32;
+                session.scroll(-step);
+            }
+            // The scan left the view at the top of the buffer; put it back.
+            session.scroll_to_bottom();
+            self.frame = session.frame();
+        }
+        if let Some(find) = &mut self.find {
+            find.lines = lines;
+            find.current = 0;
+        }
+        self.find_next(cx);
+    }
+
+    /// Scroll to the current match and highlight its line.
+    fn find_next(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        let Some(find) = &mut self.find else { return };
+        let Some(line) = find.lines.get(find.current).copied() else {
+            session.clear_selection();
+            cx.notify();
+            return;
+        };
+        let bar = session.frame().scrollbar;
+        // Put the match near the middle of the view when it is far away.
+        let wanted = line.saturating_sub(bar.len / 2);
+        let earliest = bar
+            .total
+            .saturating_sub((self.scrollback_lines as u64).min(bar.total));
+        let latest = bar.total.saturating_sub(bar.len);
+        let target = wanted.clamp(earliest, latest);
+        let delta = target as i64 - bar.offset as i64;
+        if delta != 0 {
+            session.scroll(delta as i32);
+        }
+        self.frame = session.frame();
+        // Highlight the line, once the viewport has moved.
+        let row = line.saturating_sub(target) as u16;
+        let cols = self.frame.cols.max(1);
+        session.select_range((0, row), (cols.saturating_sub(1), row));
+        cx.notify();
+    }
+
+    fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        if find.lines.is_empty() {
+            return;
+        }
+        let count = find.lines.len();
+        find.current = if forward {
+            (find.current + 1) % count
+        } else {
+            (find.current + count - 1) % count
+        };
+        self.find_next(cx);
+    }
+
+    fn toggle_case(&mut self, cx: &mut Context<Self>) {
+        if let Some(find) = &mut self.find {
+            find.case_sensitive = !find.case_sensitive;
+        }
+        self.refind(cx);
+    }
+
+    /// Keys while the find bar is open belong to it, not to the pty.
+    fn find_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(find) = &mut self.find else {
+            return false;
+        };
+        let key = event.keystroke.key.as_str();
+        let modifiers = &event.keystroke.modifiers;
+        if key == "escape" {
+            self.close_find(cx);
+            return true;
+        }
+        if key == "enter" {
+            self.find_step(true, cx);
+            return true;
+        }
+        if key == "up" || key == "f3" {
+            self.find_step(false, cx);
+            return true;
+        }
+        if key == "down" {
+            self.find_step(true, cx);
+            return true;
+        }
+        if key == "backspace" {
+            find.query.pop();
+            self.refind(cx);
+            return true;
+        }
+        if !modifiers.control && !modifiers.alt && !modifiers.platform {
+            if let Some(text) = event.keystroke.key_char.as_deref().or(Some(key)) {
+                let printable: String = text.chars().filter(|c| !c.is_control()).collect();
+                if !printable.is_empty() && printable != "space" {
+                    find.query.push_str(&printable);
+                    self.refind(cx);
+                    return true;
+                }
+            }
+        }
+        // Anything else is still swallowed: it is not terminal input while the
+        // bar is open.
+        true
     }
 
     /// The cell under a pointer position, given the pane's origin and metrics.
@@ -256,7 +436,10 @@ impl TerminalView {
         }
     }
 
-    fn press(&mut self, event: &KeyDownEvent) {
+    fn press(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.find_key(event, cx) {
+            return;
+        }
         // An armed prefix means the next key is the shell's, not the pty's.
         if self.prefix.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -329,6 +512,94 @@ impl Render for TerminalView {
         let prepaint_palette = palette.clone();
         let prepaint_session = session.clone();
         let geometry = self.geometry.clone();
+        // The find bar floats over the top of the pane, so the grid never shifts
+        // under it while typing.
+        let find_bar = self.find.is_some().then(|| {
+            let find = self.find.as_ref().unwrap();
+            let placeholder = find.query.is_empty();
+            let count = if find.lines.is_empty() {
+                format!("0 / 0")
+            } else {
+                format!("{} / {}", find.current + 1, find.lines.len())
+            };
+            let query = if placeholder {
+                "查找文本".to_owned()
+            } else {
+                find.query.clone()
+            };
+            let field = div()
+                .flex_1()
+                .truncate()
+                .text_sm()
+                .text_color(if placeholder {
+                    gpui::rgb(0x78808f)
+                } else {
+                    gpui::rgb(0xe4e9f2)
+                })
+                .child(query);
+            let counter = div().text_xs().text_color(gpui::rgb(0xa9b1c1)).child(count);
+            let button = |id: &'static str,
+                          label: String,
+                          active: bool,
+                          cx: &mut Context<Self>,
+                          f: fn(&mut Self, &mut Context<Self>)| {
+                div()
+                    .id(id)
+                    .h(px(20.0))
+                    .min_w(px(20.0))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .text_xs()
+                    .when(active, |el| el.text_color(gpui::rgb(0xf0b429)))
+                    .when(!active, |el| el.text_color(gpui::rgb(0x9aa3b2)))
+                    .hover(|el| el.bg(gpui::rgb(0x353a47)).text_color(gpui::rgb(0xe4e9f2)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| f(this, cx)))
+                    .into_any_element()
+            };
+            let up = button("find-prev", "↑".to_owned(), false, cx, |this, cx| {
+                this.find_step(false, cx)
+            });
+            let down = button("find-next", "↓".to_owned(), false, cx, |this, cx| {
+                this.find_step(true, cx)
+            });
+            let case = button(
+                "find-case",
+                "Aa".to_owned(),
+                find.case_sensitive,
+                cx,
+                |this, cx| this.toggle_case(cx),
+            );
+            let close = button("find-close", "×".to_owned(), false, cx, |this, cx| {
+                this.close_find(cx)
+            });
+
+            div()
+                .absolute()
+                .top(px(6.0))
+                .left(px(8.0))
+                .right(px(8.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .h(px(30.0))
+                .rounded_md()
+                .bg(gpui::rgb(0x21242e))
+                .border_1()
+                .border_color(gpui::rgb(0x3a3f52))
+                .shadow_lg()
+                .child(field)
+                .child(counter)
+                .child(up)
+                .child(down)
+                .child(case)
+                .child(close)
+                .into_any_element()
+        });
         let view = cx.entity();
         let focus = self.focus.clone();
         let over_picture = self.over_picture;
@@ -344,7 +615,7 @@ impl Render for TerminalView {
                     this.replace_text_in_range(None, "中文测试", window, cx);
                     return;
                 }
-                this.press(event)
+                this.press(event, cx)
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -435,6 +706,7 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .children(find_bar)
             .into_any_element()
     }
 }
@@ -584,5 +856,21 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::line_matches;
+
+    #[test]
+    fn find_matches_case_insensitively_by_default() {
+        assert!(line_matches("item-17 alpha", "ITEM-17", "item-17", false));
+    }
+
+    #[test]
+    fn find_respects_the_case_toggle() {
+        assert!(!line_matches("item-17 alpha", "ITEM-17", "item-17", true));
+        assert!(line_matches("ITEM-17 alpha", "ITEM-17", "item-17", true));
     }
 }
