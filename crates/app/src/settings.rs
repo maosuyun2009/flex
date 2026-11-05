@@ -16,6 +16,9 @@ pub struct Settings {
     /// How much of it shows through, 0..1. The terminal's own background is
     /// painted over the picture at this opacity, so higher means more picture.
     pub background_opacity: f32,
+    /// How many lines above the screen scrolling may reach. The engine keeps a
+    /// fixed 16 MiB of scrollback; this caps how much of it the view exposes.
+    pub scrollback_lines: u64,
 }
 
 impl Default for Settings {
@@ -26,12 +29,16 @@ impl Default for Settings {
             acrylic: true,
             background: None,
             background_opacity: 0.35,
+            scrollback_lines: 10_000,
         }
     }
 }
 
 pub const FONT_MIN: f32 = 9.0;
 pub const FONT_MAX: f32 = 28.0;
+
+pub const SCROLL_MIN: u64 = 500;
+pub const SCROLL_MAX: u64 = 100_000;
 
 impl Settings {
     pub fn load(engine: &Engine) -> Self {
@@ -56,6 +63,11 @@ impl Settings {
             background_opacity: number("rexshell.background_opacity")
                 .unwrap_or(default.background_opacity)
                 .clamp(0.05, 0.95),
+            scrollback_lines: store
+                .setting("rexshell.scrollback_lines")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(default.scrollback_lines)
+                .clamp(SCROLL_MIN, SCROLL_MAX),
         }
     }
 
@@ -75,5 +87,6 @@ impl Settings {
             "rexshell.background_opacity",
             json!(self.background_opacity),
         );
+        store.set_setting("rexshell.scrollback_lines", json!(self.scrollback_lines));
     }
 }

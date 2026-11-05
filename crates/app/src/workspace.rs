@@ -309,6 +309,7 @@ impl Workspace {
         let prefix = self.prefix.clone();
         let over_picture = self.picture.is_some();
         let picture_opacity = self.settings.background_opacity;
+        let scrollback = self.settings.scrollback_lines;
         let view = cx.new(|cx| {
             TerminalView::new(
                 &engine,
@@ -320,6 +321,7 @@ impl Workspace {
                 prefix,
                 over_picture,
                 picture_opacity,
+                scrollback,
                 cx,
             )
         });
@@ -827,6 +829,17 @@ impl Workspace {
         self.settings.background_opacity = value.clamp(0.05, 0.95);
         self.settings.save(&self.engine);
         self.apply_background(cx);
+        cx.notify();
+    }
+
+    fn set_scrollback(&mut self, lines: u64, cx: &mut Context<Self>) {
+        self.settings.scrollback_lines =
+            lines.clamp(crate::settings::SCROLL_MIN, crate::settings::SCROLL_MAX);
+        self.settings.save(&self.engine);
+        let value = self.settings.scrollback_lines;
+        for view in self.terminals.values() {
+            view.update(cx, |terminal, cx| terminal.set_scrollback(value, cx));
+        }
         cx.notify();
     }
 
@@ -1882,6 +1895,45 @@ impl Workspace {
                                 .children(clear)
                                 .into_any_element()
                         },
+                    ))
+                    .child(row(
+                        "Scrollback",
+                        format!("{} lines", self.settings.scrollback_lines),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("scroll-less")
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_color(theme::text())
+                                    .hover(|el| el.bg(chrome.hover()))
+                                    .child("−")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_scrollback(this.settings.scrollback_lines / 2, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("scroll-more")
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_color(theme::text())
+                                    .hover(|el| el.bg(chrome.hover()))
+                                    .child("+")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_scrollback(this.settings.scrollback_lines * 2, cx);
+                                    })),
+                            )
+                            .into_any_element(),
                     ))
                     .child(theme::section("FONT"))
                     .child(row(

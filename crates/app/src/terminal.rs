@@ -49,13 +49,19 @@ const THEME: ColorTheme = ColorTheme {
 const LINE_HEIGHT_EM: f32 = 1.3;
 
 pub struct TerminalView {
-    block_id: String,
     /// An input method is composing. Its pinyin letters arrive as ordinary key
     /// events and must not reach the terminal; only the committed text should,
     /// and that comes through `replace_text_in_range` instead.
     composing: bool,
     /// The shell's prefix key is armed, so the next key belongs to the chrome.
     prefix: Arc<std::sync::atomic::AtomicBool>,
+    /// Where a selection drag started, in cells. `None` outside a drag.
+    selecting: Option<(u16, u16)>,
+    /// The pane's text origin and cell size, written by each paint and read by
+    /// the mouse handlers. Shared because paint cannot touch the view.
+    geometry: Arc<std::sync::Mutex<(gpui::Point<gpui::Pixels>, Metrics)>>,
+    /// How many lines above the screen scrolling may reach.
+    scrollback_lines: u64,
     /// Whether a picture is painted behind the pane, and how much of it shows.
     /// The picture itself is drawn once by the pane area, so it spans the whole
     /// terminal instead of repeating in every split.
@@ -95,6 +101,7 @@ impl TerminalView {
         prefix: Arc<std::sync::atomic::AtomicBool>,
         over_picture: bool,
         background_opacity: f32,
+        scrollback_lines: u64,
         cx: &mut Context<Self>,
     ) -> Self {
         let (tx, rx) = async_channel::unbounded();
@@ -117,9 +124,17 @@ impl TerminalView {
             .detach();
         }
         Self {
-            block_id: block.to_owned(),
             composing: false,
             prefix,
+            selecting: None,
+            geometry: Arc::new(std::sync::Mutex::new((
+                gpui::Point::default(),
+                Metrics {
+                    cell_w: 8.0,
+                    cell_h: 16.0,
+                },
+            ))),
+            scrollback_lines: scrollback_lines.max(1),
             over_picture,
             background_opacity,
             leaked: String::new(),
@@ -144,9 +159,86 @@ impl TerminalView {
         cx.notify();
     }
 
+    pub fn set_scrollback(&mut self, lines: u64, cx: &mut Context<Self>) {
+        self.scrollback_lines = lines.max(1);
+        cx.notify();
+    }
+
     pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         self.palette.font_size = px(size);
         cx.notify();
+    }
+
+    /// The cell under a pointer position, given the pane's origin and metrics.
+    fn cell_at(
+        origin: gpui::Point<gpui::Pixels>,
+        metrics: Metrics,
+        at: gpui::Point<gpui::Pixels>,
+    ) -> (u16, u16) {
+        let x = (f32::from(at.x) - f32::from(origin.x)).max(0.0);
+        let y = (f32::from(at.y) - f32::from(origin.y)).max(0.0);
+        let col = (x / metrics.cell_w.max(1.0) as f32).floor() as u16;
+        let row = (y / metrics.cell_h.max(1.0) as f32).floor() as u16;
+        (col, row)
+    }
+
+    fn begin_selection(&mut self, at: (u16, u16), cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.clear_selection();
+            session.select_range(at, at);
+        }
+        self.selecting = Some(at);
+        cx.notify();
+    }
+
+    fn extend_selection(&mut self, from: (u16, u16), to: (u16, u16), cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.select_range(from, to);
+        }
+        cx.notify();
+    }
+
+    /// Finish a drag: put the selection on the clipboard, the way a terminal does.
+    /// While a selection is being dragged, extend it with the pointer.
+    fn drag_selection(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let Some(from) = self.selecting else { return };
+        let (origin, metrics) = *self.geometry.lock().unwrap();
+        let to = TerminalView::cell_at(origin, metrics, at);
+        if to != from {
+            self.extend_selection(from, to, cx);
+        }
+    }
+
+    fn finish_selection(&mut self, cx: &mut Context<Self>) {
+        self.selecting = None;
+        let Some(session) = &self.session else { return };
+        let Some(text) = session.selection_text() else {
+            session.clear_selection();
+            cx.notify();
+            return;
+        };
+        if !text.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+        session.clear_selection();
+        cx.notify();
+    }
+
+    /// Scroll by `lines` notches, never further back than the configured cap.
+    fn wheel(&mut self, notches: f32, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        let bar = self.frame.scrollbar;
+        // One notch is three lines, the usual terminal step.
+        let delta = -(notches * 3.0) as i64;
+        let limit = (self.scrollback_lines as u64).min(bar.total);
+        let earliest = bar.total.saturating_sub(limit) as i64;
+        let latest = bar.total.saturating_sub(bar.len) as i64;
+        let want = (bar.offset as i64 + delta).clamp(earliest, latest);
+        let actual = want - bar.offset as i64;
+        if actual != 0 {
+            session.scroll(actual as i32);
+            cx.notify();
+        }
     }
 
     /// The pane's whole screen and scrollback, as text.
@@ -236,6 +328,7 @@ impl Render for TerminalView {
         };
         let prepaint_palette = palette.clone();
         let prepaint_session = session.clone();
+        let geometry = self.geometry.clone();
         let view = cx.entity();
         let focus = self.focus.clone();
         let over_picture = self.over_picture;
@@ -255,17 +348,50 @@ impl Render for TerminalView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, _cx| {
-                    if std::env::var_os("REXSHELL_DEBUG").is_some() {
-                        eprintln!("[hit] terminal {}", this.block_id);
-                    }
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
                     // Claim the size so the server reflows this terminal to this window.
                     if let Some(session) = &this.session {
                         session.clone().take_control();
                     }
+                    let (origin, metrics) = *this.geometry.lock().unwrap();
+                    let cell = TerminalView::cell_at(origin, metrics, event.position);
+                    this.begin_selection(cell, cx);
                 }),
             )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_selection(cx)),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                // Vertical wheel scrolls the scrollback; horizontal is ignored.
+                let notches: f32 = match event.delta {
+                    gpui::ScrollDelta::Lines(lines) => lines.y,
+                    gpui::ScrollDelta::Pixels(pixels) => f32::from(pixels.y) / 44.0,
+                };
+                this.wheel(notches, cx);
+            }))
+            .when(self.selecting.is_some(), |el| {
+                let view = cx.entity().downgrade();
+                el.child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _cx| {
+                            let this = view.clone();
+                            window.on_mouse_event(
+                                move |event: &gpui::MouseMoveEvent, _phase, _window, cx| {
+                                    let _ = this
+                                        .update(cx, |me, cx| me.drag_selection(event.position, cx));
+                                },
+                            );
+                        },
+                    )
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size_full(),
+                )
+            })
             .child(
                 canvas(
                     move |bounds, _window, cx| {
@@ -282,6 +408,10 @@ impl Render for TerminalView {
                         metrics
                     },
                     move |bounds, metrics, window, cx| {
+                        *geometry.lock().unwrap() = (
+                            gpui::point(bounds.origin.x + px(PAD), bounds.origin.y + px(PAD)),
+                            metrics,
+                        );
                         // IME text never arrives as a keystroke: the platform hands
                         // it to whichever element registered an input handler for
                         // the focused element, so do that here, during paint.
