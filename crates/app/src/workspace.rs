@@ -3414,18 +3414,26 @@ impl Workspace {
         // nothing focused even the shell's own shortcuts stop arriving. So a
         // freshly split pane takes focus, and if focus has gone missing it goes
         // to the active pane, or the first one left.
+        // An open prompt or jump list owns the keyboard. Focusing a pane here
+        // would take it back mid-typing, and the text would land in the shell
+        // as well as in the field.
+        let held = self.prompt.is_some() || self.palette.is_some();
         let focused_somewhere = views
             .iter()
             .any(|(_, view)| view.read(cx).handle().is_focused(window));
-        let wanted = self.pending_focus.take().or_else(|| {
-            if focused_somewhere {
-                None
-            } else {
-                self.active_block
-                    .clone()
-                    .or_else(|| views.first().map(|(block, _)| block.id.clone()))
-            }
-        });
+        let wanted = if held {
+            None
+        } else {
+            self.pending_focus.take().or_else(|| {
+                if focused_somewhere {
+                    None
+                } else {
+                    self.active_block
+                        .clone()
+                        .or_else(|| views.first().map(|(block, _)| block.id.clone()))
+                }
+            })
+        };
         if let Some(wanted) = wanted {
             if let Some((_, view)) = views.iter().find(|(block, _)| block.id == wanted) {
                 window.focus(&view.read(cx).handle());
