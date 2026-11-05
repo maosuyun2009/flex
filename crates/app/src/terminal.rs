@@ -10,7 +10,7 @@ use gpui::{
     Window,
 };
 use rexshell_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
-use shrew_core::{ColorTheme, Frame, Rgb, TerminalStatus};
+use shrew_core::{ColorTheme, Frame, Rgb, Row, TerminalStatus};
 
 use crate::{keymap, paint, shortcuts};
 
@@ -92,20 +92,71 @@ impl TerminalListener for Notifier {
     fn size_changed(&self, _cols: u16, _rows: u16) {}
 }
 
-/// Does this row of the buffer contain the query?
-fn line_matches(line: &str, needle: &str, folded_needle: &str, case_sensitive: bool) -> bool {
-    if case_sensitive {
-        line.contains(needle)
-    } else {
-        line.to_lowercase().contains(folded_needle)
+/// Every occurrence of the query in one row, as (first char, char count).
+/// Matching is per row, so a query never spans a line break.
+fn find_all(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
     }
+    let haystack = if case_sensitive {
+        text.to_owned()
+    } else {
+        text.to_lowercase()
+    };
+    // Folding can change the char count (ß becomes ss), which would put the
+    // highlight on the wrong cells, so skip such a row rather than mislead.
+    if haystack.chars().count() != text.chars().count() {
+        return Vec::new();
+    }
+    let needle: Vec<char> = if case_sensitive {
+        needle.chars().collect()
+    } else {
+        needle.to_lowercase().chars().collect()
+    };
+    let haystack: Vec<char> = haystack.chars().collect();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index + needle.len() <= haystack.len() {
+        if haystack[index..index + needle.len()] == needle[..] {
+            found.push((index, needle.len()));
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    found
+}
+
+/// The plain text of a row, and the cell column each character starts at.
+fn row_cells(row: &Row) -> (String, Vec<u16>) {
+    let mut text = String::new();
+    let mut columns = Vec::new();
+    for run in &row.runs {
+        let mut column = run.col;
+        for (index, ch) in run.text.chars().enumerate() {
+            text.push(ch);
+            columns.push(column);
+            column += u16::from(*run.widths.get(index).unwrap_or(&1));
+        }
+    }
+    (text, columns)
+}
+
+/// Where one match sits in the buffer.
+#[derive(Clone, Copy)]
+struct Match {
+    /// Buffer row, counting from the oldest line.
+    row: u64,
+    /// First and last cell of the match.
+    from: u16,
+    to: u16,
 }
 
 /// An open find bar: the query, the buffer lines that contain it, and which one
 /// is being shown.
 struct Find {
     query: String,
-    lines: Vec<u64>,
+    matches: Vec<Match>,
     current: usize,
     case_sensitive: bool,
 }
@@ -198,7 +249,7 @@ impl TerminalView {
             None => {
                 self.find = Some(Find {
                     query: String::new(),
-                    lines: Vec::new(),
+                    matches: Vec::new(),
                     current: 0,
                     case_sensitive: false,
                 });
@@ -223,9 +274,8 @@ impl TerminalView {
         };
         let Some(find) = &self.find else { return };
         let (needle, case) = (find.query.clone(), find.case_sensitive);
-        let mut lines = Vec::new();
+        let mut matches = Vec::new();
         if !needle.is_empty() {
-            let folded = needle.to_lowercase();
             session.scroll_to_bottom();
             let mut bar = session.frame().scrollbar;
             let latest = bar.total.saturating_sub(bar.len);
@@ -234,9 +284,18 @@ impl TerminalView {
                 let frame = session.frame();
                 bar = frame.scrollbar;
                 for (index, row) in frame.lines.iter().enumerate() {
-                    let text: String = row.runs.iter().map(|run| run.text.as_str()).collect();
-                    if line_matches(&text, &needle, &folded, case) {
-                        lines.push(bar.offset + index as u64);
+                    let (text, columns) = row_cells(row);
+                    for (start, len) in find_all(&text, &needle, case) {
+                        let (Some(&from), Some(&to)) =
+                            (columns.get(start), columns.get(start + len - 1))
+                        else {
+                            continue;
+                        };
+                        matches.push(Match {
+                            row: bar.offset + index as u64,
+                            from,
+                            to,
+                        });
                     }
                 }
                 if bar.offset <= top || bar.len == 0 {
@@ -250,24 +309,24 @@ impl TerminalView {
             self.frame = session.frame();
         }
         if let Some(find) = &mut self.find {
-            find.lines = lines;
+            find.matches = matches;
             find.current = 0;
         }
         self.find_next(cx);
     }
 
-    /// Scroll to the current match and highlight its line.
+    /// Scroll to the current match and highlight the matched characters.
     fn find_next(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
         let Some(find) = &mut self.find else { return };
-        let Some(line) = find.lines.get(find.current).copied() else {
+        let Some(found) = find.matches.get(find.current).copied() else {
             session.clear_selection();
             cx.notify();
             return;
         };
         let bar = session.frame().scrollbar;
         // Put the match near the middle of the view when it is far away.
-        let wanted = line.saturating_sub(bar.len / 2);
+        let wanted = found.row.saturating_sub(bar.len / 2);
         let earliest = bar
             .total
             .saturating_sub((self.scrollback_lines as u64).min(bar.total));
@@ -278,19 +337,18 @@ impl TerminalView {
             session.scroll(delta as i32);
         }
         self.frame = session.frame();
-        // Highlight the line, once the viewport has moved.
-        let row = line.saturating_sub(target) as u16;
-        let cols = self.frame.cols.max(1);
-        session.select_range((0, row), (cols.saturating_sub(1), row));
+        // Highlight just the matched cells, once the viewport has moved.
+        let row = found.row.saturating_sub(target) as u16;
+        session.select_range((found.from, row), (found.to, row));
         cx.notify();
     }
 
     fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(find) = &mut self.find else { return };
-        if find.lines.is_empty() {
+        if find.matches.is_empty() {
             return;
         }
-        let count = find.lines.len();
+        let count = find.matches.len();
         find.current = if forward {
             (find.current + 1) % count
         } else {
@@ -517,10 +575,10 @@ impl Render for TerminalView {
         let find_bar = self.find.is_some().then(|| {
             let find = self.find.as_ref().unwrap();
             let placeholder = find.query.is_empty();
-            let count = if find.lines.is_empty() {
+            let count = if find.matches.is_empty() {
                 format!("0 / 0")
             } else {
-                format!("{} / {}", find.current + 1, find.lines.len())
+                format!("{} / {}", find.current + 1, find.matches.len())
             };
             let query = if placeholder {
                 "查找文本".to_owned()
@@ -861,16 +919,21 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::line_matches;
+    use super::find_all;
 
     #[test]
-    fn find_matches_case_insensitively_by_default() {
-        assert!(line_matches("item-17 alpha", "ITEM-17", "item-17", false));
+    fn find_all_matches_every_occurrence() {
+        assert_eq!(find_all("a-17 b-17 c", "17", false), vec![(2, 2), (7, 2)]);
     }
 
     #[test]
-    fn find_respects_the_case_toggle() {
-        assert!(!line_matches("item-17 alpha", "ITEM-17", "item-17", true));
-        assert!(line_matches("ITEM-17 alpha", "ITEM-17", "item-17", true));
+    fn find_all_is_case_insensitive_unless_asked_otherwise() {
+        assert_eq!(find_all("item ITEM", "ITEM", false), vec![(0, 4), (5, 4)]);
+        assert_eq!(find_all("item ITEM", "ITEM", true), vec![(5, 4)]);
+    }
+
+    #[test]
+    fn find_all_reports_nothing_for_an_empty_query() {
+        assert!(find_all("anything", "", false).is_empty());
     }
 }

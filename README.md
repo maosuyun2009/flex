@@ -317,7 +317,8 @@ scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 `Ctrl-Shift-H` opens the find bar over the top of the pane: type to search,
 `Enter` or `↓` for the next match, `↑` for the previous, `Aa` for case
 sensitivity, `Esc` or `×` to close. The count reads `n / m` and the view scrolls
-to the match, which is highlighted by the same selection paint the mouse uses.
+to the match, which is highlighted character by character — only the matched
+cells, not the whole row.
 
 The core has no search call, so the bar walks the scrollback a screen at a time
 and reads the rows of each page. That costs one frame per screen — 300 pages for
@@ -424,7 +425,8 @@ scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 `Ctrl-Shift-H` opens the find bar over the top of the pane: type to search,
 `Enter` or `↓` for the next match, `↑` for the previous, `Aa` for case
 sensitivity, `Esc` or `×` to close. The count reads `n / m` and the view scrolls
-to the match, which is highlighted by the same selection paint the mouse uses.
+to the match, which is highlighted character by character — only the matched
+cells, not the whole row.
 
 The core has no search call, so the bar walks the scrollback a screen at a time
 and reads the rows of each page. That costs one frame per screen — 300 pages for
@@ -531,7 +533,8 @@ scroll request is clamped against the frame's `Scrollbar` (`total`, `offset`,
 `Ctrl-Shift-H` opens the find bar over the top of the pane: type to search,
 `Enter` or `↓` for the next match, `↑` for the previous, `Aa` for case
 sensitivity, `Esc` or `×` to close. The count reads `n / m` and the view scrolls
-to the match, which is highlighted by the same selection paint the mouse uses.
+to the match, which is highlighted character by character — only the matched
+cells, not the whole row.
 
 The core has no search call, so the bar walks the scrollback a screen at a time
 and reads the rows of each page. That costs one frame per screen — 300 pages for
