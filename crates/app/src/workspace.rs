@@ -89,6 +89,17 @@ struct Pull {
     live: [f64; 4],
 }
 
+/// A divider being dragged: the two panes it separates, and which way it moves.
+struct Divider {
+    /// "horizontal" for side by side, "vertical" for stacked.
+    direction: &'static str,
+    before: String,
+    after: String,
+    /// The left/top pane and the right/bottom pane, as drawn.
+    before_rect: [f64; 4],
+    after_rect: [f64; 4],
+}
+
 /// One notification on screen, and when it should go away.
 struct Toast {
     kind: shrew_core::NotificationKind,
@@ -150,6 +161,11 @@ pub struct Workspace {
     title_press: Option<(std::time::Instant, gpui::Point<gpui::Pixels>)>,
     /// Notifications the engine queued: bells, program messages, agents that
     /// stopped. Drained on every reload and shown as toasts.
+    /// Where the pane area sits in the window, so a drag can be turned into the
+    /// fraction the server wants.
+    area_geometry: Arc<std::sync::Mutex<Option<(Point<Pixels>, Size<Pixels>)>>>,
+    /// A divider being dragged between two tiled panes.
+    divider: Option<Divider>,
     notices: Arc<std::sync::Mutex<Vec<Notification>>>,
     toasts: std::collections::VecDeque<Toast>,
     /// A press on the title bar with the window not moved yet. The drag only
@@ -201,6 +217,8 @@ impl Workspace {
             prefix: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_pick: None,
             tinted: None,
+            area_geometry: Arc::default(),
+            divider: None,
             notices,
             toasts: std::collections::VecDeque::new(),
             title_press: None,
@@ -478,6 +496,12 @@ impl Workspace {
             Action::SplitDown => self.split(false, cx),
             Action::ClosePane => self.close_pane(cx),
             Action::ToggleFloat => self.toggle_float(cx),
+            Action::NextPane => self.step_focus("session.focus_next_pane", cx),
+            Action::PrevPane => self.step_focus("session.focus_previous_pane", cx),
+            Action::NextTab => self.step_focus("session.focus_next_window", cx),
+            Action::PrevTab => self.step_focus("session.focus_previous_window", cx),
+            Action::SwapPane => self.swap_pane(cx),
+            Action::ClearPane => self.clear_pane(cx),
             Action::NewTab => self.new_tab(cx),
             Action::ZoomPane => self.zoom_pane(cx),
             Action::Find => self.start_find(cx),
@@ -668,6 +692,249 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Take the server's word for where focus went, which is also what other
+    /// clients see.
+    fn adopt_focus(&mut self, view: &serde_json::Value) {
+        let active_window = view.get("active_window_id").and_then(|id| id.as_str());
+        let focused = view
+            .get("windows")
+            .and_then(|w| w.as_array())
+            .and_then(|windows| {
+                windows
+                    .iter()
+                    .find(|w| w.get("window_id").and_then(|id| id.as_str()) == active_window)
+                    .or_else(|| windows.first())
+            })
+            .and_then(|w| w.get("focused_block_id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_owned);
+        if let Some(focused) = focused {
+            self.active_block = Some(focused.clone());
+            self.pending_focus = Some(focused);
+        }
+        if let Some(window) = active_window {
+            self.window_id = Some(window.to_owned());
+        }
+    }
+
+    /// Run a session method that moves focus, then follow where it landed.
+    fn step_focus(&mut self, method: &'static str, cx: &mut Context<Self>) {
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({"session_id": session, "wrap": true});
+            if let Err(e) = engine.call(&address, method, payload).await {
+                eprintln!("flex: {method}: {e}");
+                return;
+            }
+            let Ok(view) = engine
+                .call(&address, "session.view", json!({"session_id": session}))
+                .await
+            else {
+                return;
+            };
+            this.update(cx, |me, cx| {
+                me.adopt_focus(&view);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Exchange this pane with the next one in the window.
+    fn swap_pane(&mut self, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(here)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.active_block.clone(),
+        ) else {
+            return;
+        };
+        let blocks = self.blocks();
+        let Some(other) = blocks
+            .iter()
+            .map(|b| b.id.clone())
+            .filter(|id| *id != here)
+            .next()
+        else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({
+                "session_id": session,
+                "block_id": here,
+                "other_block_id": other,
+            });
+            if let Err(e) = engine.call(&address, "session.swap_blocks", payload).await {
+                eprintln!("flex: swap: {e}");
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// Empty the screen and scrollback, the way Ctrl-L and `clear` do.
+    fn clear_pane(&mut self, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(block)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.active_block.clone(),
+        ) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({"session_id": session, "block_id": block, "args": {}});
+            if let Err(e) = engine
+                .call(&address, "com.superlogical.terminal.clear", payload)
+                .await
+            {
+                eprintln!("flex: clear: {e}");
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// Draggable strips along the active pane's own edges, one per neighbour.
+    /// Four pixels, inside the border: a grab zone that reaches into the text
+    /// would make the first column unclickable.
+    fn divider_zones(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let blocks = self.blocks();
+        let Some(me) = self.active().filter(|b| !b.floating) else {
+            return Vec::new();
+        };
+        let me = blocks.iter().find(|b| b.id == me.id).unwrap_or(&me);
+        let [x, y, w, h] = me.rect;
+        let close = 0.004;
+        let mut zones: Vec<AnyElement> = Vec::new();
+        for other in blocks.iter().filter(|b| !b.floating && b.id != me.id) {
+            let [ox, oy, ow, oh] = other.rect;
+            let overlaps_y = oy < y + h - close && oy + oh > y + close;
+            let overlaps_x = ox < x + w - close && ox + ow > x + close;
+            // (direction, the pane on the before side, the pane on the after side)
+            let found: Option<(&'static str, &BlockState, &BlockState, f64)> =
+                if overlaps_y && (ox + ow - x).abs() < close {
+                    Some(("horizontal", other, me, 0.0))
+                } else if overlaps_y && (ox - (x + w)).abs() < close {
+                    Some(("horizontal", me, other, 1.0))
+                } else if overlaps_x && (oy + oh - y).abs() < close {
+                    Some(("vertical", other, me, 0.0))
+                } else if overlaps_x && (oy - (y + h)).abs() < close {
+                    Some(("vertical", me, other, 1.0))
+                } else {
+                    None
+                };
+            let Some((direction, before, after, side)) = found else {
+                continue;
+            };
+            let (before_id, after_id) = (before.id.clone(), after.id.clone());
+            let (before_rect, after_rect) = (before.rect, after.rect);
+            let zone = div()
+                .id(SharedString::from(format!(
+                    "divider:{before_id}:{after_id}"
+                )))
+                .absolute();
+            let zone = match (direction, side) {
+                ("horizontal", 0.0) => zone
+                    .left(relative(x as f32))
+                    .top(relative(y as f32))
+                    .w(px(4.0))
+                    .h(relative(h as f32))
+                    .cursor_ew_resize(),
+                ("horizontal", _) => zone
+                    .left(relative((x + w) as f32))
+                    .ml(px(-4.0))
+                    .top(relative(y as f32))
+                    .w(px(4.0))
+                    .h(relative(h as f32))
+                    .cursor_ew_resize(),
+                ("vertical", 0.0) => zone
+                    .left(relative(x as f32))
+                    .top(relative(y as f32))
+                    .w(relative(w as f32))
+                    .h(px(4.0))
+                    .cursor_ns_resize(),
+                _ => zone
+                    .left(relative(x as f32))
+                    .top(relative((y + h) as f32))
+                    .mt(px(-4.0))
+                    .w(relative(w as f32))
+                    .h(px(4.0))
+                    .cursor_ns_resize(),
+            };
+            zones.push(
+                zone.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.divider = Some(Divider {
+                            direction,
+                            before: before_id.clone(),
+                            after: after_id.clone(),
+                            before_rect,
+                            after_rect,
+                        });
+                        // The pane underneath must not take the press as a click.
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+            );
+        }
+        zones
+    }
+
+    /// The pointer let go: turn where it is into the ratio Rex wants.
+    fn commit_divider(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(divider) = self.divider.take() else {
+            return;
+        };
+        let Some(address) = self.address() else {
+            return;
+        };
+        let Some(session) = self.session_id.clone() else {
+            return;
+        };
+        let geometry = *self.area_geometry.lock().unwrap();
+        let Some((origin, size)) = geometry else {
+            return;
+        };
+        let width = f32::from(size.width).max(1.0);
+        let height = f32::from(size.height).max(1.0);
+        let fx = (f32::from(at.x) - f32::from(origin.x)) / width;
+        let fy = (f32::from(at.y) - f32::from(origin.y)) / height;
+        let [bx, by, bw, bh] = divider.before_rect;
+        let [ax, ay, aw, ah] = divider.after_rect;
+        let _ = (ax, ay);
+        let ratio = match divider.direction {
+            "horizontal" => ((fx as f64 - bx) / (bw + aw)).clamp(0.08, 0.92),
+            _ => ((fy as f64 - by) / (bh + ah)).clamp(0.08, 0.92),
+        };
+        let (before, after) = (divider.before, divider.after);
+        let direction = divider.direction;
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({
+                "session_id": session,
+                "direction": direction,
+                "before_block_id": before,
+                "after_block_id": after,
+                "ratio": ratio,
+            });
+            if let Err(e) = engine.call(&address, "session.resize_pane", payload).await {
+                eprintln!("flex: resize_pane: {e}");
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Open the find bar on the pane that has the keyboard.
@@ -1946,6 +2213,47 @@ impl Workspace {
             );
         }
 
+        // Where the area is, in window coordinates: a divider drag ends with a
+        // pointer position that has to become a fraction of this box.
+        let geometry = self.area_geometry.clone();
+        area = area.child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, _, _| {
+                    *geometry.lock().unwrap() = Some((bounds.origin, bounds.size));
+                },
+            )
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full(),
+        );
+        if self.divider.is_some() {
+            let workspace = cx.entity().downgrade();
+            let this = workspace.clone();
+            area = area.child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _cx| {
+                        let workspace = this.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, _phase, _window, cx| {
+                            if event.button != MouseButton::Left {
+                                return;
+                            }
+                            let at = event.position;
+                            workspace
+                                .update(cx, |me, cx| me.commit_divider(at, cx))
+                                .ok();
+                        });
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full(),
+            );
+        }
+
         if let Some(image) = self.picture.clone() {
             area = area.child(
                 canvas(
@@ -1986,6 +2294,11 @@ impl Workspace {
             );
         }
         let mut area = area.children(elements);
+        // After the panes, so the strips sit on top of them: a pane drawn later
+        // owns the hitbox under the pointer, and the grab would never land.
+        for zone in self.divider_zones(cx) {
+            area = area.child(zone);
+        }
 
         // While a pane is being pulled, the window reports pointer movement: a
         // drag that leaves the pane still has to track, and the listeners only
