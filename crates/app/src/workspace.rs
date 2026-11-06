@@ -236,6 +236,9 @@ pub struct Workspace {
     divider: Option<Divider>,
     /// A name being typed.
     prompt: Option<Prompt>,
+    /// The window's scale factor and bounds at the last frame, to notice a move
+    /// to a monitor with a different DPI.
+    last_geometry: Option<(f32, gpui::Bounds<Pixels>)>,
     /// `terminal.modes` for the active pane, when the Terminal page asks.
     pane_modes: Option<serde_json::Value>,
     /// `hosts.list`: the other Rex servers this one can reach.
@@ -310,6 +313,7 @@ impl Workspace {
             pane_modes: None,
             hosts: None,
             palette: None,
+            last_geometry: None,
             named_client: false,
             server_info: None,
             keymap: None,
@@ -4371,6 +4375,29 @@ impl Render for Workspace {
         if !self.styled {
             self.styled = true;
             crate::win32::round_corners();
+        }
+        // Moving the window to a monitor with another DPI gives GPUI a new size
+        // and scale in one message; the frame that follows is sometimes laid out
+        // against the old renderer size, and the right-hand window buttons end up
+        // past the edge until another redraw happens (switching apps does that).
+        // Ask for a couple more frames after the geometry changes.
+        let geometry = (window.scale_factor(), window.bounds());
+        if self.last_geometry != Some(geometry) {
+            let first = self.last_geometry.is_none();
+            self.last_geometry = Some(geometry);
+            if !first {
+                cx.spawn(async move |this, cx| {
+                    for delay in [60_u64, 220] {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(delay))
+                            .await;
+                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
         }
         let title_bar = self.title_bar(cx);
         let toasts = self.toast_strip(cx);
