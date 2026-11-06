@@ -19,6 +19,7 @@ mod terminal;
 mod theme;
 mod win32;
 mod workspace;
+mod wsl;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

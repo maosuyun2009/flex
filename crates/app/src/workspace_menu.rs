@@ -57,6 +57,8 @@ pub(super) enum Action {
     Discover,
     Control(&'static str),
     RestoreLocal,
+    /// This machine's WSL server: start it if need be, then connect.
+    OpenWsl,
 }
 
 #[derive(Clone)]
@@ -357,11 +359,54 @@ impl Workspace {
                         Action::Prompt(Ask::AddServer, "Add server — name and address".into()),
                     ),
                     Item::enabled("From server directory…", Action::Directory),
+                    Item::enabled("This machine's WSL…", Action::OpenWsl),
                 ],
             ),
             window,
             cx,
         );
+    }
+
+    /// Connect to this machine's WSL server, starting it when it is not up yet.
+    ///
+    /// The work runs off the UI thread: `wsl.exe` costs a second or two.
+    fn open_wsl(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async { crate::wsl::connect() })
+                .await;
+            this.update(cx, |me, cx| match found {
+                Ok(address) => me.connect_wsl(address, cx),
+                Err(e) => me.rpc_error("Open WSL", e, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Show the saved entry for `address`, or add it, and select it.
+    fn connect_wsl(&mut self, address: String, cx: &mut Context<Self>) {
+        self.state = self.engine.state();
+        let saved = self
+            .state
+            .servers
+            .iter()
+            .find(|s| s.address.trim() == address)
+            .map(|s| s.id.clone());
+        let id = match saved {
+            Some(id) => id,
+            None => match self.engine.add_server("WSL", &address) {
+                Ok(id) => id,
+                Err(e) => return self.rpc_error("Add server", e, cx),
+            },
+        };
+        self.state = self.engine.state();
+        self.server_id = Some(id);
+        self.session_id = None;
+        self.window_id = None;
+        self.active_block = None;
+        self.reload(cx);
     }
 
     pub(super) fn menu_button(
@@ -568,7 +613,7 @@ impl Workspace {
         // Address entry is local and does not depend on a directory's source.
         let needs_target = !matches!(
             action,
-            Action::Prompt(Ask::AddServer, _) | Action::Directory
+            Action::Prompt(Ask::AddServer, _) | Action::Directory | Action::OpenWsl
         );
         if needs_target
             && target
@@ -602,6 +647,7 @@ impl Workspace {
                     self.refresh_hosts_for(target.address, target.server, cx);
                 }
             }
+            Action::OpenWsl => self.open_wsl(cx),
             Action::Connect(name, endpoint) => {
                 // Revalidate against the latest saved list: another request may have added it.
                 let saved: Vec<_> = self
