@@ -74,6 +74,9 @@ pub struct TerminalView {
     /// reached the terminal by the time we know better; the composition start
     /// retracts them with backspaces.
     leaked: String,
+    /// The punctuation key last sent to the pty. A Chinese IME commits its own
+    /// version of that key right afterwards, so the plain one has to go.
+    last_punct: Option<char>,
     session: Option<Arc<TerminalSession>>,
     error: Option<String>,
     frame: Frame,
@@ -95,6 +98,38 @@ impl TerminalListener for Notifier {
         crate::win32::set_clipboard_text(&text);
     }
     fn size_changed(&self, _cols: u16, _rows: u16) {}
+}
+
+/// The Chinese IME's punctuation for a US-keyboard key.
+///
+/// A Chinese input method commits `，` for the `,` key — but Windows also sends
+/// the plain key first, so the terminal types `,` and then the IME's `，`, and
+/// the user sees both. Knowing the pair lets the shell take the plain one back.
+fn cjk_punctuation(ascii: char) -> Option<char> {
+    Some(match ascii {
+        ',' => '，',
+        '.' => '。',
+        '?' => '？',
+        '!' => '！',
+        ':' => '：',
+        ';' => '；',
+        '(' => '（',
+        ')' => '）',
+        '<' => '《',
+        '>' => '》',
+        '[' => '【',
+        ']' => '】',
+        _ => return None,
+    })
+}
+
+/// Whether the committed text is the IME's version of the key just sent.
+fn replaces_sent_punctuation(sent: Option<char>, text: &str) -> bool {
+    let mut chars = text.chars();
+    let (Some(committed), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    sent.and_then(cjk_punctuation) == Some(committed)
 }
 
 /// How much of what we already sent the IME is about to take back.
@@ -263,6 +298,7 @@ impl TerminalView {
             over_picture,
             background_opacity,
             leaked: String::new(),
+            last_punct: None,
             session,
             error,
             frame: empty_frame(),
@@ -655,6 +691,10 @@ impl TerminalView {
                 } else if let shrew_core::Key::Char(c) = p.key {
                     self.leaked.push(c);
                 }
+                self.last_punct = match (p.key, p.ctrl || p.alt || p.meta) {
+                    (shrew_core::Key::Char(c), false) if c.is_ascii_punctuation() => Some(c),
+                    _ => None,
+                };
                 session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta);
             }
             None => {
@@ -1002,6 +1042,9 @@ impl EntityInputHandler for TerminalView {
         if std::env::var_os("FLEX_DEBUG").is_some() {
             eprintln!("[ime] commit {text:?}");
         }
+        // Punctuation reaches us twice: Windows sends the plain key, then the
+        // IME commits its full-width version. Take the plain one back.
+        let take_back = replaces_sent_punctuation(self.last_punct.take(), text);
         // ASCII already arrives as key events; sending it here would type every
         // character twice. Only the IME's own output takes this path.
         if !text.chars().any(|c| !c.is_ascii()) {
@@ -1009,6 +1052,9 @@ impl EntityInputHandler for TerminalView {
         }
         self.leaked.clear();
         if let Some(session) = &self.session {
+            if take_back {
+                session.send_text("\u{7f}");
+            }
             session.send_text(text);
         }
     }
@@ -1063,10 +1109,24 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{retract_len, url_token};
+    use super::{replaces_sent_punctuation, retract_len, url_token};
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
+    }
+
+    #[test]
+    fn the_imes_punctuation_replaces_the_plain_key() {
+        assert!(replaces_sent_punctuation(Some(','), "，"));
+        assert!(replaces_sent_punctuation(Some('.'), "。"));
+        assert!(replaces_sent_punctuation(Some('?'), "？"));
+        // A Chinese character is not a punctuation replacement.
+        assert!(!replaces_sent_punctuation(Some(','), "中"));
+        // Nothing was sent, or the text is not a single character.
+        assert!(!replaces_sent_punctuation(None, "，"));
+        assert!(!replaces_sent_punctuation(Some(','), "，。"));
+        // The IME chose a different mark than the key suggests.
+        assert!(!replaces_sent_punctuation(Some(';'), "，"));
     }
 
     #[test]

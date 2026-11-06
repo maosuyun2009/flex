@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "flex"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "async-channel 2.5.0",
  "flex-engine",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "flex-engine"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "serde_json",
  "shrew-client",
