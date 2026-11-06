@@ -100,6 +100,16 @@ impl TerminalListener for Notifier {
     fn size_changed(&self, _cols: u16, _rows: u16) {}
 }
 
+/// Whether a committed string has to be typed into the pty.
+///
+/// ASCII normally arrives as key events, so echoing it here would type every
+/// character twice. But while a composition was in progress those key events
+/// were swallowed, so an English word the IME commits (the user kept the pinyin
+/// or switched the method to English mid-composition) has no other way in.
+fn commit_needs_typing(was_composing: bool, text: &str) -> bool {
+    was_composing || text.chars().any(|c| !c.is_ascii())
+}
+
 /// The Chinese IME's punctuation for a US-keyboard key.
 ///
 /// A Chinese input method commits `，` for the `,` key — but Windows also sends
@@ -1038,16 +1048,14 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        self.composing = false;
+        let was_composing = std::mem::replace(&mut self.composing, false);
         if std::env::var_os("FLEX_DEBUG").is_some() {
-            eprintln!("[ime] commit {text:?}");
+            eprintln!("[ime] commit {text:?} composing={was_composing}");
         }
         // Punctuation reaches us twice: Windows sends the plain key, then the
         // IME commits its full-width version. Take the plain one back.
         let take_back = replaces_sent_punctuation(self.last_punct.take(), text);
-        // ASCII already arrives as key events; sending it here would type every
-        // character twice. Only the IME's own output takes this path.
-        if !text.chars().any(|c| !c.is_ascii()) {
+        if !commit_needs_typing(was_composing, text) {
             return;
         }
         self.leaked.clear();
@@ -1109,10 +1117,22 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{replaces_sent_punctuation, retract_len, url_token};
+    use super::{commit_needs_typing, replaces_sent_punctuation, retract_len, url_token};
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
+    }
+
+    #[test]
+    fn english_committed_from_a_composition_is_typed() {
+        // Keys were swallowed while composing, so this is the only way in.
+        assert!(commit_needs_typing(true, "abc"));
+        assert!(commit_needs_typing(true, "ABC"));
+        // No composition: the key events already typed it.
+        assert!(!commit_needs_typing(false, "abc"));
+        // Chinese always goes through this path.
+        assert!(commit_needs_typing(false, "中文"));
+        assert!(commit_needs_typing(true, "中文"));
     }
 
     #[test]
