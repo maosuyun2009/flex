@@ -46,7 +46,7 @@ the window, so server-side splits, floats and zoom need no layout code here.
 
 ## Install
 
-Download [`flex-0.0.6-setup.exe`](https://github.com/maosuyun2009/flex/releases/download/v0.0.6/flex-0.0.6-setup.exe)
+Download [`flex-0.0.8-setup.exe`](https://github.com/maosuyun2009/flex/releases/download/v0.0.8/flex-0.0.8-setup.exe)
 and run it. Release builds are a Windows GUI binary: double-clicking opens the
 window and nothing else, with no console behind it. It installs
 for the current user only, adds **flex** to the Start menu and the desktop, and
@@ -74,7 +74,7 @@ The installer is NSIS, built from `installer/flex.nsi` after the release build:
 
 ```powershell
 mkdir dist
-makensis /DAPP_VERSION=0.0.6 installer\flex.nsi   # → dist\flex-0.0.6-setup.exe
+makensis /DAPP_VERSION=0.0.8 installer\flex.nsi   # → dist\flex-0.0.8-setup.exe
 ```
 
 On Linux, `cargo check` currently trips over `xattr v0.2.3` vs `libc v0.2.191`
@@ -194,6 +194,17 @@ the size of the client that *owns* it, and owning is a separate call
 (`own_block`); the shell gives ownership to whichever pane holds the keyboard,
 not just to the pane that was clicked. Without that, a pane opened from the
 prefix menu — never clicked — keeps its small grid when it is zoomed.
+
+`Ctrl-Shift-F` on the last tiled pane in a tab now floats it **locally** (the
+header says `local`). Its server placement and process stay unchanged; pressing
+the shortcut again restores it without creating a pane or tab. Drag, resize and
+minimize are also local. Other clients keep their existing layout. A server-side
+split/move invalidates the local presentation so it cannot hide the new layout.
+
+With another tiled pane in the same tab, floating still uses Rex's shared
+layout. Restore never creates a shell or uses an anchor from another tab. An
+already server-floating pane with no tiled neighbour cannot be retiled by API 10;
+flex reports that limitation instead of silently creating a replacement tab.
 
 Floating a pane remembers the rect it had, so tiling it again puts it back on
 the same side with roughly its old share (`split_hint`): a pane from the right of
@@ -436,24 +447,90 @@ everything else.
 - Settings page: font size (live on every open terminal), sidebar, finish; all
   saved and reloaded from the engine's store.
 
-## What is not there yet
+## Sidebar navigation
 
-Deliberately, so the first version stays readable:
+The sidebar has one **SERVERS** tree: saved connections, with their sessions
+underneath. Server and session rows keep their labels readable; the `…` menu
+contains creation, rename/edit, ordering, reconnect and removal actions.
+Removing a saved connection does not stop the remote server. Deleting a session
+still asks for confirmation because it ends its programs.
 
-- **Blinking cursor and inverted cursor cells.** The cursor is a quad painted
-  behind the text, so the glyph stays visible instead of inverting.
-- **Mouse selection, scroll wheel, scrollback gestures.** Scrollback exists in
-  the engine; the shell paints only the viewport.
-- **Cell-accurate wide glyphs.** Each run is shaped as one line, so a long line
-  mixing CJK/emoji with ASCII can drift off the grid. `Run::widths` carries the
-  per-grapheme cell widths when that matters.
-- **Add/remove server UI.** Set an address on the command line or let it save
-  from the last run.
-- Notifications, agent "needs you" inbox, file viewer, themes, font settings.
-- The cursor is a solid block behind the glyph and does not blink, so on the
-  last row it can look clipped at the pane edge.
-- Very fast synthetic input (a `SendKeys` burst) can interleave; typing by hand
-  is clean.
+The header `+` offers manual address entry or adding a connection from the
+selected server's directory. The directory is not a second list of machines;
+its maintenance belongs in Settings → **Connection**.
+
+Agents, minimized panes and parked panes appear only when relevant. Parked-pane
+refresh belongs with parked panes; session menus also offer discovery when the
+list is empty. The sidebar scrolls independently in short windows.
+
+Pane actions are separate from navigation. The pane `…` menu shows **Terminal
+size** ownership controls (request, take, release); these choose whose terminal
+dimensions Rex uses, not who has permission to type. Floating-layer close is
+available only for floating panes and still requires confirmation.
+
+Menus support Up/Down, Enter and Escape. Opening a menu takes keyboard focus
+away from the terminal; dismissing it restores focus without forwarding menu
+input to the remote program.
+
+## Rex integration
+
+Settings → **Connection** now includes saved-server editing, reconnect/probe,
+config reload, host creation, Tailscale enable/login/disable/logout/rename,
+connected clients and terminal ownership controls. Session rows offer rename
+and ordering. Parked blocks are discovered from `session.list_blocks`, rather
+than only remembered in this process; restoring one uses its original server
+and session and creates an anchor window if necessary.
+
+The jump palette (`Ctrl-Shift-O`) includes titled server actions; start the
+query with `>` to see only actions. Lua actions with argument schemas open a
+JSON-object prompt. Fixed creator actions omit arguments. Server keymaps are
+registered on the persistent client connection with Flex defaults underneath
+configuration bindings. Logical key sequences and modes (including exclusive,
+once, blocked keys and Escape cancellation) are resolved locally; forwarded
+sequences carry their prefix to Rex instead of typing it into the terminal.
+
+Connection also lists the server's block creators/flavors. **Create** accepts a
+JSON options object and leaves creator-specific schema validation to Rex.
+Unknown creators remain visible as selectable **unsupported renderer** panes
+with a Describe action; there is no claim to render arbitrary block plugins.
+
+**Choose Lua…** stages a local UTF-8 script without executing it. **Load**
+explicitly replaces this client's scripts, **Unload** removes them, and returned
+diagnostics are shown. Client label, scripts and action registration use the
+same long-lived connection as the UI, and are restored after reconnect.
+
+### Remote actions
+
+**Allow remote client actions (trusted peers only)** is off by default. With it
+on, registered supported layout/navigation actions can be requested through
+`client.perform`. Requests are bound to the originating server and validated
+session/block, executed in server order, and answered on the original connection.
+Clipboard, file dialogs, tool launchers and interactive prompts still require
+local interaction. Unsupported actions return an error, not a success stub.
+
+Cross-server Lua calls may relay only selected read-only methods (`server.status`,
+`server.whoami`, `session.list`, `session.view`) to saved, connected servers.
+Arbitrary addresses, terminal input, scripts and write methods are refused.
+Timeouts prevent starting further operations; they cannot undo a request the
+server already accepted. Enable automation only for trusted servers/peers.
+
+### Remaining limitations
+
+- Native Windows GUI/IME, mouse capture and multiple-monitor behavior still
+  require interactive testing. Terminal IME rollback outside search remains a
+  heuristic; it is not safe to describe it as fully correct for every raw-mode TUI.
+- GPUI 0.2.2 does not expose physical scan-code identity in `Keystroke`;
+  physical bindings such as `ctrl+[KeyD]` are not implemented. Logical bindings
+  and sequences are supported.
+- Complex combining/ZWJ glyph runs retain whole-run shaping. Simple CJK/wide
+  cells use cell widths, but this is not a guarantee for every font/emoji.
+- Cursor blinking/inverted glyphs, full OSC 8 hyperlink metadata, terminal image
+  protocols, native system notifications, and arbitrary plugin renderers remain
+  outside the implemented renderer. Text URL opening and application toasts exist.
+- Older servers may reject newer management methods. The client negotiates up
+  to API revision 10, retaining revision 8 as its minimum, and surfaces RPC errors.
+
+Local dependency changes are recorded in [`vendor/shrew/README.md`](vendor/shrew/README.md).
 
 Set `FLEX_DEBUG=1` to log one line per rendered frame — the quickest way to
 tell a dead stream from a failed snapshot restore.

@@ -30,6 +30,24 @@ pub fn translate(k: &Keystroke) -> Option<Press> {
     })
 }
 
+pub fn binding_key(k: &Keystroke) -> String {
+    let mut keys = Vec::new();
+    if k.modifiers.control {
+        keys.push("ctrl");
+    }
+    if k.modifiers.alt {
+        keys.push("alt");
+    }
+    if k.modifiers.shift {
+        keys.push("shift");
+    }
+    if k.modifiers.platform {
+        keys.push("cmd");
+    }
+    keys.push(&k.key);
+    flex_engine::keybindings::normalize(&keys.join("+"))
+}
+
 fn named(key: &str) -> Option<Key> {
     Some(match key {
         // Windows reports the space bar as a named key with no character, so

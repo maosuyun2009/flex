@@ -1,11 +1,5 @@
-//! Draws a `shrew_core::Frame` with GPUI: a quad per cell background, then one
-//! shaped line per run.
-//!
-//! Deliberate MVP limits: no blinking cursor, the cursor is a quad painted
-//! behind the text rather than an inverted cell, and wide glyphs (CJK, emoji)
-//! are shaped as part of their run instead of placed cell by cell, so a long
-//! mixed-width line can drift off the grid. `Run::widths` is there when that
-//! matters.
+//! Draws cell backgrounds, the cursor, then text on the terminal grid.
+//! Multi-codepoint grapheme runs retain shaping when scalar widths are ambiguous.
 
 use flex_engine::Metrics;
 use gpui::{
@@ -59,6 +53,22 @@ pub fn paint(
         },
     ));
 
+    let selection = mix(frame.foreground, frame.background, 0.30);
+    for (row, line) in frame.lines.iter().enumerate() {
+        for run in &line.runs {
+            let background = if run.selected {
+                Some(color(selection))
+            } else {
+                run.bg.map(color)
+            };
+            if let Some(background) = background {
+                let at = cell(run.col, row as u16);
+                let w = cell_w * run.cells as f32;
+                window.paint_quad(fill(Bounds::new(at, size(w, cell_h)), background));
+            }
+        }
+    }
+
     if let Some(cursor) = &frame.cursor {
         let at = cell(cursor.col, cursor.row);
         let w = if cursor.wide { cell_w * 2.0 } else { cell_w };
@@ -80,51 +90,59 @@ pub fn paint(
         });
     }
 
-    let selection = mix(frame.foreground, frame.background, 0.30);
     for (row, line) in frame.lines.iter().enumerate() {
         for run in &line.runs {
-            let background = if run.selected {
-                Some(color(selection))
-            } else {
-                run.bg.map(color)
-            };
-            if let Some(background) = background {
-                let at = cell(run.col, row as u16);
-                let w = cell_w * run.cells as f32;
-                window.paint_quad(fill(Bounds::new(at, size(w, cell_h)), background));
+            for (offset, text) in positioned_text(&run.text, &run.widths) {
+                if text.trim().is_empty() && run.underline == Underline::None && !run.strikethrough
+                {
+                    continue;
+                }
+                let fg = if run.faint {
+                    mix(run.fg, frame.background, 0.5)
+                } else {
+                    run.fg
+                };
+                let shape = TextRun {
+                    len: text.len(),
+                    font: font_for(palette, run),
+                    color: color(fg),
+                    background_color: None,
+                    underline: underline_for(run, fg),
+                    strikethrough: run.strikethrough.then(|| StrikethroughStyle {
+                        thickness: px(1.0),
+                        color: Some(color(fg)),
+                    }),
+                };
+                let shaped = window.text_system().shape_line(
+                    SharedString::from(text),
+                    palette.font_size,
+                    &[shape],
+                    None,
+                );
+                let at = cell(run.col.saturating_add(offset), row as u16);
+                let _ = shaped.paint(at, cell_h, window, cx);
             }
-        }
-        for run in &line.runs {
-            let text = printable(&run.text);
-            if text.trim().is_empty() {
-                continue;
-            }
-            let fg = if run.faint {
-                mix(run.fg, frame.background, 0.5)
-            } else {
-                run.fg
-            };
-            let shape = TextRun {
-                len: text.len(),
-                font: font_for(palette, run),
-                color: color(fg),
-                background_color: None,
-                underline: underline_for(run, fg),
-                strikethrough: run.strikethrough.then(|| StrikethroughStyle {
-                    thickness: px(1.0),
-                    color: Some(color(fg)),
-                }),
-            };
-            let shaped = window.text_system().shape_line(
-                SharedString::from(text),
-                palette.font_size,
-                &[shape],
-                None,
-            );
-            let at = cell(run.col, row as u16);
-            let _ = shaped.paint(at, cell_h, window, cx);
         }
     }
+}
+
+/// Use the core's widths when one scalar is one cell grapheme. Don't guess
+/// boundaries in combining/ZWJ sequences: keep those shaped as a whole run.
+// shortcut: multi-codepoint grapheme runs can still drift; place them per cell
+// when the public frame exposes grapheme boundaries.
+fn positioned_text(text: &str, widths: &[u8]) -> Vec<(u16, String)> {
+    if text.chars().count() != widths.len() {
+        return vec![(0, printable(text))];
+    }
+    let mut col: u16 = 0;
+    text.chars()
+        .zip(widths)
+        .map(|(ch, width)| {
+            let at = col;
+            col = col.saturating_add(u16::from(*width));
+            (at, printable(&ch.to_string()))
+        })
+        .collect()
 }
 
 fn font_for(palette: &Palette, run: &Run) -> Font {
@@ -175,4 +193,26 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
             .clamp(0.0, 255.0) as u8
     };
     Rgb::new(f(a.r, b.r), f(a.g, b.g), f(a.b, b.b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_width_cells_keep_the_following_glyph_on_grid() {
+        assert_eq!(
+            positioned_text("a中b", &[1, 2, 1]),
+            vec![(0, "a".into()), (1, "中".into()), (3, "b".into())]
+        );
+    }
+
+    #[test]
+    fn combining_sequences_are_not_split_into_separate_cells() {
+        assert_eq!(
+            positioned_text("e\u{301}中", &[1, 2]),
+            vec![(0, "e\u{301}中".into())]
+        );
+        assert_eq!(printable("a\n\tb"), "a  b");
+    }
 }

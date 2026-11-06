@@ -4,15 +4,16 @@
 //! driven by a different UI toolkit, without a GPU or a display.
 
 mod grid;
+pub mod keybindings;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub use grid::{fit_grid, Metrics};
 pub use shrew_core::{
-    AppState, BlockState, Connectivity, CoreError, Notification, ServerState, SessionState,
-    TerminalListener, TerminalSession, WindowState,
+    AppState, BlockState, CacheInvalidation, ClientReplyError, ClientRequest, Connectivity,
+    CoreError, Notification, ServerState, SessionState, TerminalListener, TerminalSession,
+    WindowState,
 };
 use shrew_core::{Config, Listener, Shrew};
 
@@ -111,51 +112,52 @@ impl Engine {
         field("/foreground/cwd").or_else(|| field("/child/cwd"))
     }
 
-    /// Call a Rex method that `shrew-core` does not wrap — `session.float_block`
-    /// and `session.move_block` today. shrew-core keeps its control connection
-    /// private, so this opens a short-lived one of its own.
+    /// Resolve a saved address and use its supervised control connection.
+    /// Unsaved/offline addresses never create an ephemeral client identity.
     pub async fn call(
         &self,
         address: &str,
         method: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
-        use shrew_client::{ConnectOptions, Connection, Endpoint};
-        use shrew_core::ClientInfo;
-
-        let endpoint =
-            Endpoint::parse(address).map_err(|e| CoreError::InvalidAddress(e.to_string()))?;
-        let options = ConnectOptions {
-            client: ClientInfo {
-                kind: Some("app".into()),
-                platform: Some(shrew_client::platform_name().into()),
-                name: Some("flex".into()),
-                version: Some(env!("CARGO_PKG_VERSION").into()),
-                label: None,
-            },
-            reconnect_token: None,
-            timeout: Duration::from_secs(8),
-        };
-        let method = method.to_owned();
-        self.shrew
-            .runtime()
-            .clone()
-            .spawn(async move {
-                let (connection, _events) = Connection::connect(&endpoint, options).await?;
-                // Session-scoped methods need the connection attached first.
-                let _ = connection
-                    .call(
-                        "session.attach_all",
-                        serde_json::json!({"event_scope": "session"}),
-                    )
-                    .await;
-                let result = connection.call(&method, payload).await;
-                connection.close();
-                result
+        let endpoint = shrew_core::Endpoint::parse(address)
+            .map_err(|e| CoreError::InvalidAddress(e.to_string()))?;
+        let server_id = self
+            .state()
+            .servers
+            .iter()
+            .find(|server| {
+                shrew_core::Endpoint::parse(&server.address).ok().as_ref() == Some(&endpoint)
             })
-            .await
-            .map_err(|e| CoreError::Server(e.to_string()))?
-            .map_err(|e| CoreError::Server(e.to_string()))
+            .map(|server| server.id.clone())
+            .ok_or(CoreError::UnknownServer)?;
+        self.call_server(&server_id, method, payload).await
+    }
+
+    pub async fn call_server(
+        &self,
+        server_id: &str,
+        method: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.shrew.call(server_id, method, payload).await
+    }
+
+    pub fn take_client_requests(&self) -> Vec<ClientRequest> {
+        self.shrew.take_client_requests()
+    }
+
+    pub fn take_cache_invalidations(&self) -> Vec<CacheInvalidation> {
+        self.shrew.take_cache_invalidations()
+    }
+
+    /// Always send the result/refusal back on the request's original connection.
+    pub async fn reply_client_request(
+        &self,
+        event_id: &str,
+        result: Result<serde_json::Value, ClientReplyError>,
+    ) -> Result<(), CoreError> {
+        self.shrew.reply_client_request(event_id, result).await
     }
 
     pub fn open_terminal(
@@ -167,5 +169,34 @@ impl Engine {
     ) -> Result<Arc<TerminalSession>, CoreError> {
         self.shrew
             .open_terminal(server_id, session_id, block_id, listener)
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn call_resolves_saved_endpoint_and_rejects_unsaved_addresses() {
+        let engine = Engine::new(None, "test", Arc::new(|| {}), Arc::new(|_| {}));
+        let id = engine.add_server("offline", "127.0.0.1:1").unwrap();
+        let rt = engine.shrew();
+        assert_eq!(
+            rt.block_on(engine.call("http://127.0.0.1:1/", "client.keymap", json!({}))),
+            Err(CoreError::NotConnected)
+        );
+        assert_eq!(
+            rt.block_on(engine.call_server(&id, "client.keymap", json!({}))),
+            Err(CoreError::NotConnected)
+        );
+        assert_eq!(
+            rt.block_on(engine.call("127.0.0.1:2", "client.keymap", json!({}))),
+            Err(CoreError::UnknownServer)
+        );
+        assert!(matches!(
+            rt.block_on(engine.call("", "client.keymap", json!({}))),
+            Err(CoreError::InvalidAddress(_))
+        ));
     }
 }

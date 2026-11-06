@@ -140,6 +140,98 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
     ),
 ];
 
+/// Stable action names are shared by the keymap and remote client.perform.
+fn action_name(action: Action) -> String {
+    let debug = format!("{action:?}");
+    let mut name = String::from("flex.");
+    for (i, c) in debug.chars().enumerate() {
+        if i > 0 && c.is_ascii_uppercase() {
+            name.push('_');
+        }
+        name.push(c.to_ascii_lowercase());
+    }
+    name
+}
+
+pub fn configured_action(name: &str, args: &serde_json::Value) -> Option<Action> {
+    use serde_json::Value;
+    let empty = args.is_null() || args.as_object().is_some_and(|a| a.is_empty());
+    if empty {
+        if let Some((_, action, _)) = BINDINGS.iter().find(|(_, a, _)| action_name(*a) == name) {
+            return Some(*action);
+        }
+        return match name {
+            "client.tab.new" => Some(Action::NewTab),
+            "client.tab.next" => Some(Action::NextTab),
+            "client.tab.previous" => Some(Action::PrevTab),
+            "pane.close" => Some(Action::ClosePane),
+            "pane.zoom" => Some(Action::ZoomPane),
+            "pane.float" => Some(Action::ToggleFloat),
+            _ => None,
+        };
+    }
+    let object = args.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    match (name, object.get("direction").and_then(Value::as_str)?) {
+        ("pane.split", "right") => Some(Action::SplitRight),
+        ("pane.split", "down") => Some(Action::SplitDown),
+        ("pane.focus", "left") => Some(Action::FocusLeft),
+        ("pane.focus", "right") => Some(Action::FocusRight),
+        ("pane.focus", "up") => Some(Action::FocusUp),
+        ("pane.focus", "down") => Some(Action::FocusDown),
+        _ => None,
+    }
+}
+
+pub fn keymap_request() -> serde_json::Value {
+    use serde_json::json;
+    let empty = json!({"type":"object","additionalProperties":false});
+    let mut actions: Vec<_> = BINDINGS
+        .iter()
+        .map(|(_, action, title)| {
+            json!({
+                "name":action_name(*action), "kind":"client", "title":title, "args":empty
+            })
+        })
+        .collect();
+    for name in [
+        "client.tab.new",
+        "client.tab.next",
+        "client.tab.previous",
+        "pane.close",
+        "pane.zoom",
+        "pane.float",
+    ] {
+        actions.push(json!({"name":name,"kind":"client","args":empty}));
+    }
+    for (name, directions) in [
+        ("pane.split", vec!["right", "down"]),
+        ("pane.focus", vec!["left", "right", "up", "down"]),
+    ] {
+        actions.push(json!({"name":name,"kind":"client","args":{
+            "type":"object","properties":{"direction":{"type":"string","enum":directions}},
+            "required":["direction"],"additionalProperties":false
+        }}));
+    }
+    actions.push(json!({"name":"client.mode.enter","kind":"client","args":{
+        "type":"object","properties":{"name":{"type":"string"},"once":{"type":"boolean"}},"required":["name"],"additionalProperties":false
+    }}));
+    for name in ["client.mode.exit", "client.mode.exit_all"] {
+        actions.push(json!({"name":name,"kind":"client","args":empty}));
+    }
+    let bindings: Vec<_> = BINDINGS
+        .iter()
+        .map(|(keys, action, _)| {
+            json!({
+                "keys":[keys.replace('-', "+")], "action":action_name(*action)
+            })
+        })
+        .collect();
+    json!({"actions":actions,"defaults":[{"name":"flex","bindings":bindings}],"server_actions":"all"})
+}
+
 pub fn lookup(keystroke: &Keystroke) -> Option<Action> {
     // Enter arrives as "\r" on Windows; the table spells it "enter".
     let key = match keystroke.key.to_ascii_lowercase().as_str() {
@@ -207,6 +299,42 @@ mod tests {
             });
             assert_eq!(found, Some(*action), "{keys} did not resolve");
         }
+    }
+
+    #[test]
+    fn configured_actions_validate_direction_and_reject_unknown_names() {
+        assert_eq!(
+            configured_action("pane.split", &serde_json::json!({"direction":"right"})),
+            Some(Action::SplitRight)
+        );
+        assert_eq!(
+            configured_action("pane.split", &serde_json::json!({"direction":"down"})),
+            Some(Action::SplitDown)
+        );
+        assert_eq!(
+            configured_action("pane.split", &serde_json::json!({"direction":"diagonal"})),
+            None
+        );
+        assert_eq!(configured_action("shell.run", &serde_json::json!({})), None);
+        assert_eq!(
+            configured_action("flex.close_pane", &serde_json::json!({"unexpected":true})),
+            None
+        );
+    }
+
+    #[test]
+    fn registered_defaults_can_all_be_executed() {
+        let request = keymap_request();
+        for binding in request["defaults"][0]["bindings"].as_array().unwrap() {
+            assert!(
+                configured_action(binding["action"].as_str().unwrap(), &binding["args"]).is_some()
+            );
+            assert!(binding["keys"][0].as_str().unwrap().contains('+'));
+        }
+        assert_eq!(
+            request["defaults"][0]["bindings"].as_array().unwrap().len(),
+            BINDINGS.len()
+        );
     }
 
     #[test]

@@ -1,9 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/app"]
+members = [
+    "crates/engine", "crates/app",
+    "vendor/shrew/shrew-core", "vendor/shrew/shrew-client", "vendor/shrew/shrew-proto",
+]
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.8"
 edition = "2021"
 license = "MIT"
 
@@ -11,6 +14,11 @@ license = "MIT"
 # Pinned: shrew 0.1.0-dev is not on crates.io yet. Bump the rev deliberately.
 shrew-core = { git = "https://github.com/teddytennant/shrew", rev = "9cfc45ff91ab1d2283f7514f8a5d0096a0d68690" }
 flex-engine = { path = "crates/engine" }
+
+[patch."https://github.com/teddytennant/shrew"]
+shrew-core = { path = "vendor/shrew/shrew-core" }
+shrew-client = { path = "vendor/shrew/shrew-client" }
+shrew-proto = { path = "vendor/shrew/shrew-proto" }
 
 [profile.dev]
 opt-level = 1

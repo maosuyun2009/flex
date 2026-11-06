@@ -5,6 +5,14 @@
 //! Every pane is placed from `BlockState::rect`, which the server sends as
 //! fractions of its window, so splits, floats and zoom need no layout code here.
 
+#[path = "workspace_automation.rs"]
+mod automation;
+#[path = "workspace_menu.rs"]
+mod menu;
+#[path = "workspace_model.rs"]
+mod model;
+use model::{move_before, tool_layer_request, FloatHints, PendingTool, ServerCache, ToolProgress};
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -21,8 +29,9 @@ use serde_json::json;
 use crate::icons::{self, Icon};
 use crate::settings::{Settings, FONT_MAX, FONT_MIN};
 use crate::shortcuts::{self, Action};
-use crate::terminal::TerminalView;
+use crate::terminal::{TerminalEvent, TerminalView};
 use crate::theme;
+use flex_engine::keybindings::KeyBindings;
 use flex_engine::Notification;
 
 /// Printed by a picker pane once it has a choice, so the client can find it in
@@ -49,22 +58,18 @@ enum Tool {
     Anything,
 }
 
-/// A picker pane that is running: when its program exits, the choice is read out
-/// of its text and typed into the pane it was opened from.
+/// A detached block's identity stays tied to the server and session that own it.
 #[derive(Clone)]
-struct PendingPick {
-    origin_block: String,
-    pick_block: String,
-    suffix: &'static str,
+struct ParkedBlock {
+    server: String,
+    session: String,
+    id: String,
+    label: String,
 }
 
 /// Where a pane lands when it is floated: centred, leaving the tiled panes
 /// visible around it, the way a floating terminal is usually wanted.
 const FLOAT_BOUNDS: [f64; 4] = [0.14, 0.12, 0.72, 0.7];
-
-/// Where a tool (lazygit, a picker) opens as a floating terminal: centred, with
-/// the panes still visible around it.
-const TOOL_BOUNDS: [f64; 4] = [0.18, 0.1, 0.64, 0.72];
 
 /// What the pointer grabbed on a floating pane.
 #[derive(Clone, Copy, PartialEq)]
@@ -80,6 +85,7 @@ enum Grab {
 #[derive(Clone)]
 struct Pull {
     block_id: String,
+    local_key: Option<model::LocalFloatKey>,
     grab: Grab,
     /// Pointer position in window coordinates when the drag started.
     start: Point<Pixels>,
@@ -105,14 +111,32 @@ struct Divider {
 enum Ask {
     RenameTab,
     RenamePane,
+    RenameSession(String, String, String),
+    CloseLayer(String, String, String),
+    RenameTailscale,
+    EditServer(String, String, String),
     /// The address of the machine the session is created on.
     NewSession(String),
     /// Session id and label.
-    DeleteSession(String, String),
+    DeleteSession(String, String, String),
     NewHost,
     /// Host id and label.
     DeleteHost(String, String),
     AddServer,
+    CreateBlock {
+        server: String,
+        session: String,
+        anchor: Option<String>,
+        flavor: String,
+        schema: serde_json::Value,
+    },
+    RunAction {
+        server: String,
+        session: String,
+        block: Option<String>,
+        name: String,
+        schema: serde_json::Value,
+    },
     /// Server id and name.
     DeleteServer(String, String),
 }
@@ -122,15 +146,27 @@ impl Ask {
     fn wants_text(&self) -> bool {
         matches!(
             self,
-            Ask::RenameTab | Ask::RenamePane | Ask::NewSession(..) | Ask::NewHost | Ask::AddServer
+            Ask::RenameTab
+                | Ask::RenamePane
+                | Ask::RenameSession(..)
+                | Ask::NewSession(..)
+                | Ask::NewHost
+                | Ask::AddServer
+                | Ask::RenameTailscale
+                | Ask::EditServer(..)
+                | Ask::CreateBlock { .. }
+                | Ask::RunAction { .. }
         )
     }
 
     fn hint(&self) -> &'static str {
         match self {
-            Ask::DeleteSession(..) => "Enter to delete · Esc to cancel",
+            Ask::DeleteSession(..) | Ask::CloseLayer(..) => "Enter to delete · Esc to cancel",
             Ask::DeleteHost(..) | Ask::DeleteServer(..) => "Enter to remove · Esc to cancel",
             Ask::NewHost | Ask::AddServer => "Enter to add · Esc to cancel",
+            Ask::CreateBlock { .. } | Ask::RunAction { .. } => {
+                "Paste JSON with Ctrl-V · Enter to submit · Esc to cancel"
+            }
             _ => "Enter to save · Esc to cancel",
         }
     }
@@ -142,9 +178,28 @@ struct Prompt {
     what: Ask,
     label: String,
     value: String,
+    scope: Option<menu::Target>,
+}
+
+#[derive(Clone)]
+struct ScriptDraft {
+    name: String,
+    source: String,
+}
+
+#[derive(Clone)]
+struct PaletteActionItem {
+    server: String,
+    session: String,
+    block: Option<String>,
+    name: String,
+    title: String,
+    description: String,
+    args_schema: Option<serde_json::Value>,
 }
 
 /// Where a palette entry takes you.
+#[derive(Clone)]
 enum Jump {
     Block {
         server: String,
@@ -153,10 +208,18 @@ enum Jump {
         block: String,
     },
     Window {
+        server: String,
         session: String,
         window: String,
     },
     File(String),
+    Action {
+        server: String,
+        session: String,
+        block: Option<String>,
+        name: String,
+        schema: Option<serde_json::Value>,
+    },
 }
 
 /// The jump list: tabs, panes and the files beside the pane, filtered as you type.
@@ -165,6 +228,8 @@ struct Palette {
     cursor: usize,
     /// Files from `list_dir`, for the pane the palette was opened on.
     files: Vec<String>,
+    actions: Vec<PaletteActionItem>,
+    origin: (String, String, Option<String>),
 }
 
 /// One notification on screen, and when it should go away.
@@ -203,6 +268,7 @@ pub struct Workspace {
     active_block: Option<String>,
     /// A pane to take focus once it exists, e.g. the one a split just made.
     pending_focus: Option<String>,
+    navigation: Option<(String, String, String)>,
     terminals: HashMap<String, Entity<TerminalView>>,
     styled: bool,
     show_settings: bool,
@@ -216,11 +282,12 @@ pub struct Workspace {
     settled: Option<(String, [f64; 4])>,
     /// Where each floating pane sat before it was floated, so tiling it again
     /// can put it back on the same side with roughly the same share.
-    float_rects: std::collections::HashMap<String, [f64; 4]>,
+    float_rects: FloatHints,
+    local_floats: model::LocalFloats,
     /// Prefix armed: the next bare key picks a tool.
     prefix: Arc<std::sync::atomic::AtomicBool>,
-    /// A picker pane that has not answered yet.
-    pending_pick: Option<PendingPick>,
+    /// A tool request or pane, including its scoped focus and exit lifecycle.
+    pending_tool: Option<PendingTool>,
     /// The pane a tool was opened from, dimmed while the tool is up.
     tinted: Option<String>,
     /// The last press on the title bar, for spotting a double-click. Windows
@@ -242,20 +309,28 @@ pub struct Workspace {
     /// `terminal.modes` for the active pane, when the Terminal page asks.
     pane_modes: Option<serde_json::Value>,
     /// `hosts.list`: the other Rex servers this one can reach.
-    hosts: Option<serde_json::Value>,
+    hosts: ServerCache<serde_json::Value>,
     /// The jump list, when it is open.
     palette: Option<Palette>,
+    menu: Option<menu::Menu>,
     /// Whether this client has told the server its label yet.
-    named_client: bool,
+    named_client: HashSet<String>,
     /// `server.whoami` and `server.status`, fetched when Connection is opened.
-    server_info: Option<serde_json::Value>,
+    server_info: ServerCache<serde_json::Value>,
     /// `client.keymap`: the bindings Rex itself would apply, from init.lua.
-    keymap: Option<serde_json::Value>,
+    keymap: ServerCache<serde_json::Value>,
+    keybindings: ServerCache<Arc<std::sync::Mutex<KeyBindings>>>,
+    configured_actions: Vec<(String, serde_json::Value)>,
+    keymap_dirty: HashSet<String>,
+    keymap_pending: HashSet<String>,
+    creators: ServerCache<serde_json::Value>,
+    script: Option<ScriptDraft>,
+    script_diagnostics: ServerCache<Vec<String>>,
+    client_requests: automation::ClientRequests,
     /// Panes this shell parked: alive, out of every window, in this list.
-    parked: Vec<(String, String)>,
-    /// Floating layers this shell tucked away. Rex keeps the state, but
-    /// shrew-core's snapshot drops it, so the shell remembers its own.
-    minimized: std::collections::HashSet<String>,
+    parked: Vec<ParkedBlock>,
+    parked_key: Option<(String, String)>,
+    block_details: HashMap<(String, String, String), serde_json::Value>,
     notices: Arc<std::sync::Mutex<Vec<Notification>>>,
     toasts: std::collections::VecDeque<Toast>,
     /// A press on the title bar with the window not moved yet. The drag only
@@ -267,6 +342,10 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    pub(super) fn input_overlay_open(&self) -> bool {
+        self.prompt.is_some() || self.palette.is_some() || self.menu.is_some()
+    }
+
     pub fn new(
         engine: Arc<Engine>,
         wake: Receiver<()>,
@@ -296,6 +375,7 @@ impl Workspace {
             window_id: None,
             active_block: None,
             pending_focus: None,
+            navigation: None,
             terminals: HashMap::new(),
             styled: false,
             show_settings: false,
@@ -303,22 +383,33 @@ impl Workspace {
             focus: cx.focus_handle(),
             pull: None,
             settled: None,
-            float_rects: std::collections::HashMap::new(),
+            float_rects: FloatHints::default(),
+            local_floats: model::LocalFloats::default(),
             prefix: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_pick: None,
+            pending_tool: None,
             tinted: None,
             area_geometry: Arc::default(),
             divider: None,
             prompt: None,
             pane_modes: None,
-            hosts: None,
+            hosts: ServerCache::default(),
             palette: None,
+            menu: None,
             last_geometry: None,
-            named_client: false,
-            server_info: None,
-            keymap: None,
+            named_client: HashSet::new(),
+            server_info: ServerCache::default(),
+            keymap: ServerCache::default(),
+            keybindings: ServerCache::default(),
+            configured_actions: Vec::new(),
+            keymap_dirty: HashSet::new(),
+            keymap_pending: HashSet::new(),
+            creators: ServerCache::default(),
+            script: None,
+            script_diagnostics: ServerCache::default(),
+            client_requests: automation::ClientRequests::default(),
             parked: Vec::new(),
-            minimized: std::collections::HashSet::new(),
+            parked_key: None,
+            block_details: HashMap::new(),
             notices,
             toasts: std::collections::VecDeque::new(),
             title_press: None,
@@ -380,31 +471,147 @@ impl Workspace {
     fn jump_to_block(&mut self, server: &str, session: &str, block: &str, cx: &mut Context<Self>) {
         let window = self
             .state
-            .servers
-            .iter()
-            .flat_map(|server| server.sessions.iter())
-            .find(|s| s.id == session)
+            .server(server)
+            .and_then(|server| server.sessions.iter().find(|s| s.id == session))
             .and_then(|s| {
                 s.windows
                     .iter()
                     .find(|w| w.blocks.iter().any(|b| b.id == block))
             })
             .map(|w| w.id.clone());
-        self.server_id = Some(server.to_owned());
-        self.session_id = Some(session.to_owned());
         if let Some(window) = window {
-            self.window_id = Some(window);
+            self.navigate(
+                server.to_owned(),
+                session.to_owned(),
+                window,
+                Some(block.to_owned()),
+                cx,
+            );
         }
-        self.active_block = Some(block.to_owned());
-        self.pending_focus = Some(block.to_owned());
+    }
+
+    /// Publish the complete destination before reload can adopt the old server focus.
+    fn navigate(
+        &mut self,
+        server: String,
+        session: String,
+        window: String,
+        block: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.server_id = Some(server.clone());
+        self.session_id = Some(session.clone());
+        self.window_id = Some(window.clone());
+        let destination = self
+            .state
+            .server(&server)
+            .and_then(|s| s.sessions.iter().find(|s| s.id == session))
+            .and_then(|s| s.windows.iter().find(|w| w.id == window));
+        let initial = destination.and_then(|w| {
+            visible_focus(&w.blocks, block.as_deref(), w.focused_block_id.as_deref())
+        });
+        self.active_block = initial.clone();
+        self.pending_focus = initial;
         self.show_settings = false;
-        self.reload(cx);
+        self.navigation = Some((server.clone(), session.clone(), window.clone()));
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                engine
+                    .shrew()
+                    .focus_window(&server, &session, &window)
+                    .await?;
+                if let Some(block) = &block {
+                    engine.shrew().focus_block(&server, &session, block).await?;
+                }
+                engine
+                    .call_server(&server, "session.view", json!({"session_id": session}))
+                    .await
+            }
+            .await;
+            this.update(cx, |me, cx| {
+                if me.navigation.as_ref()
+                    != Some(&(server.clone(), session.clone(), window.clone()))
+                    || me.server_id.as_ref() != Some(&server)
+                    || me.session_id.as_ref() != Some(&session)
+                    || me.window_id.as_ref() != Some(&window)
+                {
+                    return;
+                }
+                me.reload(cx);
+                match result {
+                    Ok(view) => {
+                        if view.get("active_window_id").and_then(|v| v.as_str())
+                            == Some(window.as_str())
+                        {
+                            me.adopt_focus(&view);
+                            me.active_block =
+                                visible_focus(&me.blocks(), me.active_block.as_deref(), None);
+                            me.pending_focus = me.active_block.clone();
+                        }
+                    }
+                    Err(e) => me.rpc_error("Focus destination", e, cx),
+                }
+                me.navigation = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn rpc_error(
+        &mut self,
+        operation: &str,
+        error: impl std::fmt::Display,
+        cx: &mut Context<Self>,
+    ) {
+        eprintln!("flex: {operation}: {error}");
+        self.toasts.push_back(Toast {
+            kind: shrew_core::NotificationKind::AgentError,
+            title: operation.to_owned(),
+            body: error.to_string(),
+            server_id: String::new(),
+            session_id: String::new(),
+            block_id: String::new(),
+            until: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        });
+        while self.toasts.len() > 3 {
+            self.toasts.pop_front();
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(10))
+                .await;
+            this.update(cx, |me, cx| {
+                me.toasts
+                    .retain(|toast| toast.until > std::time::Instant::now());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Re-read the engine's state and drop selections and terminals that went away.
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.absorb_notices(cx);
         self.state = self.engine.state();
+        self.local_floats.prune(&self.state);
+        for event in self.engine.take_cache_invalidations() {
+            match event.kind.as_str() {
+                "keymap_changed" => {
+                    self.keymap_dirty.insert(event.server_id);
+                }
+                "hosts_changed" => {
+                    self.hosts.remove(&event.server_id);
+                }
+                "client_setup_failed" => self.rpc_error("Client setup", event.payload, cx),
+                _ => {}
+            }
+        }
 
         if self
             .state
@@ -436,34 +643,75 @@ impl Workspace {
             .find(|s| Some(&s.id) == self.session_id.as_ref())
             .and_then(|s| s.active_window_id)
         {
-            if windows.iter().any(|w| w.id == active) {
+            if self
+                .navigation
+                .as_ref()
+                .is_some_and(|(server, session, target)| {
+                    self.server_id.as_ref() != Some(server)
+                        || self.session_id.as_ref() != Some(session)
+                        || self.window_id.as_ref() != Some(target)
+                })
+            {
+                self.navigation = None;
+            }
+            if self.navigation.is_none() && windows.iter().any(|w| w.id == active) {
                 self.window_id = Some(active);
             }
         }
-        if self.hosts.is_none() && self.session_id.is_some() {
+        if self.hosts.get(self.server_id.as_deref()).is_none() && self.session_id.is_some() {
             self.refresh_hosts(cx);
         }
-        if !self.named_client && self.session_id.is_some() && self.address().is_some() {
-            self.named_client = true;
+        if self.keymap.get(self.server_id.as_deref()).is_none()
+            || self
+                .server_id
+                .as_ref()
+                .is_some_and(|s| self.keymap_dirty.contains(s))
+        {
+            self.refresh_keymap(cx);
+        }
+        let parked_key = self.server_id.clone().zip(self.session_id.clone());
+        if parked_key != self.parked_key {
+            self.parked_key = parked_key;
+            self.parked.clear();
+            self.pane_modes = None;
+            self.refresh_parked(cx);
+            if self.keymap.get(self.server_id.as_deref()).is_none() {
+                self.refresh_keymap(cx);
+            }
+            if self.show_settings && self.page == Page::Connection {
+                self.refresh_info(cx);
+            }
+            if self.creators.get(self.server_id.as_deref()).is_none() {
+                self.refresh_creators(cx);
+            }
+        }
+        if self.session_id.is_some()
+            && self
+                .server_id
+                .as_ref()
+                .is_some_and(|id| !self.named_client.contains(id))
+        {
+            self.named_client.insert(self.server_id.clone().unwrap());
             let label = format!("flex on {}", self.device());
             self.name_client(label, cx);
         }
+        let tool_waiting = self.reconcile_tool(cx);
         let blocks = self.blocks();
-        if !blocks
+        let focused = windows
             .iter()
-            .any(|b| Some(&b.id) == self.active_block.as_ref())
-        {
-            self.active_block = blocks
+            .find(|w| Some(&w.id) == self.window_id.as_ref())
+            .and_then(|w| w.focused_block_id.as_deref());
+        let active = visible_focus(&blocks, self.active_block.as_deref(), focused);
+        if !tool_waiting && self.active_block != active {
+            self.active_block = active.clone();
+            self.pending_focus = active;
+        }
+        if self.pending_focus.as_ref().is_some_and(|id| {
+            blocks
                 .iter()
-                .find(|b| {
-                    Some(&b.id)
-                        == windows
-                            .iter()
-                            .find(|w| Some(&w.id) == self.window_id.as_ref())
-                            .and_then(|w| w.focused_block_id.as_ref())
-                })
-                .or_else(|| blocks.first())
-                .map(|b| b.id.clone());
+                .any(|b| b.id == *id && b.layer_state == "minimized")
+        }) {
+            self.pending_focus = self.active_block.clone();
         }
 
         // Drop only blocks the engine no longer has anywhere. Pruning to the
@@ -478,9 +726,7 @@ impl Workspace {
             .flat_map(|w| &w.blocks)
             .map(|b| b.id.clone())
             .collect();
-        // The picker is read before pruning: a pane that closed on exit is gone
-        // from the state, but its text is still in our terminal.
-        self.settle_pick(&live, cx);
+        // Tool reconciliation reads the picker text before terminals are pruned.
         self.terminals.retain(|id, _| live.contains(id));
 
         // A dropped pane stops being drawn from our own copy as soon as the
@@ -513,16 +759,34 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    fn local_float_key(&self, block: &str) -> Option<model::LocalFloatKey> {
+        Some((self.server_id.clone()?, self.session_id.clone()?, self.window_id.clone()?, block.to_owned()))
+    }
+
+    fn is_local_float(&self, block: &str) -> bool {
+        self.local_float_key(block).is_some_and(|key| self.local_floats.0.contains_key(&key))
+    }
+
     fn blocks(&self) -> Vec<BlockState> {
-        self.windows()
+        let mut blocks = self.windows()
             .into_iter()
             .find(|w| Some(&w.id) == self.window_id.as_ref())
             .map(|w| w.blocks)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for block in &mut blocks {
+            if let Some(key) = self.local_float_key(&block.id) {
+                self.local_floats.present(&key, block);
+            }
+        }
+        blocks
     }
 
     fn active(&self) -> Option<BlockState> {
-        let blocks = self.blocks();
+        let blocks: Vec<_> = self
+            .blocks()
+            .into_iter()
+            .filter(|b| b.layer_state != "minimized")
+            .collect();
         blocks
             .iter()
             .find(|b| Some(&b.id) == self.active_block.as_ref())
@@ -551,6 +815,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<TerminalView> {
         if let Some(view) = self.terminals.get(block_id) {
+            if let Some(bindings) = self.keybindings.get(Some(server_id)) {
+                view.update(cx, |terminal, _| terminal.set_keybindings(bindings.clone()));
+            }
             return view.clone();
         }
         let engine = self.engine.clone();
@@ -575,6 +842,25 @@ impl Workspace {
                 cx,
             )
         });
+        if let Some(bindings) = self.keybindings.get(Some(server_id)) {
+            view.update(cx, |terminal, _| terminal.set_keybindings(bindings.clone()));
+        }
+        let source_server = server_id.to_owned();
+        let source_session = session_id.to_owned();
+        cx.subscribe(&view, move |this, _, event: &TerminalEvent, cx| {
+            if this.server_id.as_ref() != Some(&source_server)
+                || this.session_id.as_ref() != Some(&source_session)
+            {
+                return;
+            }
+            match event {
+                TerminalEvent::ConfiguredAction { name, args } => {
+                    this.configured_actions.push((name.clone(), args.clone()))
+                }
+            }
+            cx.notify();
+        })
+        .detach();
         self.terminals.insert(block_id.to_owned(), view.clone());
         view
     }
@@ -600,13 +886,53 @@ impl Workspace {
     /// it, because the page unmounts every terminal while it is up.
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_settings = false;
-        if let Some(view) = self
+        if self.input_overlay_open() {
+            window.focus(&self.focus);
+        } else if let Some(view) = self
             .active()
+            .filter(|block| block.layer_state != "minimized" && block.is_terminal())
             .and_then(|block| self.terminals.get(&block.id))
         {
             window.focus(&view.read(cx).handle());
+        } else {
+            window.focus(&self.focus);
         }
         cx.notify();
+    }
+
+    pub(crate) fn run_configured_action(
+        &mut self,
+        name: &str,
+        args: serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(action) = shortcuts::configured_action(name, &args) {
+            self.run(action, window, cx);
+            return;
+        }
+        let Some(server) = self.server_id.clone() else {
+            return;
+        };
+        let mut payload = json!({"action": name, "origin": "key"});
+        if let Some(session) = &self.session_id {
+            payload["session_id"] = json!(session);
+        }
+        if let Some(block) = &self.active_block {
+            payload["block_id"] = json!(block);
+        }
+        if !args.is_null() {
+            payload["args"] = args;
+        }
+        payload["servers"] = self.client_action_servers(&server);
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = engine.call_server(&server, "client.action", payload).await {
+                this.update(cx, |me, cx| me.rpc_error("client.action", e, cx))
+                    .ok();
+            }
+        })
+        .detach();
     }
 
     // ---- actions -----------------------------------------------------------
@@ -620,8 +946,8 @@ impl Workspace {
             return;
         }
         match action {
-            Action::SplitRight => self.split(true, cx),
-            Action::SplitDown => self.split(false, cx),
+            Action::SplitRight => self.split(false, cx),
+            Action::SplitDown => self.split(true, cx),
             Action::ClosePane => self.close_pane(cx),
             Action::ToggleFloat => self.toggle_float(cx),
             Action::NextPane => self.step_focus("session.focus_next_pane", cx),
@@ -828,6 +1154,11 @@ impl Workspace {
                 .and_then(|id| id.as_str())
                 .map(str::to_owned);
             this.update(cx, |me, cx| {
+                if me.address().as_deref() != Some(address.as_str())
+                    || me.session_id.as_ref() != Some(&session)
+                {
+                    return;
+                }
                 me.active_block = Some(to.clone());
                 me.pending_focus = Some(to);
                 if let Some(window) = to_window {
@@ -884,6 +1215,11 @@ impl Workspace {
                 return;
             };
             this.update(cx, |me, cx| {
+                if me.address().as_deref() != Some(address.as_str())
+                    || me.session_id.as_ref() != Some(&session)
+                {
+                    return;
+                }
                 me.adopt_focus(&view);
                 cx.notify();
             })
@@ -953,10 +1289,12 @@ impl Workspace {
             what,
             label: label.to_owned(),
             value: String::new(),
+            scope: None,
         });
         // The pane under the overlay would keep the keyboard otherwise, and
         // typing a name would also type it into the shell.
         window.focus(&self.focus);
+        window.refresh();
     }
 
     /// Type into the prompt. Returns true when the key belonged to it.
@@ -964,6 +1302,19 @@ impl Workspace {
         let Some(prompt) = &mut self.prompt else {
             return false;
         };
+        let modifiers = &event.keystroke.modifiers;
+        if (modifiers.control || modifiers.platform)
+            && event.keystroke.key.eq_ignore_ascii_case("v")
+        {
+            if let Some(text) = crate::win32::clipboard_text() {
+                prompt.paste(&text);
+            }
+            cx.notify();
+            return true;
+        }
+        if modifiers.control || modifiers.platform || modifiers.alt {
+            return true;
+        }
         match event.keystroke.key.as_str() {
             // Space is a named key, so it never comes with a key_char.
             "space" if prompt.what.wants_text() => {
@@ -1010,8 +1361,189 @@ impl Workspace {
         }
     }
 
+    fn refresh_creators(&mut self, cx: &mut Context<Self>) {
+        let Some(server) = self.server_id.clone() else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .call_server(&server, "block_creator.list", json!({}))
+                .await;
+            this.update(cx, |me, cx| {
+                match result {
+                    Ok(value) => {
+                        me.creators.insert(server, value);
+                    }
+                    Err(e) => me.rpc_error("block_creator.list", e, cx),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn choose_script(&mut self, cx: &mut Context<Self>) {
+        let options = gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a Lua script".into()),
+        };
+        cx.spawn(async move |this, cx| {
+            let Ok(receiver) = cx.update(|cx| cx.prompt_for_paths(options)) else {
+                return;
+            };
+            let picked = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(path) = picked else { return };
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::read(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| script_draft(&path, &bytes))
+                })
+                .await;
+            match result {
+                Ok(script) => this
+                    .update(cx, |me, cx| {
+                        me.script = Some(script);
+                        cx.notify();
+                    })
+                    .ok(),
+                Err(e) => this
+                    .update(cx, |me, cx| me.rpc_error("Read script", e, cx))
+                    .ok(),
+            };
+        })
+        .detach();
+    }
+
+    fn set_script(&mut self, unload: bool, cx: &mut Context<Self>) {
+        let Some(server) = self.server_id.clone() else {
+            return;
+        };
+        if !unload && self.script.is_none() {
+            self.rpc_error("Load script", "Choose a .lua file first", cx);
+            return;
+        }
+        let payload = script_request(if unload { None } else { self.script.as_ref() });
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            match engine
+                .call_server(&server, "client.set_script", payload)
+                .await
+            {
+                Ok(reply) => this
+                    .update(cx, |me, cx| {
+                        let mut diagnostics: Vec<String> = reply
+                            .get("diagnostics")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().map(|d| d.to_string()).collect())
+                            .unwrap_or_default();
+                        if diagnostics.is_empty() {
+                            diagnostics.push(if unload {
+                                "Scripts unloaded".into()
+                            } else {
+                                "Script loaded".into()
+                            });
+                        }
+                        me.script_diagnostics.insert(server.clone(), diagnostics);
+                        me.keymap_dirty.insert(server.clone());
+                        me.refresh_keymap_for(server.clone(), cx);
+                        cx.notify();
+                    })
+                    .ok(),
+                Err(e) => this
+                    .update(cx, |me, cx| {
+                        me.rpc_error("client.set_script", e, cx);
+                        me.refresh_keymap_for(server, cx);
+                    })
+                    .ok(),
+            };
+        })
+        .detach();
+    }
+
+    fn run_client_action(
+        &mut self,
+        server: String,
+        session: String,
+        block: Option<String>,
+        name: String,
+        args: Option<serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = self.engine.clone();
+        let servers = self.client_action_servers(&server);
+        cx.spawn(async move |this, cx| {
+            let mut payload = action_request(&session, block.as_deref(), &name, args);
+            payload["servers"] = servers;
+            if let Err(e) = engine.call_server(&server, "client.action", payload).await {
+                this.update(cx, |me, cx| me.rpc_error("client.action", e, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn create_block(
+        &mut self,
+        server: String,
+        session: String,
+        anchor: Option<String>,
+        flavor: String,
+        options_text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let options = match json_object(&options_text) {
+            Ok(value) => value,
+            Err(e) => {
+                self.rpc_error("Create block", e, cx);
+                return;
+            }
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let (method, payload) = creator_request(&session, anchor.as_deref(), &flavor, options);
+            match engine.call_server(&server, method, payload).await {
+                Ok(_) => this.update(cx, |me, cx| me.reload(cx)).ok(),
+                Err(e) => this
+                    .update(cx, |me, cx| me.rpc_error("Create block", e, cx))
+                    .ok(),
+            };
+        })
+        .detach();
+    }
+
     fn commit_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
+        if prompt
+            .scope
+            .as_ref()
+            .is_some_and(|target| !target.valid(&self.engine.state()))
+        {
+            self.rpc_error(
+                "Menu action",
+                "The original target is no longer available",
+                cx,
+            );
+            return;
+        }
         let value = prompt.value.trim().to_owned();
+        if matches!(
+            &prompt.what,
+            Ask::CreateBlock { .. } | Ask::RunAction { .. }
+        ) {
+            if let Err(error) = json_object(&value) {
+                self.rpc_error("JSON input", error, cx);
+                self.prompt = Some(prompt);
+                return;
+            }
+        }
         if prompt.what.wants_text() && value.is_empty() {
             cx.notify();
             return;
@@ -1026,7 +1558,8 @@ impl Workspace {
                 };
                 let name = words.join(" ");
                 if let Err(e) = self.engine.add_server(&name, address) {
-                    eprintln!("flex: add_server: {e}");
+                    self.rpc_error("Add server", e, cx);
+                    return;
                 }
                 self.state = self.engine.state();
                 self.server_id = self
@@ -1053,17 +1586,156 @@ impl Workspace {
             _ => {}
         }
 
+        if let Ask::CreateBlock {
+            server,
+            session,
+            anchor,
+            flavor,
+            ..
+        } = &prompt.what
+        {
+            self.create_block(
+                server.clone(),
+                session.clone(),
+                anchor.clone(),
+                flavor.clone(),
+                value,
+                cx,
+            );
+            return;
+        }
+        if let Ask::RunAction {
+            server,
+            session,
+            block,
+            name,
+            ..
+        } = &prompt.what
+        {
+            let Ok(args) = json_object(&value) else {
+                self.rpc_error("Run action", "Arguments must be a JSON object", cx);
+                return;
+            };
+            self.run_client_action(
+                server.clone(),
+                session.clone(),
+                block.clone(),
+                name.clone(),
+                Some(args),
+                cx,
+            );
+            return;
+        }
+        if let Ask::CloseLayer(server, session, layer) = &prompt.what {
+            let Some(address) = self.state.server(server).map(|s| s.address.clone()) else {
+                return;
+            };
+            let session = session.clone();
+            let engine = self.engine.clone();
+            let block = layer.clone();
+            cx.spawn(async move |this, cx| {
+                let view = match engine
+                    .call(&address, "session.view", json!({"session_id": session}))
+                    .await
+                {
+                    Ok(view) => view,
+                    Err(e) => {
+                        this.update(cx, |me, cx| me.rpc_error("session.view", e, cx))
+                            .ok();
+                        return;
+                    }
+                };
+                let Some(layer) = floating_layer_id(&view, &block) else {
+                    this.update(cx, |me, cx| {
+                        me.rpc_error("Close layer", "Floating layer not found", cx)
+                    })
+                    .ok();
+                    return;
+                };
+                match engine
+                    .call(
+                        &address,
+                        "session.close_layer",
+                        json!({"session_id": session, "layer_id": layer}),
+                    )
+                    .await
+                {
+                    Ok(_) => this
+                        .update(cx, |me, cx| {
+                            me.reload(cx);
+                        })
+                        .ok(),
+                    Err(e) => this
+                        .update(cx, |me, cx| me.rpc_error("session.close_layer", e, cx))
+                        .ok(),
+                };
+            })
+            .detach();
+            return;
+        }
+
         // Everything else is a Rex call. A session id is not a precondition:
         // creating the first session has to work when there is none.
-        let Some(address) = self.address() else {
-            return;
-        };
+        let address = prompt
+            .scope
+            .as_ref()
+            .map(|target| target.address.clone())
+            .or_else(|| match &prompt.what {
+                Ask::DeleteSession(server, ..) | Ask::RenameSession(server, ..) => {
+                    self.state.server(server).map(|s| s.address.clone())
+                }
+                _ => self.address(),
+            });
+        let Some(address) = address else { return };
+        let source_server = prompt
+            .scope
+            .as_ref()
+            .map(|target| target.server.clone())
+            .or_else(|| {
+                self.state
+                    .servers
+                    .iter()
+                    .find(|s| s.address == address)
+                    .map(|s| s.id.clone())
+            });
         let session = self.session_id.clone();
         let fresh_session = matches!(&prompt.what, Ask::NewSession(..));
         let touched_hosts = matches!(&prompt.what, Ask::NewHost | Ask::DeleteHost(..));
-        let deleted_session = matches!(&prompt.what, Ask::DeleteSession(..));
+        let deleted_session = matches!(&prompt.what, Ask::DeleteSession(_, id, _) if self.session_id.as_ref() == Some(id));
         let engine = self.engine.clone();
         let (target, method, payload) = match &prompt.what {
+            Ask::RenameSession(server, id, _) => {
+                let Some(address) = self.state.server(server).map(|s| s.address.clone()) else {
+                    return;
+                };
+                (
+                    address,
+                    "session.set_label",
+                    json!({"session_id": id, "label": value}),
+                )
+            }
+            Ask::RenameTailscale => (
+                address.clone(),
+                "server.tailscale.rename",
+                json!({"hostname": value}),
+            ),
+            Ask::EditServer(id, _, _) => {
+                let mut words = value.split_whitespace();
+                let Some(new_address) = words.next_back() else {
+                    return;
+                };
+                let new_name = words.collect::<Vec<_>>().join(" ");
+                if let Err(e) = self
+                    .engine
+                    .shrew()
+                    .update_server(id, &new_name, new_address)
+                {
+                    self.rpc_error("Update server", e, cx);
+                }
+                self.hosts.remove(id);
+                self.reload(cx);
+                return;
+            }
             Ask::RenameTab => {
                 let (Some(window_id), Some(session)) = (self.window_id.clone(), session) else {
                     return;
@@ -1087,7 +1759,7 @@ impl Workspace {
             Ask::NewSession(machine) => {
                 (machine.clone(), "session.create", json!({"label": value}))
             }
-            Ask::DeleteSession(id, _) => (
+            Ask::DeleteSession(_, id, _) => (
                 address.clone(),
                 "session.destroy",
                 json!({"session_id": id}),
@@ -1111,12 +1783,17 @@ impl Workspace {
                 )
             }
             Ask::DeleteHost(id, _) => (address.clone(), "hosts.remove", json!({"id": id})),
-            Ask::AddServer | Ask::DeleteServer(..) => return,
+            Ask::AddServer
+            | Ask::DeleteServer(..)
+            | Ask::CloseLayer(..)
+            | Ask::CreateBlock { .. }
+            | Ask::RunAction { .. } => return,
         };
         cx.spawn(async move |this, cx| {
             let reply = engine.call(&target, method, payload).await;
             if let Err(e) = &reply {
-                eprintln!("flex: {method}: {e}");
+                this.update(cx, |me, cx| me.rpc_error(method, e, cx)).ok();
+                return;
             }
             let created = reply.ok().and_then(|reply| {
                 reply
@@ -1127,8 +1804,12 @@ impl Workspace {
             });
             this.update(cx, |me, cx| {
                 if touched_hosts {
-                    me.hosts = None;
-                    me.refresh_hosts(cx);
+                    if let Some(server) = &source_server {
+                        me.hosts.remove(server);
+                    }
+                    if me.server_id == source_server {
+                        me.refresh_hosts(cx);
+                    }
                 }
                 if fresh_session {
                     if let Some(created) = created {
@@ -1148,13 +1829,35 @@ impl Workspace {
                         me.new_tab(cx);
                     }
                 }
-                if deleted_session {
+                if deleted_session && me.server_id == source_server {
                     me.window_id = None;
                     me.active_block = None;
                 }
                 me.reload(cx);
             })
             .ok();
+        })
+        .detach();
+    }
+
+    fn move_session(&mut self, server: String, session: String, step: i32, cx: &mut Context<Self>) {
+        let Some(server_state) = self.state.server(&server) else {
+            return;
+        };
+        let ids: Vec<String> = server_state.sessions.iter().map(|s| s.id.clone()).collect();
+        let Some(before) = move_before(&ids, &session, step) else {
+            return;
+        };
+        let address = server_state.address.clone();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({"session_id": session, "before_session_id": before});
+            if let Err(e) = engine.call(&address, "session.move", payload).await {
+                this.update(cx, |me, cx| me.rpc_error("session.move", e, cx))
+                    .ok();
+            } else {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            }
         })
         .detach();
     }
@@ -1199,79 +1902,113 @@ impl Workspace {
         .detach();
     }
 
-    /// Tuck the floating layer under this pane away, or bring it back.
-    ///
-    /// Rex would move the *layer* to `minimized`, but that method needs control
-    /// API revision 9 and shrew-core (pinned) speaks 8, so the shell hides it
-    /// itself and only tells the server when the server can hear it. Another
-    /// client keeps seeing the float, which is the cost of the old protocol.
+    /// Commit layer state remotely before changing what this client shows.
     fn toggle_minimized(&mut self, cx: &mut Context<Self>) {
-        let Some(block) = self.active_block.clone() else {
-            return;
-        };
-        let restore = self.minimized.contains(&block);
-        if restore {
-            self.minimized.remove(&block);
-        } else {
-            self.minimized.insert(block.clone());
-            // Send focus somewhere visible, or the keyboard goes to a hidden pane.
-            if let Some(next) = self
-                .blocks()
+        let (Some(address), Some(session), Some(block)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.blocks()
                 .into_iter()
-                .find(|b| !self.minimized.contains(&b.id))
-            {
-                self.active_block = Some(next.id.clone());
-                self.pending_focus = Some(next.id);
-            }
-        }
-        cx.notify();
-
-        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+                .find(|b| self.active_block.as_ref() == Some(&b.id)),
+        ) else {
             return;
         };
-        let state = if restore { "normal" } else { "minimized" };
+        if !block.floating {
+            return;
+        }
+        if let Some(local) = self.local_float_key(&block.id).and_then(|key| self.local_floats.0.get_mut(&key)) {
+            local.minimized = !local.minimized;
+            self.pending_focus = if local.minimized { None } else { Some(block.id.clone()) };
+            cx.notify();
+            return;
+        }
+        let restore = block.layer_state == "minimized";
+        let block = block.id;
         let engine = self.engine.clone();
-        cx.spawn(async move |_, _| {
-            // Rex wants a layer id, and this shell's snapshot has only blocks.
-            let Ok(view) = engine
-                .call(&address, "session.view", json!({"session_id": session}))
-                .await
-            else {
-                return;
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let view = engine.call(&address, "session.view", json!({"session_id": session})).await?;
+                let layer = floating_layer_id(&view, &block).ok_or_else(|| flex_engine::CoreError::Server("Floating layer not found".into()))?;
+                engine.call(&address, "session.set_layer_state", json!({"session_id": session,"layer_id": layer,"state": if restore { "normal" } else { "minimized" },"focus": restore})).await
+            }.await;
+            this.update(cx, |me, cx| {
+                match result {
+                    Ok(_) => {
+                        if !restore && me.active_block.as_deref() == Some(block.as_str()) {
+                            me.active_block = me.blocks().iter().find(|b| b.layer_state != "minimized" && b.id != block).map(|b| b.id.clone());
+                            me.pending_focus = me.active_block.clone();
+                        }
+                        cx.notify();
+                    }
+                    Err(e) => me.rpc_error("session.set_layer_state", e, cx),
+                }
+            }).ok();
+        }).detach();
+    }
+
+    fn connection_call(
+        &mut self,
+        method: &'static str,
+        payload: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(address), Some(server)) = (self.address(), self.server_id.clone()) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            match engine.call(&address, method, payload).await {
+                Ok(reply) => this
+                    .update(cx, |me, cx| {
+                        if let Some(diagnostics) = reply
+                            .get("diagnostics")
+                            .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+                        {
+                            me.rpc_error(method, diagnostics, cx);
+                        }
+                        me.server_info.remove(&server);
+                        me.keymap_dirty.insert(server.clone());
+                        if me.server_id.as_ref() == Some(&server) {
+                            me.refresh_info(cx);
+                            me.refresh_keymap(cx);
+                            me.refresh_hosts(cx);
+                        }
+                    })
+                    .ok(),
+                Err(e) => this.update(cx, |me, cx| me.rpc_error(method, e, cx)).ok(),
             };
-            let Some(layer) = find_layer(&view, &block) else {
-                return;
-            };
-            let payload = json!({
-                "session_id": session,
-                "layer_id": layer,
-                "state": state,
-                "focus": restore,
-            });
-            if let Err(e) = engine
-                .call(&address, "session.set_layer_state", payload)
-                .await
-            {
-                eprintln!("flex: set_layer_state: {e}");
-            }
         })
         .detach();
     }
 
     /// Ask the server who we are and what it is running, for the Connection page.
     fn refresh_info(&mut self, cx: &mut Context<Self>) {
-        let Some(address) = self.address() else {
+        let (Some(address), Some(server)) = (self.address(), self.server_id.clone()) else {
             return;
         };
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
             let whoami = engine.call(&address, "server.whoami", json!({})).await;
             let status = engine.call(&address, "server.status", json!({})).await;
+            let clients = engine.call(&address, "client.list", json!({})).await;
             this.update(cx, |me, cx| {
-                me.server_info = Some(json!({
-                    "whoami": whoami.ok(),
-                    "status": status.ok(),
-                }));
+                for (operation, reply) in [
+                    ("server.whoami", &whoami),
+                    ("server.status", &status),
+                    ("client.list", &clients),
+                ] {
+                    if let Err(e) = reply {
+                        me.rpc_error(operation, e, cx);
+                    }
+                }
+                me.server_info.insert(
+                    server,
+                    json!({
+                        "whoami": whoami.ok(),
+                        "status": status.ok(),
+                        "clients": clients.ok(),
+                    }),
+                );
                 cx.notify();
             })
             .ok();
@@ -1282,19 +2019,71 @@ impl Workspace {
     /// Ask the server for the keymap it would apply, which includes whatever
     /// the user wrote in init.lua.
     fn refresh_keymap(&mut self, cx: &mut Context<Self>) {
-        let Some(address) = self.address() else {
+        let Some(server) = self.server_id.clone() else {
             return;
         };
+        self.refresh_keymap_for(server, cx);
+    }
+
+    fn refresh_keymap_for(&mut self, server: String, cx: &mut Context<Self>) {
+        if !self
+            .state
+            .server(&server)
+            .is_some_and(|s| s.connectivity == Connectivity::Online)
+        {
+            return;
+        }
+        if !self.keymap_pending.insert(server.clone()) {
+            return;
+        }
+        self.keymap_dirty.remove(&server);
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
-            let keymap = engine.call(&address, "client.keymap", json!({})).await;
+            let keymap = engine
+                .call_server(&server, "client.keymap", shortcuts::keymap_request())
+                .await;
             this.update(cx, |me, cx| {
-                me.keymap = keymap.ok();
+                me.keymap_pending.remove(&server);
+                if me.keymap_dirty.contains(&server) {
+                    me.refresh_keymap_for(server.clone(), cx);
+                    return;
+                }
+                match keymap {
+                    Ok(value) => {
+                        if keymap_resolution_changed(me.keymap.get(Some(&server)), &value) {
+                            let bindings = me
+                                .keybindings
+                                .get(Some(&server))
+                                .cloned()
+                                .unwrap_or_default();
+                            if let Ok(mut map) = bindings.lock() {
+                                map.update(value.clone());
+                            }
+                            me.keybindings.insert(server.clone(), bindings);
+                        }
+                        if let Some(palette) = &mut me.palette {
+                            if palette.origin.0 == server {
+                                palette.actions = palette_actions(
+                                    &value,
+                                    &palette.origin.0,
+                                    &palette.origin.1,
+                                    palette.origin.2.clone(),
+                                );
+                            }
+                        }
+                        me.keymap.insert(server.clone(), value);
+                    }
+                    Err(e) => me.rpc_error("refresh_keymap", e, cx),
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn tailscale_call(&mut self, method: &'static str, cx: &mut Context<Self>) {
+        self.connection_call(method, json!({}), cx);
     }
 
     /// Turn on the server's built-in Tailscale, or ask it for a sign-in link.
@@ -1320,7 +2109,9 @@ impl Workspace {
                         crate::win32::open_url(url);
                     }
                 }
-                Err(e) => eprintln!("flex: {method}: {e}"),
+                Err(e) => {
+                    this.update(cx, |me, cx| me.rpc_error(method, e, cx)).ok();
+                }
             }
             this.update(cx, |me, cx| me.refresh_info(cx)).ok();
         })
@@ -1333,10 +2124,14 @@ impl Workspace {
             return;
         };
         let engine = self.engine.clone();
-        cx.spawn(async move |_, _| {
-            let _ = engine
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = engine
                 .call(&address, "client.set_label", json!({"label": label}))
-                .await;
+                .await
+            {
+                this.update(cx, |me, cx| me.rpc_error("client.set_label", e, cx))
+                    .ok();
+            }
         })
         .detach();
     }
@@ -1358,6 +2153,12 @@ impl Workspace {
                 .call(&address, "com.superlogical.terminal.modes", payload)
                 .await;
             this.update(cx, |me, cx| {
+                if me.address().as_deref() != Some(address.as_str())
+                    || me.session_id.as_ref() != Some(&session)
+                    || me.active_block.as_ref() != Some(&block)
+                {
+                    return;
+                }
                 me.pane_modes = modes.ok();
                 cx.notify();
             })
@@ -1368,14 +2169,34 @@ impl Workspace {
 
     /// Ask the server which other servers it can reach.
     fn refresh_hosts(&mut self, cx: &mut Context<Self>) {
-        let Some(address) = self.address() else {
+        let (Some(address), Some(server)) = (self.address(), self.server_id.clone()) else {
             return;
         };
+        self.refresh_hosts_for(address, server, cx);
+    }
+
+    fn refresh_hosts_for(&mut self, address: String, server: String, cx: &mut Context<Self>) {
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
             let hosts = engine.call(&address, "hosts.list", json!({})).await;
             this.update(cx, |me, cx| {
-                me.hosts = hosts.ok();
+                if !me
+                    .state
+                    .server(&server)
+                    .is_some_and(|s| s.address == address)
+                {
+                    return;
+                }
+                match hosts {
+                    Ok(value) => {
+                        me.hosts.insert(server.clone(), value);
+                        me.update_directory_menu(&server);
+                    }
+                    Err(e) => {
+                        me.directory_failed(&server);
+                        me.rpc_error("refresh_hosts", e, cx);
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -1389,10 +2210,27 @@ impl Workspace {
             query: String::new(),
             cursor: 0,
             files: Vec::new(),
+            actions: Vec::new(),
+            origin: (
+                self.server_id.clone().unwrap_or_default(),
+                self.session_id.clone().unwrap_or_default(),
+                self.active_block.clone(),
+            ),
         });
         window.focus(&self.focus);
         cx.notify();
 
+        if let Some(server) = self.server_id.clone() {
+            let session = self.session_id.clone().unwrap_or_default();
+            let block = self.active_block.clone();
+            if let Some(map) = self.keymap.get(Some(&server)) {
+                if let Some(palette) = &mut self.palette {
+                    palette.actions = palette_actions(map, &server, &session, block);
+                }
+            } else {
+                self.refresh_keymap(cx);
+            }
+        }
         let (Some(address), Some(session), Some(block)) = (
             self.address(),
             self.session_id.clone(),
@@ -1438,6 +2276,12 @@ impl Workspace {
                 })
                 .unwrap_or_default();
             this.update(cx, |me, cx| {
+                if me.address().as_deref() != Some(address.as_str())
+                    || me.session_id.as_ref() != Some(&session)
+                    || me.active_block.as_ref() != Some(&block)
+                {
+                    return;
+                }
                 if let Some(palette) = &mut me.palette {
                     palette.files = files;
                 }
@@ -1453,16 +2297,18 @@ impl Workspace {
         let Some(palette) = &self.palette else {
             return Vec::new();
         };
-        let needle = palette.query.to_lowercase();
+        let actions_only = palette.query.starts_with('>');
+        let needle = palette.query.trim_start_matches('>').trim().to_lowercase();
         let keep = |text: &str| needle.is_empty() || text.to_lowercase().contains(&needle);
         let mut items: Vec<(String, Jump)> = Vec::new();
-        for server in &self.state.servers {
+        for server in self.state.servers.iter().filter(|_| !actions_only) {
             for session in &server.sessions {
                 for window in &session.windows {
                     if keep(&window.label) {
                         items.push((
                             format!("{} · {}", session.label, window.label),
                             Jump::Window {
+                                server: server.id.clone(),
                                 session: session.id.clone(),
                                 window: window.id.clone(),
                             },
@@ -1486,16 +2332,35 @@ impl Workspace {
                 }
             }
         }
-        for file in &palette.files {
+        for file in palette.files.iter().filter(|_| !actions_only) {
             if keep(file) {
                 items.push((file.clone(), Jump::File(file.clone())));
+            }
+        }
+        for action in &palette.actions {
+            if keep(&action.title) || keep(&action.name) || keep(&action.description) {
+                items.push((
+                    format!("{} · {}", action.title, action.description),
+                    Jump::Action {
+                        server: action.server.clone(),
+                        session: action.session.clone(),
+                        block: action.block.clone(),
+                        name: action.name.clone(),
+                        schema: action.args_schema.clone(),
+                    },
+                ));
             }
         }
         items
     }
 
     /// Type into the palette. Returns true when the key belonged to it.
-    fn palette_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn palette_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.palette.is_none() {
             return false;
         }
@@ -1541,7 +2406,7 @@ impl Workspace {
                 let cursor = self.palette.as_ref().map(|p| p.cursor).unwrap_or(0);
                 self.palette = None;
                 if let Some((_, jump)) = items.into_iter().nth(cursor) {
-                    self.take_jump(jump, cx);
+                    self.take_jump(jump, window, cx);
                 }
                 cx.notify();
                 true
@@ -1571,7 +2436,7 @@ impl Workspace {
         }
     }
 
-    fn take_jump(&mut self, jump: Jump, cx: &mut Context<Self>) {
+    fn take_jump(&mut self, jump: Jump, window: &mut Window, cx: &mut Context<Self>) {
         match jump {
             Jump::Block {
                 server,
@@ -1584,11 +2449,36 @@ impl Workspace {
                 self.window_id = Some(window);
                 self.jump_to_block(&server, &session, &block, cx);
             }
-            Jump::Window { session, window } => {
-                self.session_id = Some(session);
-                self.window_id = Some(window);
-                self.show_settings = false;
-                self.reload(cx);
+            Jump::Window {
+                server,
+                session,
+                window,
+            } => {
+                self.navigate(server, session, window, None, cx);
+            }
+            Jump::Action {
+                server,
+                session,
+                block,
+                name,
+                schema,
+            } => {
+                if let Some(schema) = schema {
+                    self.open_prompt(
+                        Ask::RunAction {
+                            server,
+                            session,
+                            block,
+                            name,
+                            schema,
+                        },
+                        "Action arguments (JSON object)",
+                        window,
+                    );
+                    cx.notify();
+                } else {
+                    self.run_client_action(server, session, block, name, None, cx);
+                }
             }
             Jump::File(path) => {
                 // Type it into the pane, the way the fzf picker does.
@@ -1624,6 +2514,10 @@ impl Workspace {
         ) else {
             return;
         };
+        if self.is_local_float(&block) {
+            self.rpc_error("Local floating pane", "Local panes have no server layer order; restore with Ctrl-Shift-F first.", cx);
+            return;
+        }
         let engine = self.engine.clone();
         cx.spawn(async move |_, _| {
             let Ok(view) = engine
@@ -1650,9 +2544,12 @@ impl Workspace {
 
     /// Park this pane: the program keeps running, the window is out of the way.
     fn park_pane(&mut self, cx: &mut Context<Self>) {
-        let (Some(address), Some(session), Some(block)) =
-            (self.address(), self.session_id.clone(), self.active())
-        else {
+        let (Some(address), Some(server), Some(session), Some(block)) = (
+            self.address(),
+            self.server_id.clone(),
+            self.session_id.clone(),
+            self.active(),
+        ) else {
             return;
         };
         let id = block.id.clone();
@@ -1661,11 +2558,22 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let payload = json!({"session_id": session, "block_id": id});
             if let Err(e) = engine.call(&address, "session.detach_block", payload).await {
-                eprintln!("flex: detach_block: {e}");
+                this.update(cx, |me, cx| me.rpc_error("session.detach_block", e, cx))
+                    .ok();
                 return;
             }
             this.update(cx, |me, cx| {
-                me.parked.push((id.clone(), label.clone()));
+                if me.server_id.as_ref() != Some(&server)
+                    || me.session_id.as_ref() != Some(&session)
+                {
+                    return;
+                }
+                me.parked.push(ParkedBlock {
+                    server: server.clone(),
+                    session: session.clone(),
+                    id: id.clone(),
+                    label: label.clone(),
+                });
                 if me.active_block.as_deref() == Some(id.as_str()) {
                     me.active_block = me.blocks().first().map(|b| b.id.clone());
                 }
@@ -1677,35 +2585,118 @@ impl Workspace {
     }
 
     /// Put a parked pane back beside the active one.
-    fn unpark(&mut self, id: String, cx: &mut Context<Self>) {
-        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+    fn refresh_parked(&mut self, cx: &mut Context<Self>) {
+        let (Some(address), Some(server), Some(session)) = (
+            self.address(),
+            self.server_id.clone(),
+            self.session_id.clone(),
+        ) else {
             return;
         };
-        let Some(anchor) = self.active().map(|b| b.id) else {
-            return;
-        };
+        self.refresh_parked_for(address, server, session, cx);
+    }
+
+    fn refresh_parked_for(
+        &mut self,
+        address: String,
+        server: String,
+        session: String,
+        cx: &mut Context<Self>,
+    ) {
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
-            let payload = json!({
-                "session_id": session,
-                "block_id": id,
-                "anchor_block_id": anchor,
-                "side": "after",
-                "direction": "horizontal",
-                "ratio": 0.5,
-            });
-            if let Err(e) = engine.call(&address, "session.move_block", payload).await {
-                eprintln!("flex: move_block: {e}");
-                return;
-            }
+            let reply = engine
+                .call(
+                    &address,
+                    "session.list_blocks",
+                    json!({"session_id": session}),
+                )
+                .await;
             this.update(cx, |me, cx| {
-                me.parked.retain(|(parked, _)| parked != &id);
-                me.pending_focus = Some(id.clone());
+                if me.server_id.as_deref() != Some(server.as_str())
+                    || me.session_id.as_deref() != Some(session.as_str())
+                    || !me
+                        .state
+                        .server(&server)
+                        .is_some_and(|s| s.address == address)
+                {
+                    return;
+                }
+                match reply {
+                    Ok(value) => {
+                        me.parked = value
+                            .get("blocks")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|block| {
+                                if matches!(
+                                    block.get("placement").and_then(|v| v.as_str()),
+                                    Some("placed")
+                                ) {
+                                    return None;
+                                }
+                                let id = block
+                                    .get("block_id")
+                                    .or_else(|| block.get("id"))
+                                    .and_then(|v| v.as_str())?
+                                    .to_owned();
+                                let label = block
+                                    .get("label")
+                                    .or_else(|| block.get("title"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Detached block")
+                                    .to_owned();
+                                Some(ParkedBlock {
+                                    server: server.clone(),
+                                    session: session.clone(),
+                                    id,
+                                    label,
+                                })
+                            })
+                            .collect();
+                    }
+                    Err(e) => me.rpc_error("session.list_blocks", e, cx),
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Put a parked pane back beside the active one, creating an empty anchor window if needed.
+    fn unpark(&mut self, parked: ParkedBlock, cx: &mut Context<Self>) {
+        let Some(address) = self.state.server(&parked.server).map(|s| s.address.clone()) else {
+            return;
+        };
+        let session = parked.session.clone();
+        let engine = self.engine.clone();
+        let id = parked.id.clone();
+        let anchor = if self.server_id.as_ref() == Some(&parked.server)
+            && self.session_id.as_ref() == Some(&parked.session)
+        {
+            self.active().map(|b| b.id)
+        } else {
+            None
+        };
+        cx.spawn(async move |this, cx| {
+            let anchor = match anchor {
+                Some(anchor) => anchor,
+                None => match engine.call(&address, "session.new_window", json!({
+                    "session_id": session, "layout": {"block": {"flavor": "com.superlogical.terminal.shell"}}
+                })).await {
+                    Ok(view) => match view.pointer("/block_ids/0").and_then(|v| v.as_str()) { Some(id) => id.to_owned(), None => { this.update(cx, |me, cx| me.rpc_error("session.new_window", "no anchor returned", cx)).ok(); return; } },
+                    Err(e) => { this.update(cx, |me, cx| me.rpc_error("session.new_window", e, cx)).ok(); return; }
+                }
+            };
+            let result = engine.call(&address, "session.move_block", json!({"session_id": session, "block_id": id, "anchor_block_id": anchor, "side": "after", "direction": "horizontal", "ratio": 0.5})).await;
+            this.update(cx, |me, cx| match result {
+                Ok(_) if me.server_id.as_ref() == Some(&parked.server) && me.session_id.as_ref() == Some(&parked.session) => { me.parked.retain(|p| p.id != parked.id || p.server != parked.server || p.session != parked.session); me.pending_focus = Some(parked.id); cx.notify(); }
+                Ok(_) => {},
+                Err(e) => me.rpc_error("session.move_block", e, cx),
+            }).ok();
+        }).detach();
     }
 
     /// Copy everything the pane can still show, from the server's own
@@ -1932,17 +2923,29 @@ impl Workspace {
             return;
         };
         let engine = self.engine.clone();
+        let server = self.server_id.clone().unwrap_or_default();
         let block_id = block.id.clone();
+        let window_id = self.window_id.clone();
         let floating = block.floating;
-        // Tiling again means placing the pane beside a *tiled* one, and Rex
-        // needs a real anchor id. Prefer this window, then another tab in the
-        // session; if the whole session is floating, a fresh tab's shell is
-        // created to sit beside.
-        let anchor = self.tiled_anchor(&block_id);
-        if !floating {
-            self.float_rects.insert(block_id.clone(), block.rect);
+        let Some(raw_window) = self.windows().into_iter().find(|w| Some(&w.id) == window_id.as_ref()) else { return; };
+        let Some(key) = self.local_float_key(&block_id) else { return; };
+        if self.local_floats.toggle(key, &raw_window, FLOAT_BOUNDS) {
+            self.pull = None;
+            self.settled = None;
+            self.pending_focus = Some(block_id.clone());
+            cx.notify();
+            return;
         }
-        let hint = self.float_rects.remove(&block_id);
+        // Never create a process or move tabs just to provide a retile anchor.
+        let anchor = model::tiled_anchor(&raw_window, &block_id);
+        if floating && anchor.is_none() {
+            self.rpc_error("Restore floating pane", "This is a server floating pane with no tiled neighbour in this tab. Rex cannot retile it into an empty layer; no new pane was created.", cx);
+            return;
+        }
+        if !floating {
+            self.float_rects.remember(&server, &block_id, block.rect);
+        }
+        let hint = self.float_rects.get(&server, &block_id);
 
         cx.spawn(async move |this, cx| {
             if !floating {
@@ -1952,32 +2955,11 @@ impl Workspace {
                     "bounds": FLOAT_BOUNDS,
                 });
                 if let Err(e) = engine.call(&address, "session.float_block", payload).await {
-                    eprintln!("flex: session.float_block: {e}");
+                    this.update(cx, |me, cx| me.rpc_error("session.float_block", e, cx))
+                        .ok();
+                    return;
                 }
             } else {
-                let anchor = match anchor {
-                    Some(anchor) => Some(anchor),
-                    None => {
-                        // A split needs an anchor, and the whole session is
-                        // floating, so open a tab with a shell to sit beside.
-                        let payload = json!({
-                            "session_id": session_id,
-                            "layout": {"block": {"flavor": "com.superlogical.terminal.shell"}},
-                        });
-                        match engine.call(&address, "session.new_window", payload).await {
-                            Ok(view) => view
-                                .get("block_ids")
-                                .and_then(|ids| ids.as_array())
-                                .and_then(|ids| ids.first())
-                                .and_then(|id| id.as_str())
-                                .map(str::to_owned),
-                            Err(e) => {
-                                eprintln!("flex: session.new_window: {e}");
-                                None
-                            }
-                        }
-                    }
-                };
                 let Some(anchor) = anchor else { return };
                 // Put it back on the side it came from, with roughly the share it
                 // had. Rex only takes a side and a ratio, not a saved layout.
@@ -1992,101 +2974,22 @@ impl Workspace {
                     "ratio": ratio,
                 });
                 if let Err(e) = engine.call(&address, "session.move_block", payload).await {
-                    eprintln!("flex: session.move_block: {e}");
+                    this.update(cx, |me, cx| me.rpc_error("session.move_block", e, cx))
+                        .ok();
+                    return;
                 }
             }
-            this.update(cx, |_, cx| cx.notify()).ok();
-        })
-        .detach();
-    }
-
-    /// Open a tool beside the active pane: lazygit, or an fzf picker whose choice
-    /// is typed back into the pane it came from.
-    fn run_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
-        let (Some(address), Some(session_id), Some(origin)) =
-            (self.address(), self.session_id.clone(), self.active())
-        else {
-            return;
-        };
-
-        let (command, keep_open, suffix) = match tool {
-            Tool::Lazygit => (vec!["lazygit".to_owned()], false, ""),
-            Tool::Files => (
-                vec!["sh".to_owned(), "-c".to_owned(), PICK_FILES.to_owned()],
-                true,
-                " ",
-            ),
-            Tool::Dirs => (
-                vec!["sh".to_owned(), "-c".to_owned(), PICK_DIRS.to_owned()],
-                true,
-                "/",
-            ),
-            Tool::Anything => (
-                vec!["sh".to_owned(), "-c".to_owned(), PICK_ANY.to_owned()],
-                true,
-                " ",
-            ),
-        };
-
-        let engine = self.engine.clone();
-        let origin_block = origin.id.clone();
-        let window_id = self.window_id.clone();
-
-        cx.spawn(async move |this, cx| {
-            // In the pane's own directory, not in `$HOME`: the block's reported
-            // pwd is empty unless the shell speaks OSC 7, so ask the server where
-            // the foreground process actually is.
-            let mut options = json!({"shell": "none", "command": command});
-            if let Some(cwd) = engine.block_cwd(&address, &session_id, &origin_block).await {
-                options["cwd"] = json!(cwd);
-            }
-            // A floating terminal, not a split: it covers the work, and closing it
-            // leaves the layout exactly as it was.
-            let payload = json!({
-                "session_id": session_id,
-                "window_id": window_id,
-                "bounds": TOOL_BOUNDS,
-                "layout": {
-                    "block": {
-                        "flavor": "com.superlogical.terminal.shell",
-                        "options": options,
-                    }
-                },
-            });
-            let result = engine.call(&address, "session.new_layer", payload).await;
-            let block = match result {
-                Ok(view) => view
-                    .pointer("/block_ids/0")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_owned),
-                Err(e) => {
-                    eprintln!("flex: session.new_layer: {e}");
-                    None
-                }
-            };
-            let Some(block) = block else {
-                this.update(cx, |me, cx| {
-                    me.drop_tint(cx);
-                })
-                .ok();
-                return;
-            };
-            // Whatever the tool, it takes the keyboard: it is what you type into.
-            // The server gives a new block focus on its own, but this client also
-            // has to move its own focus handle, or keystrokes keep going to the
-            // pane the tool was opened from.
-            let pick = keep_open.then(|| PendingPick {
-                origin_block: origin_block.clone(),
-                pick_block: block.clone(),
-                suffix,
-            });
             this.update(cx, |me, cx| {
-                me.active_block = Some(block.clone());
-                me.pending_focus = Some(block.clone());
-                // Dim the pane the tool covers: the floating one has the keyboard.
-                me.tinted = Some(origin_block);
-                if let Some(pick) = pick {
-                    me.pending_pick = Some(pick);
+                if floating {
+                    me.float_rects.finish_tiling(&server, &block_id, true);
+                }
+                if me.server_id.as_ref() == Some(&server)
+                    && me.session_id.as_ref() == Some(&session_id)
+                    && me.window_id == window_id
+                    && me.active_block.as_ref() == Some(&block_id)
+                {
+                    me.publish_focus(&block_id);
+                    me.pending_focus = Some(block_id.clone());
                 }
                 cx.notify();
             })
@@ -2095,64 +2998,263 @@ impl Workspace {
         .detach();
     }
 
-    /// A picker's program has exited: take the choice out of its text, type it
-    /// into the pane it came from, and close the picker.
-    fn settle_pick(&mut self, live: &HashSet<String>, cx: &mut Context<Self>) {
-        let Some(pick) = self.pending_pick.clone() else {
+    /// Open a tool beside the active pane: lazygit, or an fzf picker whose choice
+    /// is typed back into the pane it came from.
+    fn run_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        if self.pending_tool.is_some() {
+            return;
+        }
+        let (Some(address), Some(server), Some(session), Some(window), Some(origin)) = (
+            self.address(),
+            self.server_id.clone(),
+            self.session_id.clone(),
+            self.window_id.clone(),
+            self.active(),
+        ) else {
             return;
         };
-        let present = self
-            .windows()
-            .into_iter()
-            .flat_map(|window| window.blocks)
-            .find(|block| block.id == pick.pick_block);
-        // Gone from the session means it closed on exit; still present means we
-        // wait until its process reports having exited.
-        let finished = present
-            .as_ref()
-            .map_or(true, |block| block.exited.is_some());
-        if !finished {
-            return;
-        }
-        let still_open = present.is_some();
-        self.pending_pick = None;
-        self.tinted = None;
-
-        let text = self
-            .terminals
-            .get(&pick.pick_block)
-            .map(|view| view.read(cx).text())
-            .unwrap_or_default();
-        let choice = text
-            .lines()
-            .rev()
-            .find_map(|line| {
-                line.split_once(PICK_MARK)
-                    .map(|(_, path)| path.trim().to_owned())
-            })
-            .filter(|path| !path.is_empty());
-        if std::env::var_os("FLEX_DEBUG").is_some() {
-            eprintln!("[pick] finished open={still_open} choice={choice:?}");
-        }
-        if let Some(path) = choice {
-            if let Some(origin) = self.terminals.get(&pick.origin_block) {
-                origin.read(cx).send(&format!("{path}{}", pick.suffix));
-            }
-        }
-
-        // Only a pane that is still open needs closing; one that closed on exit
-        // is already gone, and `live` says so.
-        if still_open && live.contains(&pick.pick_block) {
-            if let (Some(server), Some(session)) = (self.server_id.clone(), self.session_id.clone())
+        let (command, suffix) = match tool {
+            Tool::Lazygit => (vec!["lazygit".to_owned()], None),
+            Tool::Files => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_FILES.to_owned()],
+                Some(" "),
+            ),
+            Tool::Dirs => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_DIRS.to_owned()],
+                Some("/"),
+            ),
+            Tool::Anything => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_ANY.to_owned()],
+                Some(" "),
+            ),
+        };
+        let request = PendingTool {
+            request: Default::default(),
+            server,
+            session,
+            window,
+            origin: origin.id,
+            target: None,
+            suffix,
+            observed: false,
+            confirmed_absent: false,
+            checking: false,
+        };
+        self.pending_tool = Some(request.clone());
+        self.pending_focus = None;
+        cx.notify();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            // Ask for the foreground process directory when OSC 7 is unavailable.
+            let mut options = json!({"shell": "none", "command": command});
+            if let Some(cwd) = engine
+                .block_cwd(&address, &request.session, &request.origin)
+                .await
             {
-                let engine = self.engine.clone();
-                let block = pick.pick_block;
-                cx.spawn(async move |_, _| {
-                    let _ = engine.shrew().close_block(&server, &session, &block).await;
+                options["cwd"] = json!(cwd);
+            }
+            let current = this
+                .update(cx, |me, _| {
+                    request.matches_context((
+                        me.server_id.as_deref(),
+                        me.session_id.as_deref(),
+                        me.window_id.as_deref(),
+                    )) && me.active_block.as_deref() == Some(request.origin.as_str())
+                        && me
+                            .pending_tool
+                            .as_ref()
+                            .is_some_and(|pending| Arc::ptr_eq(&pending.request, &request.request))
                 })
-                .detach();
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let payload = tool_layer_request(&request.session, &request.window, options);
+            let result = engine.call(&address, "session.new_layer", payload).await;
+            this.update(cx, |me, cx| {
+                // A reply from a tool opened in another tab/server must not
+                // change this context's active pane or keyboard owner.
+                let current = request.matches_context((
+                    me.server_id.as_deref(),
+                    me.session_id.as_deref(),
+                    me.window_id.as_deref(),
+                )) && me
+                    .pending_tool
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.request, &request.request));
+                let block = match result {
+                    Ok(view) => view
+                        .pointer("/block_ids/0")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned),
+                    Err(e) => {
+                        me.rpc_error("session.new_layer", e, cx);
+                        None
+                    }
+                };
+                if !current {
+                    return;
+                }
+                if let Some(block) = block {
+                    if let Some(pending) = &mut me.pending_tool {
+                        pending.target = Some(block);
+                    }
+                    me.tinted = Some(request.origin);
+                    me.reconcile_tool(cx);
+                } else {
+                    me.pending_tool = None;
+                    me.pending_focus = me.active_block.clone();
+                    me.drop_tint(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reconcile both reload and render against the same scoped tool lifecycle.
+    /// Returns true while no target view exists, so the workspace holds keys.
+    fn reconcile_tool(&mut self, cx: &mut Context<Self>) -> bool {
+        let blocks = self.blocks();
+        let visible: Vec<_> = blocks
+            .iter()
+            .map(|block| (block.id.as_str(), block.exited.is_some()))
+            .collect();
+        let Some(tool) = &mut self.pending_tool else {
+            return false;
+        };
+        let progress = tool.reconcile(
+            (
+                self.server_id.as_deref(),
+                self.session_id.as_deref(),
+                self.window_id.as_deref(),
+            ),
+            &visible,
+            &mut self.active_block,
+            &mut self.pending_focus,
+        );
+        match progress {
+            ToolProgress::Waiting => {
+                if tool.target.is_some() && !tool.checking {
+                    tool.checking = true;
+                    let request = tool.clone();
+                    let engine = self.engine.clone();
+                    cx.spawn(async move |this, cx| {
+                        // A view fetched after creation distinguishes "not delivered
+                        // yet" from a short-lived tool that has already disappeared.
+                        let result = engine
+                            .call_server(
+                                &request.server,
+                                "session.view",
+                                json!({
+                                    "session_id": request.session,
+                                }),
+                            )
+                            .await;
+                        this.update(cx, |me, cx| {
+                            if !request.matches_context((
+                                me.server_id.as_deref(),
+                                me.session_id.as_deref(),
+                                me.window_id.as_deref(),
+                            )) {
+                                return;
+                            }
+                            let Some(pending) = &mut me.pending_tool else {
+                                return;
+                            };
+                            if !Arc::ptr_eq(&pending.request, &request.request) {
+                                return;
+                            }
+                            pending.checking = false;
+                            match result {
+                                Ok(view) => {
+                                    let present = view
+                                        .get("windows")
+                                        .and_then(|v| v.as_array())
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|w| w.get("layers").and_then(|v| v.as_array()))
+                                        .flatten()
+                                        .filter_map(|l| l.get("blocks").and_then(|v| v.as_array()))
+                                        .flatten()
+                                        .any(|b| {
+                                            b.get("block_id").and_then(|v| v.as_str())
+                                                == request.target.as_deref()
+                                        });
+                                    if !present {
+                                        pending.confirmed_absent = true;
+                                        me.reconcile_tool(cx);
+                                        cx.notify();
+                                    }
+                                }
+                                Err(e) => {
+                                    me.pending_tool = None;
+                                    me.pending_focus = me.active_block.clone();
+                                    me.tinted = None;
+                                    me.rpc_error("Check tool", e, cx);
+                                }
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                return true;
+            }
+            ToolProgress::Running => return false,
+            ToolProgress::Cancelled => {
+                self.pending_tool = None;
+                self.tinted = None;
+                return false;
+            }
+            ToolProgress::Finished => {}
+        }
+        let tool = self.pending_tool.take().unwrap();
+        self.tinted = None;
+        let target = tool.target.as_deref().unwrap();
+        // The helper has already checked server/session/window. Also require
+        // the origin still to exist before typing a choice or restoring focus.
+        if visible.iter().any(|(id, _)| *id == tool.origin) {
+            if let Some(suffix) = tool.suffix {
+                let text = self
+                    .terminals
+                    .get(target)
+                    .map(|view| view.read(cx).text())
+                    .unwrap_or_default();
+                let choice = text
+                    .lines()
+                    .rev()
+                    .find_map(|line| {
+                        line.split_once(PICK_MARK)
+                            .map(|(_, path)| path.trim().to_owned())
+                    })
+                    .filter(|path| !path.is_empty());
+                if let Some(path) = choice {
+                    if let Some(origin) = self.terminals.get(&tool.origin) {
+                        origin.read(cx).send(&format!("{path}{suffix}"));
+                    }
+                }
+            }
+            if self.active_block.as_deref() == Some(tool.origin.as_str()) {
+                self.publish_focus(&tool.origin);
             }
         }
+        if blocks.iter().any(|block| block.id == target) {
+            let engine = self.engine.clone();
+            cx.spawn(async move |this, cx| {
+                if let Err(e) = engine
+                    .shrew()
+                    .close_block(&tool.server, &tool.session, tool.target.as_deref().unwrap())
+                    .await
+                {
+                    this.update(cx, |me, cx| me.rpc_error("Close tool", e, cx))
+                        .ok();
+                }
+            })
+            .detach();
+        }
+        false
     }
 
     /// Tell the server which pane this client is on, so focus changes and splits
@@ -2267,25 +3369,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// A tiled block to place `block_id` beside: this window first, then any
-    /// other window in the session.
-    fn tiled_anchor(&self, block_id: &str) -> Option<String> {
-        let mut fallback = None;
-        for window in self.windows() {
-            let here = Some(&window.id) == self.window_id.as_ref();
-            for block in window.blocks {
-                if block.floating || block.id == block_id {
-                    continue;
-                }
-                if here {
-                    return Some(block.id);
-                }
-                fallback.get_or_insert(block.id);
-            }
-        }
-        fallback
-    }
-
     fn chrome(&self) -> theme::Chrome {
         theme::Chrome {
             glass: self.settings.acrylic,
@@ -2314,6 +3397,7 @@ impl Workspace {
         self.active_block = Some(block.id.clone());
         self.pull = Some(Pull {
             block_id: block.id.clone(),
+            local_key: self.local_float_key(&block.id).filter(|key| self.local_floats.0.contains_key(key)),
             grab,
             start,
             rect: block.rect,
@@ -2351,6 +3435,13 @@ impl Workspace {
     fn end_pull(&mut self, cx: &mut Context<Self>) {
         let Some(pull) = self.pull.take() else { return };
         if pull.live == pull.rect {
+            cx.notify();
+            return;
+        }
+        if let Some(key) = &pull.local_key {
+            if let Some(local) = self.local_floats.0.get_mut(key) {
+                local.rect = pull.live;
+            }
             cx.notify();
             return;
         }
@@ -2512,10 +3603,17 @@ impl Workspace {
             .justify_center()
             .items_center()
             .bg(hsla(0.0, 0.0, 0.0, 0.5))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .occlude()
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+            .map(|mut el| {
+                el.interactivity().on_any_mouse_up(|_, _, cx| cx.stop_propagation());
+                el
+            })
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_mouse_move(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
-                    .w(px(360.0))
+                    .w(px(620.0))
                     .rounded_lg()
                     .bg(theme::color(theme::SURFACE))
                     .border_1()
@@ -2527,12 +3625,32 @@ impl Workspace {
                     .flex_col()
                     .gap_2()
                     .child(div().text_color(theme::text()).child(prompt.label.clone()))
+                    .when_some(
+                        match &prompt.what {
+                            Ask::CreateBlock { schema, .. } | Ask::RunAction { schema, .. } => {
+                                Some(schema.to_string())
+                            }
+                            _ => None,
+                        },
+                        |el, schema| {
+                            el.child(
+                                div()
+                                    .max_h(px(120.0))
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(format!("Schema (validated by server): {schema}")),
+                            )
+                        },
+                    )
                     .when(prompt.what.wants_text(), |el| {
                         el.child(
                             div()
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
+                                .max_h(px(240.0))
+                                .overflow_hidden()
                                 .bg(chrome.active())
                                 .text_color(theme::text())
                                 .child(format!("{}▌", prompt.value)),
@@ -2545,44 +3663,6 @@ impl Workspace {
                             .child(prompt.what.hint()),
                     ),
             )
-            .into_any_element()
-    }
-
-    /// A sidebar section title with a small `+`, for the lists that grow.
-    fn sidebar_header(
-        &self,
-        title: &'static str,
-        add: Option<(&'static str, Ask, &'static str)>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let chrome = self.chrome();
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .pt_3()
-            .pb_1()
-            .child(div().text_xs().text_color(theme::muted()).child(title))
-            .when_some(add, |el, (id, what, label)| {
-                el.child(
-                    div()
-                        .id(id)
-                        .size(px(16.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .text_xs()
-                        .text_color(theme::muted())
-                        .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
-                        .child("+")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_prompt(what.clone(), label, window);
-                            cx.notify();
-                        })),
-                )
-            })
             .into_any_element()
     }
 
@@ -2599,26 +3679,7 @@ impl Workspace {
             .enumerate()
             .map(|(index, (label, jump))| {
                 let selected = index == palette.cursor;
-                let (session, window, block, server) = match jump {
-                    Jump::Block {
-                        server,
-                        session,
-                        window,
-                        block,
-                    } => (
-                        session.clone(),
-                        window.clone(),
-                        block.clone(),
-                        server.clone(),
-                    ),
-                    Jump::Window { session, window } => (
-                        session.clone(),
-                        window.clone(),
-                        String::new(),
-                        String::new(),
-                    ),
-                    Jump::File(path) => (String::new(), String::new(), path.clone(), String::new()),
-                };
+                let jump = jump.clone();
                 div()
                     .id(SharedString::from(format!("palette-{index}")))
                     .px_3()
@@ -2633,20 +3694,9 @@ impl Workspace {
                     .child(div().flex_1().truncate().child(label.clone()))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
                             this.palette = None;
-                            if !session.is_empty() && !window.is_empty() && !block.is_empty() {
-                                this.server_id = Some(server.clone());
-                                this.session_id = Some(session.clone());
-                                this.jump_to_block(&server, &session, &block, cx);
-                            } else if !session.is_empty() {
-                                this.session_id = Some(session.clone());
-                                this.window_id = Some(window.clone());
-                                this.show_settings = false;
-                                this.reload(cx);
-                            } else {
-                                this.take_jump(Jump::File(block.clone()), cx);
-                            }
+                            this.take_jump(jump.clone(), window, cx);
                             cx.notify();
                             cx.stop_propagation();
                         }),
@@ -2664,7 +3714,14 @@ impl Workspace {
             .justify_center()
             .items_center()
             .bg(hsla(0.0, 0.0, 0.0, 0.5))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .occlude()
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+            .map(|mut el| {
+                el.interactivity().on_any_mouse_up(|_, _, cx| cx.stop_propagation());
+                el
+            })
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_mouse_move(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .w(px(520.0))
@@ -2703,7 +3760,9 @@ impl Workspace {
                             .pt_1()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child("↑↓ to pick · Enter to go · Esc to close"),
+                            .child(
+                            "↑↓ to pick · Enter to go · > actions (no arguments) · Esc to close",
+                        ),
                     ),
             )
             .into_any_element()
@@ -2787,12 +3846,181 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn describe_block(
+        &mut self,
+        server: String,
+        session: String,
+        block: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(address) = self.state.server(&server).map(|s| s.address.clone()) else {
+            return;
+        };
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .call(
+                    &address,
+                    "session.describe_block",
+                    json!({"session_id":session,"block_id":block}),
+                )
+                .await;
+            this.update(cx, |me, cx| {
+                match result {
+                    Ok(value) => {
+                        me.block_details.insert((server, session, block), value);
+                    }
+                    Err(e) => me.rpc_error("session.describe_block", e, cx),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let chrome = self.chrome();
         let mut rows: Vec<AnyElement> = Vec::new();
-
-        // Agents first: the whole point is to see who needs you without
-        // hunting through sessions and tabs. Ordered by urgency by the engine.
+        rows.push(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .child(div().text_xs().text_color(theme::muted()).child("SERVERS"))
+                .child(
+                    div()
+                        .id("server-add")
+                        .size(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .hover(|el| el.bg(chrome.hover()))
+                        .child("+")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                            this.open_add_menu(window, cx);
+                            if let Some(menu) = &mut this.menu {
+                                menu.anchor = Some(event.position());
+                            }
+                            cx.stop_propagation();
+                        })),
+                )
+                .into_any_element(),
+        );
+        for server in &self.state.servers {
+            let target = menu::Target {
+                server: server.id.clone(),
+                address: server.address.clone(),
+                session: None,
+                block: None,
+            };
+            let selected = self.server_id.as_ref() == Some(&server.id);
+            let dot = match server.connectivity {
+                Connectivity::Online => theme::accent(),
+                Connectivity::Connecting => theme::muted(),
+                Connectivity::Offline { .. } => theme::danger(),
+                Connectivity::Idle => theme::border(),
+            };
+            let id = server.id.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("server:{id}")))
+                    .mx_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w(px(0.0))
+                    .when(selected, |el| el.bg(chrome.active()))
+                    .hover(|el| el.bg(chrome.hover()))
+                    .child(theme::dot(dot))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .child(server.name.clone()),
+                    )
+                    .child(self.menu_button(format!("server-menu:{id}"), target, cx))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if this.server_id.as_ref() != Some(&id) {
+                                this.server_id = Some(id.clone());
+                                this.session_id = None;
+                                this.window_id = None;
+                                this.active_block = None;
+                                this.reload(cx);
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element(),
+            );
+            for session in &server.sessions {
+                let target = menu::Target {
+                    server: server.id.clone(),
+                    address: server.address.clone(),
+                    session: Some(session.id.clone()),
+                    block: None,
+                };
+                let active = selected && self.session_id.as_ref() == Some(&session.id);
+                let (server_id, id) = (server.id.clone(), session.id.clone());
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("session:{server_id}:{id}")))
+                        .ml_4()
+                        .mr_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w(px(0.0))
+                        .when(active, |el| el.bg(chrome.active()))
+                        .hover(|el| el.bg(chrome.hover()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .child(session.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(session.block_count().to_string()),
+                        )
+                        .child(self.menu_button(
+                            format!("session-menu:{server_id}:{id}"),
+                            target,
+                            cx,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.server_id = Some(server_id.clone());
+                                this.session_id = Some(id.clone());
+                                this.window_id = None;
+                                this.active_block = None;
+                                this.reload(cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        // Attention stays visible below server/session navigation.
         let agents = self.state.attention();
         if !agents.is_empty() {
             rows.push(theme::section("AGENTS").into_any_element());
@@ -2848,13 +4076,70 @@ impl Workspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
-                                this.server_id = Some(server.clone());
-                                this.session_id = Some(session.clone());
-                                this.window_id = Some(window.clone());
-                                this.active_block = Some(block.clone());
-                                this.pending_focus = Some(block.clone());
-                                this.reload(cx);
+                                this.navigate(
+                                    server.clone(),
+                                    session.clone(),
+                                    window.clone(),
+                                    Some(block.clone()),
+                                    cx,
+                                );
                             }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let parked: Vec<_> = self
+            .parked
+            .iter()
+            .filter(|p| {
+                self.server_id.as_ref() == Some(&p.server)
+                    && self.session_id.as_ref() == Some(&p.session)
+            })
+            .cloned()
+            .collect();
+        if !parked.is_empty() {
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(theme::section("Parked panes"))
+                    .child(
+                        div()
+                            .id("refresh-parked")
+                            .min_w(px(24.0))
+                            .h(px(24.0))
+                            .mr_2()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child("Refresh")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_parked(cx))),
+                    )
+                    .into_any_element(),
+            );
+            for parked in parked {
+                let id = parked.id.clone();
+                let label = parked.label.clone();
+                let flat = parked.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("parked:{id}")))
+                        .mx_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(theme::text())
+                        .hover(|el| el.bg(chrome.hover()))
+                        .child(div().flex_1().truncate().child(label))
+                        .child(div().text_xs().text_color(theme::muted()).child("parked"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| this.unpark(flat.clone(), cx)),
                         )
                         .into_any_element(),
                 );
@@ -2864,7 +4149,7 @@ impl Workspace {
         let tucked: Vec<AnyElement> = self
             .blocks()
             .into_iter()
-            .filter(|block| self.minimized.contains(&block.id))
+            .filter(|block| block.layer_state == "minimized")
             .map(|block| {
                 let id = block.id.clone();
                 div()
@@ -2896,310 +4181,31 @@ impl Workspace {
             })
             .collect();
         if !tucked.is_empty() {
-            rows.push(theme::section("TUCKED AWAY").into_any_element());
+            rows.push(theme::section("Minimized panes").into_any_element());
             rows.extend(tucked);
-        }
-        if !self.parked.is_empty() {
-            rows.push(theme::section("PARKED").into_any_element());
-            for (id, label) in self.parked.clone() {
-                let flat = id.clone();
-                rows.push(
-                    div()
-                        .id(SharedString::from(format!("parked:{id}")))
-                        .mx_2()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(theme::text())
-                        .hover(|el| el.bg(chrome.hover()))
-                        .child(div().flex_1().truncate().child(label))
-                        .child(div().text_xs().text_color(theme::muted()).child("parked"))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| this.unpark(flat.clone(), cx)),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-
-        let hosts_left: Vec<(String, String, String)> = self
-            .hosts
-            .as_ref()
-            .and_then(|hosts| hosts.get("hosts").or(Some(hosts)))
-            .and_then(|hosts| hosts.as_array())
-            .map(|list| {
-                list.iter()
-                    .filter_map(|host| {
-                        let label = host.get("label").and_then(|l| l.as_str())?;
-                        let id = host
-                            .get("id")
-                            .and_then(|i| i.as_str())
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("host:{label}"));
-                        let address = host
-                            .get("endpoints")
-                            .and_then(|e| e.as_array())
-                            .and_then(|list| list.first())
-                            .and_then(|a| a.as_str())
-                            .unwrap_or("")
-                            .to_owned();
-                        Some((label.to_owned(), address, id))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        rows.push(self.sidebar_header(
-            "MACHINES",
-            Some((
-                "server-add",
-                Ask::AddServer,
-                "Add a machine — name and address",
-            )),
-            cx,
-        ));
-        let mut session_rows: Vec<AnyElement> = Vec::new();
-        for server in &self.state.servers {
-            let dot = match server.connectivity {
-                Connectivity::Online => theme::accent(),
-                Connectivity::Connecting => theme::muted(),
-                Connectivity::Offline { .. } => theme::danger(),
-                Connectivity::Idle => theme::border(),
-            };
-            rows.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(div().size(px(6.0)).rounded_full().bg(dot))
-                    .child(div().flex_1().truncate().child(server.name.clone()))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("session-add:{}", server.id)))
-                            .size(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_size(px(12.0))
-                            .text_color(theme::muted())
-                            .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
-                            .child("+")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let address = server.address.clone();
-                                    move |this, _, window, cx| {
-                                        this.open_prompt(
-                                            Ask::NewSession(address.clone()),
-                                            "New session — name it",
-                                            window,
-                                        );
-                                        cx.notify();
-                                        cx.stop_propagation();
-                                    }
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("server-del:{}", server.id)))
-                            .size(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_size(px(11.0))
-                            .text_color(theme::muted())
-                            .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
-                            .child("×")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let id = server.id.clone();
-                                    let name = server.name.clone();
-                                    move |this, _, window, cx| {
-                                        this.open_prompt(
-                                            Ask::DeleteServer(id.clone(), name.clone()),
-                                            &format!("Remove server {name}?"),
-                                            window,
-                                        );
-                                        cx.notify();
-                                        cx.stop_propagation();
-                                    }
-                                }),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-
-            for session in &server.sessions {
-                let id = session.id.clone();
-                let active = self.session_id.as_deref() == Some(id.as_str());
-                session_rows.push(
-                    div()
-                        .id(SharedString::from(id.clone()))
-                        .mx_2()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .when(active, |el| {
-                            el.bg(chrome.active()).text_color(theme::text())
-                        })
-                        .when(!active, |el| {
-                            el.text_color(theme::text())
-                                .hover(|el| el.bg(chrome.hover()))
-                        })
-                        .when_some(session.agent_state(), |el, state| {
-                            el.child(theme::dot(theme::agent(state)))
-                        })
-                        .child(div().flex_1().truncate().child(session.label.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::muted())
-                                .child(session.block_count().to_string()),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("session-del:{id}")))
-                                .size(px(14.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_sm()
-                                .text_size(px(11.0))
-                                .text_color(theme::muted())
-                                .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
-                                .child("×")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener({
-                                        let label = session.label.clone();
-                                        let delete_id = id.clone();
-                                        move |this, _, window, cx| {
-                                            this.open_prompt(
-                                                Ask::DeleteSession(
-                                                    delete_id.clone(),
-                                                    label.clone(),
-                                                ),
-                                                &format!("Delete session {label}?"),
-                                                window,
-                                            );
-                                            cx.notify();
-                                            cx.stop_propagation();
-                                        }
-                                    }),
-                                ),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.session_id = Some(id.clone());
-                                this.window_id = None;
-                                this.active_block = None;
-                                this.reload(cx);
-                            }),
-                        )
-                        .into_any_element(),
-                );
-            }
-            rows.append(&mut session_rows);
-        }
-
-        // Hosts the server knows about but this client has not connected to:
-        // same list, dimmer, and one click adds them as a machine of their own.
-        for (label, address, host_id) in hosts_left {
-            if self
-                .state
-                .servers
-                .iter()
-                .any(|server| server.address.trim() == address.trim())
-            {
-                continue;
-            }
-            let connect = address.clone();
-            let host_name = label.clone();
-            let del_id = host_id.clone();
-            let del_label = label.clone();
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("host:{host_id}")))
-                    .mx_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_color(theme::muted())
-                    .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
-                    .child(theme::dot(theme::border()))
-                    .child(div().flex_1().truncate().child(label))
-                    .child(div().text_xs().text_color(theme::muted()).child("host"))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("host-del:{host_id}")))
-                            .size(px(14.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_size(px(11.0))
-                            .text_color(theme::muted())
-                            .hover(|el| el.bg(chrome.hover()).text_color(theme::danger()))
-                            .child("×")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.open_prompt(
-                                        Ask::DeleteHost(del_id.clone(), del_label.clone()),
-                                        &format!("Remove host {del_label}?"),
-                                        window,
-                                    );
-                                    cx.notify();
-                                    cx.stop_propagation();
-                                }),
-                            ),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            if this.engine.add_server(&host_name, &connect).is_ok() {
-                                this.state = this.engine.state();
-                                this.server_id = this
-                                    .state
-                                    .servers
-                                    .iter()
-                                    .find(|s| s.address.trim() == connect.trim())
-                                    .map(|s| s.id.clone());
-                                this.reload(cx);
-                            }
-                        }),
-                    )
-                    .into_any_element(),
-            );
         }
 
         div()
+            .w(theme::SIDEBAR_W)
+            .flex_none()
+            .min_w(px(0.0))
+            .h_full()
             .flex()
             .flex_col()
-            .w(theme::SIDEBAR_W)
-            .h_full()
+            .overflow_hidden()
             .bg(chrome.surface())
             .border_r_1()
             .border_color(theme::border())
-            .children(rows)
+            .child(
+                div()
+                    .id("sidebar-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
             .into_any_element()
     }
 
@@ -3407,11 +4413,33 @@ impl Workspace {
         // one pane, or a zoomed one filling the window, it is just a frame.
         let ring = self.blocks().len() > 1 && zoomed.is_none();
 
-        let blocks = self.blocks();
-        let views: Vec<(BlockState, Entity<TerminalView>)> = blocks
+        let tool_waiting = self.reconcile_tool(cx);
+        let all_blocks = self.blocks();
+        let blocks: Vec<_> = all_blocks
+            .iter()
+            .filter(|b| pane_visible(b, zoomed.as_deref()))
+            .cloned()
+            .collect();
+        let visible = visible_focus(&blocks, self.active_block.as_deref(), None);
+        if !tool_waiting && self.active_block != visible {
+            self.active_block = visible.clone();
+            if self.pending_focus.is_none() {
+                self.pending_focus = visible;
+            }
+        }
+        if self.pending_focus.as_ref().is_some_and(|id| {
+            all_blocks
+                .iter()
+                .any(|b| b.id == *id && !pane_visible(b, zoomed.as_deref()))
+        }) {
+            self.pending_focus = self.active_block.clone();
+        }
+        let views: Vec<(BlockState, Option<Entity<TerminalView>>)> = blocks
             .into_iter()
             .map(|block| {
-                let view = self.terminal(&server_id, &session_id, &block.id, cx);
+                let view = block
+                    .is_terminal()
+                    .then(|| self.terminal(&server_id, &session_id, &block.id, cx));
                 (block, view)
             })
             .collect();
@@ -3424,11 +4452,21 @@ impl Workspace {
         // An open prompt or jump list owns the keyboard. Focusing a pane here
         // would take it back mid-typing, and the text would land in the shell
         // as well as in the field.
-        let held = self.prompt.is_some() || self.palette.is_some();
-        let focused_somewhere = views
-            .iter()
-            .any(|(_, view)| view.read(cx).handle().is_focused(window));
-        let wanted = if held {
+        let held = self.input_overlay_open();
+        if held || tool_waiting {
+            window.focus(&self.focus);
+        }
+        if !held && views.is_empty() {
+            window.focus(&self.focus);
+        }
+        let focused_somewhere = views.iter().any(|(_, view)| {
+            view.as_ref()
+                .is_some_and(|view| view.read(cx).handle().is_focused(window))
+        }) || (self.focus.is_focused(window)
+            && views
+                .iter()
+                .any(|(b, view)| view.is_none() && self.active_block.as_ref() == Some(&b.id)));
+        let wanted = if held || tool_waiting {
             None
         } else {
             self.pending_focus.take().or_else(|| {
@@ -3443,7 +4481,11 @@ impl Workspace {
         };
         if let Some(wanted) = wanted {
             if let Some((_, view)) = views.iter().find(|(block, _)| block.id == wanted) {
-                window.focus(&view.read(cx).handle());
+                if let Some(view) = view {
+                    window.focus(&view.read(cx).handle());
+                } else {
+                    window.focus(&self.focus);
+                }
             } else {
                 self.pending_focus = Some(wanted);
             }
@@ -3452,6 +4494,7 @@ impl Workspace {
         // The pane with the keyboard owns its terminal's size, so zooming it or
         // opening it from a shortcut reflows the remote side to the new box.
         for (_, view) in &views {
+            let Some(view) = view else { continue };
             let view = view.read(cx);
             if view.handle().is_focused(window) {
                 view.take_control();
@@ -3465,17 +4508,7 @@ impl Workspace {
         for floating_pass in [false, true] {
             for (block, view) in views.iter().filter(|(b, _)| b.floating == floating_pass) {
                 // A zoomed block is the only one the window shows.
-                if zoomed.is_some() && Some(&block.id) != zoomed.as_ref() {
-                    continue;
-                }
-                if self.minimized.contains(&block.id) {
-                    continue;
-                }
-                let [x, y, w, h] = if Some(&block.id) == zoomed.as_ref() {
-                    [0.0, 0.0, 1.0, 1.0]
-                } else {
-                    self.rect_of(block)
-                };
+                let [x, y, w, h] = pane_geometry(block, zoomed.as_deref(), self.rect_of(block));
                 let is_active = active.as_deref() == Some(block.id.as_str());
                 let outline = if is_active && ring {
                     theme::accent()
@@ -3485,6 +4518,46 @@ impl Workspace {
                 let block_id = block.id.clone();
                 let floating = block.floating;
                 let activate_id = block_id.clone();
+                let unsupported = view.is_none();
+                let content = if let Some(view) = view {
+                    div().size_full().child(view.clone())
+                } else {
+                    let server = server_id.clone();
+                    let session = session_id.clone();
+                    let id = block.id.clone();
+                    let details = self
+                        .block_details
+                        .get(&(server.clone(), session.clone(), id.clone()))
+                        .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+                        .unwrap_or_default();
+                    div()
+                        .size_full()
+                        .p_4()
+                        .bg(chrome.surface())
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_color(theme::text()).child(block.display_name()))
+                        .child(div().text_xs().text_color(theme::muted()).child(format!(
+                            "Creator: {} — no renderer installed",
+                            block.creator_name
+                        )))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("describe:{}", block.id)))
+                                .text_xs()
+                                .child("Describe block")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.describe_block(
+                                        server.clone(),
+                                        session.clone(),
+                                        id.clone(),
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(div().text_xs().text_color(theme::muted()).child(details))
+                };
 
                 let body = if floating {
                     // A floating pane carries its own little title bar: that is
@@ -3500,6 +4573,7 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .gap_2()
+                                .flex_none()
                                 .h(px(24.0))
                                 .px_2()
                                 .bg(chrome.surface())
@@ -3512,8 +4586,20 @@ impl Workspace {
                                         .truncate()
                                         .text_xs()
                                         .text_color(theme::muted())
-                                        .child(block.display_name()),
+                                        .child(if block.layer_kind == "local" { format!("{} · local", block.display_name()) } else { block.display_name() }),
                                 )
+                                .when(is_active, |el| {
+                                    el.child(self.menu_button(
+                                        format!("pane-menu:{}", block.id),
+                                        menu::Target {
+                                            server: server_id.clone(),
+                                            address: self.address().unwrap_or_default(),
+                                            session: Some(session_id.clone()),
+                                            block: Some(block.id.clone()),
+                                        },
+                                        cx,
+                                    ))
+                                })
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -3521,7 +4607,7 @@ impl Workspace {
                                     }),
                                 ),
                         )
-                        .child(view.clone())
+                        .child(div().flex_1().min_h(px(0.0)).child(content))
                         .child(
                             div()
                                 .absolute()
@@ -3551,8 +4637,44 @@ impl Workspace {
                                     }),
                                 ),
                         )
+                } else if is_active {
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(px(24.0))
+                                .flex_none()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .bg(chrome.surface())
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(block.display_name()),
+                                )
+                                .child(self.menu_button(
+                                    format!("pane-menu:{}", block.id),
+                                    menu::Target {
+                                        server: server_id.clone(),
+                                        address: self.address().unwrap_or_default(),
+                                        session: Some(session_id.clone()),
+                                        block: Some(block.id.clone()),
+                                    },
+                                    cx,
+                                )),
+                        )
+                        .child(div().flex_1().min_h(px(0.0)).child(content))
                 } else {
-                    div().size_full().child(view.clone())
+                    content
                 };
 
                 let pane = div()
@@ -3572,8 +4694,12 @@ impl Workspace {
                     .child(body)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
                             this.active_block = Some(activate_id.clone());
+                            this.pending_focus = None;
+                            if unsupported {
+                                window.focus(&this.focus);
+                            }
                             // The server keeps the authoritative focus; a click has
                             // to reach it too, or focus moves from the wrong pane.
                             this.publish_focus(&activate_id);
@@ -3869,13 +4995,22 @@ impl Workspace {
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.page = page;
-                        if page == Page::Connection && this.server_info.is_none() {
+                        if page == Page::Connection
+                            && this.server_info.get(this.server_id.as_deref()).is_none()
+                        {
                             this.refresh_info(cx);
+                        }
+                        if page == Page::Connection
+                            && this.creators.get(this.server_id.as_deref()).is_none()
+                        {
+                            this.refresh_creators(cx);
                         }
                         if page == Page::Terminal {
                             this.refresh_modes(cx);
                         }
-                        if page == Page::Keys && this.keymap.is_none() {
+                        if page == Page::Keys
+                            && this.keymap.get(this.server_id.as_deref()).is_none()
+                        {
                             this.refresh_keymap(cx);
                         }
                         cx.notify();
@@ -4085,8 +5220,14 @@ impl Workspace {
                 }
             }
             Page::Connection => {
-                let status = self.server_info.as_ref().and_then(|i| i.get("status"));
-                let whoami = self.server_info.as_ref().and_then(|i| i.get("whoami"));
+                let status = self
+                    .server_info
+                    .get(self.server_id.as_deref())
+                    .and_then(|i| i.get("status"));
+                let whoami = self
+                    .server_info
+                    .get(self.server_id.as_deref())
+                    .and_then(|i| i.get("whoami"));
                 let text = |value: Option<&serde_json::Value>, pointer: &str| -> String {
                     value
                         .and_then(|v| v.pointer(pointer))
@@ -4100,6 +5241,52 @@ impl Workspace {
                     "Server",
                     self.address().unwrap_or_else(|| "—".into()),
                     div().into_any_element(),
+                ));
+                rows.push(row(
+                    "Server actions",
+                    "Connection and configuration".into(),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("reconnect")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .child("Reconnect")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(id) = this.server_id.clone() {
+                                        this.engine.reconnect(&id);
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("probe")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .child("Probe")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.server_info = ServerCache::default();
+                                    this.refresh_info(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("config-reload")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .child("Reload config")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.connection_call("server.config_reload", json!({}), cx)
+                                })),
+                        )
+                        .into_any_element(),
                 ));
                 rows.push(row(
                     "Signed in as",
@@ -4164,6 +5351,50 @@ impl Workspace {
                                     this.tailscale(true, cx);
                                 })),
                         )
+                        .child(
+                            div()
+                                .id("ts-logout")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child("Logout")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.tailscale_call("server.tailscale.logout", cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("ts-disable")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child("Disable")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.tailscale_call("server.tailscale.disable", cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("ts-rename")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child("Rename")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_prompt(
+                                        Ask::RenameTailscale,
+                                        "Tailscale hostname",
+                                        window,
+                                    );
+                                    cx.notify();
+                                })),
+                        )
                         .into_any_element(),
                 ));
                 rows.push(row(
@@ -4185,7 +5416,9 @@ impl Workspace {
                                 .hover(|el| el.bg(chrome.hover()))
                                 .child("Refresh")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.server_info = None;
+                                    if let Some(server) = &this.server_id {
+                                        this.server_info.remove(server);
+                                    }
                                     this.refresh_info(cx);
                                 })),
                         )
@@ -4206,10 +5439,300 @@ impl Workspace {
                         )
                         .into_any_element(),
                 ));
+                rows.push(row(
+                    "Allow remote client actions (trusted peers only)",
+                    "Remote peers can request local UI actions. Disabled by default.".into(),
+                    toggle(
+                        "allow-remote-actions",
+                        self.settings.allow_remote_actions,
+                        cx,
+                        |s| &mut s.allow_remote_actions,
+                    ),
+                ));
+                rows.push(theme::section("SERVER DIRECTORY").into_any_element());
+                if let Some(server) = self.server_id.as_ref().and_then(|id| self.state.server(id)) {
+                    let target = menu::Target {
+                        server: server.id.clone(),
+                        address: server.address.clone(),
+                        session: None,
+                        block: None,
+                    };
+                    let source = target.clone();
+                    rows.push(row(
+                        "Selected server",
+                        format!("{} — {}", server.name, server.address),
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("directory-refresh")
+                                    .min_w(px(24.0))
+                                    .h(px(24.0))
+                                    .px_2()
+                                    .text_xs()
+                                    .child("Refresh")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.refresh_hosts_for(
+                                            source.address.clone(),
+                                            source.server.clone(),
+                                            cx,
+                                        )
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("directory-add")
+                                    .min_w(px(24.0))
+                                    .h(px(24.0))
+                                    .px_2()
+                                    .text_xs()
+                                    .child("Add entry…")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_prompt(
+                                            Ask::NewHost,
+                                            "Add directory entry — name and endpoint",
+                                            window,
+                                        );
+                                        this.prompt.as_mut().unwrap().scope = Some(target.clone());
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element(),
+                    ));
+                    if let Some(hosts) = self.hosts.get(Some(&server.id)) {
+                        let hosts = hosts.get("hosts").unwrap_or(hosts).as_array();
+                        if hosts.is_none_or(|list| list.is_empty()) {
+                            rows.push(row(
+                                "Directory",
+                                "No directory entries".into(),
+                                div().into_any_element(),
+                            ));
+                        }
+                        for host in hosts.into_iter().flatten() {
+                            let label = host
+                                .get("label")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Server")
+                                .to_owned();
+                            let endpoints = host
+                                .get("endpoints")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let mut actions = div().into_any_element();
+                            if let Some(id) = host.get("id").and_then(|v| v.as_str()) {
+                                let (id, name) = (id.to_owned(), label.clone());
+                                let target = menu::Target {
+                                    server: server.id.clone(),
+                                    address: server.address.clone(),
+                                    session: None,
+                                    block: None,
+                                };
+                                actions = div()
+                                    .id(SharedString::from(format!("directory-remove:{id}")))
+                                    .min_w(px(24.0))
+                                    .h(px(24.0))
+                                    .px_2()
+                                    .text_xs()
+                                    .child("Remove…")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_prompt(
+                                            Ask::DeleteHost(id.clone(), name.clone()),
+                                            &format!("Remove directory entry {name}?"),
+                                            window,
+                                        );
+                                        this.prompt.as_mut().unwrap().scope = Some(target.clone());
+                                        cx.notify();
+                                    }))
+                                    .into_any_element();
+                            }
+                            rows.push(row(
+                                "Directory entry",
+                                format!("{label} — {endpoints}"),
+                                actions,
+                            ));
+                        }
+                    } else {
+                        rows.push(row(
+                            "Directory",
+                            "Not loaded — choose Refresh".into(),
+                            div().into_any_element(),
+                        ));
+                    }
+                } else {
+                    rows.push(row(
+                        "Directory",
+                        "No selected server".into(),
+                        div().into_any_element(),
+                    ));
+                }
+                rows.push(theme::section("CLIENT LUA SCRIPTS").into_any_element());
+                rows.push(row(
+                    "Script",
+                    self.script
+                        .as_ref()
+                        .map(|s| format!("{} — Load executes on the selected server", s.name))
+                        .unwrap_or("No script selected".into()),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("script-choose")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .child("Choose .lua…")
+                                .on_click(cx.listener(|this, _, _, cx| this.choose_script(cx))),
+                        )
+                        .child(
+                            div()
+                                .id("script-load")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .child("Load")
+                                .on_click(cx.listener(|this, _, _, cx| this.set_script(false, cx))),
+                        )
+                        .child(
+                            div()
+                                .id("script-unload")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .child("Unload")
+                                .on_click(cx.listener(|this, _, _, cx| this.set_script(true, cx))),
+                        )
+                        .into_any_element(),
+                ));
+                for diagnostic in self
+                    .script_diagnostics
+                    .get(self.server_id.as_deref())
+                    .into_iter()
+                    .flatten()
+                {
+                    rows.push(
+                        div()
+                            .px_4()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(diagnostic.clone())
+                            .into_any_element(),
+                    );
+                }
+                rows.push(row(
+                    "Block creators",
+                    "Choose a flavor, then provide its options as a JSON object.".into(),
+                    div()
+                        .id("creators-refresh")
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .child("Discover / Refresh")
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_creators(cx)))
+                        .into_any_element(),
+                ));
+                if let Some(server) = self.server_id.clone() {
+                    if let Some(creators) = self
+                        .creators
+                        .get(Some(&server))
+                        .and_then(|v| v.get("creators"))
+                        .and_then(|v| v.as_array())
+                    {
+                        for creator in creators {
+                            for flavor in creator
+                                .get("flavors")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                            {
+                                let Some(name) = flavor
+                                    .get("flavor")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned)
+                                else {
+                                    continue;
+                                };
+                                let schema =
+                                    flavor.get("options_schema").cloned().unwrap_or(json!({}));
+                                let title = flavor
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&name)
+                                    .to_owned();
+                                let description = flavor
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let target_server = server.clone();
+                                rows.push(row(
+                                    "Create block",
+                                    format!("{title} · {description}"),
+                                    div()
+                                        .id(SharedString::from(format!("create:{name}")))
+                                        .px_2()
+                                        .py_1()
+                                        .text_xs()
+                                        .child("Create…")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if this.server_id.as_ref() != Some(&target_server) {
+                                                this.rpc_error("Create block", "Server selection changed; choose the flavor again", cx);
+                                                return;
+                                            }
+                                    let Some(session) = this.session_id.clone() else {
+                                                this.rpc_error(
+                                                    "Create block",
+                                                    "Select or create a session first",
+                                                    cx,
+                                                );
+                                                return;
+                                            };
+                                            let anchor = this.active().map(|b| b.id);
+                                            this.open_prompt(
+                                                Ask::CreateBlock {
+                                                    server: target_server.clone(),
+                                                    session,
+                                                    anchor,
+                                                    flavor: name.clone(),
+                                                    schema: schema.clone(),
+                                                },
+                                                "New block options (JSON object, e.g. {})",
+                                                window,
+                                            );
+                                            cx.notify();
+                                        }))
+                                        .into_any_element(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(clients) = self
+                    .server_info
+                    .get(self.server_id.as_deref())
+                    .and_then(|v| v.get("clients"))
+                {
+                    rows.push(theme::section("CONNECTED CLIENTS").into_any_element());
+                    rows.push(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(serde_json::to_string_pretty(clients).unwrap_or_default())
+                            .into_any_element(),
+                    );
+                }
             }
             Page::Keys => {
                 rows.push(theme::section("SHORTCUTS").into_any_element());
-                if let Some(keymap) = &self.keymap {
+                if let Some(keymap) = self.keymap.get(self.server_id.as_deref()) {
                     let config = keymap.get("config").cloned().unwrap_or_default();
                     let path = config
                         .get("path")
@@ -4372,6 +5895,10 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.process_client_requests(window, cx);
+        for (name, args) in std::mem::take(&mut self.configured_actions) {
+            self.run_configured_action(&name, args, window, cx);
+        }
         if !self.styled {
             self.styled = true;
             crate::win32::round_corners();
@@ -4403,6 +5930,7 @@ impl Render for Workspace {
         let toasts = self.toast_strip(cx);
         let prompt = self.prompt_overlay();
         let palette = self.palette_overlay(cx);
+        let menu = self.menu_overlay(window, cx);
         let body = if self.show_settings {
             self.settings_page(cx)
         } else {
@@ -4444,7 +5972,12 @@ impl Render for Workspace {
             .text_sm()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.palette.is_some() && this.palette_key(event, cx) {
+                if this.menu.is_some() {
+                    this.menu_key(event, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.palette.is_some() && this.palette_key(event, window, cx) {
                     cx.stop_propagation();
                     return;
                 }
@@ -4454,6 +5987,14 @@ impl Render for Workspace {
                 }
                 if this.show_settings && event.keystroke.key == "escape" {
                     this.close_settings(window, cx);
+                    return;
+                }
+                // The terminal already resolved its keymap. Let ordinary keys propagate to
+                // Windows/IME without resurrecting a removed default shortcut here.
+                if !this.show_settings
+                    && !this.prefix.load(std::sync::atomic::Ordering::Relaxed)
+                    && this.terminals.values().any(|view| view.read(cx).owns_keyboard(window))
+                {
                     return;
                 }
                 if let Some(action) = shortcuts::lookup(&event.keystroke) {
@@ -4475,6 +6016,9 @@ impl Render for Workspace {
                             _ => {}
                         }
                     }
+                    if this.pending_tool.as_ref().is_some_and(|tool| !tool.observed) {
+                        window.focus(&this.focus);
+                    }
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -4484,6 +6028,7 @@ impl Render for Workspace {
             .child(prompt)
             .child(palette)
             .child(toasts)
+            .child(menu)
     }
 }
 
@@ -4689,5 +6234,340 @@ mod split_tests {
         );
         // A lone pane cannot ask for the whole space back.
         assert_eq!(split_hint([0.0, 0.0, 1.0, 1.0]).2, 0.95);
+    }
+}
+
+#[cfg(test)]
+mod management_tests {
+    use super::*;
+
+    #[test]
+    fn palette_preserves_lua_schema_and_never_prompts_for_fixed_creator_args() {
+        let schema = json!({"type":"object","properties":{"cwd":{"type":"string"}}});
+        let map = json!({"actions":[
+            {"name":"dev_layout","kind":"lua","title":"Layout","args":schema},
+            {"name":"com.example.reset","kind":"block","title":"Reset","args":{"fixed":true}},
+            {"name":"pane.split","kind":"client","title":"Split"},
+            {"name":"com.example.method","kind":"block","args":{"type":"object"}}
+        ]});
+        let actions = palette_actions(
+            &map,
+            "original-server",
+            "original-session",
+            Some("original-block".into()),
+        );
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].args_schema, Some(schema));
+        assert_eq!(actions[0].server, "original-server");
+        assert_eq!(actions[0].session, "original-session");
+        assert_eq!(actions[0].block.as_deref(), Some("original-block"));
+        assert_eq!(actions[1].args_schema, None);
+    }
+
+    #[test]
+    fn creator_options_go_to_split_or_new_window_without_shell_interpolation() {
+        let options = json!({"command":["echo","$HOME; rm -rf /"],"cwd":"D:/some folder"});
+        let (method, payload) =
+            creator_request("session", Some("anchor"), "creator.flavor", options.clone());
+        assert_eq!(method, "session.new_split");
+        assert_eq!(payload["anchor_id"], "anchor");
+        assert_eq!(payload["layout"]["block"]["options"], options);
+        let (method, payload) = creator_request("session", None, "creator.flavor", json!({}));
+        assert_eq!(method, "session.new_window");
+        assert!(payload.get("anchor_id").is_none());
+    }
+
+    #[test]
+    fn fixed_action_omits_args_and_global_lua_action_omits_session() {
+        let fixed = action_request("session", Some("block"), "creator.reset", None);
+        assert!(fixed.get("args").is_none());
+        assert_eq!(fixed["session_id"], "session");
+        assert_eq!(fixed["block_id"], "block");
+        let args = json!({"cwd":"D:/work"});
+        let configured = action_request("", None, "layout", Some(args.clone()));
+        assert!(configured.get("session_id").is_none());
+        assert_eq!(configured["args"], args);
+        assert_eq!(configured["origin"], "palette");
+    }
+
+    #[test]
+    fn cached_keymap_generation_only_change_keeps_active_modes() {
+        let old = json!({"bindings":[],"modes":[{"name":"resize"}],"config":{"generation":1,"hash":"same","instance_id":"same"}});
+        let mut new = old.clone();
+        new["config"]["generation"] = json!(2);
+        assert!(!keymap_resolution_changed(Some(&old), &new));
+        new["bindings"] = json!([{"action":"pane.close","keys":["ctrl+w"]}]);
+        assert!(keymap_resolution_changed(Some(&old), &new));
+    }
+
+    #[test]
+    fn script_selection_only_stages_utf8_lua_and_load_payload_is_explicit() {
+        let script = script_draft(
+            std::path::Path::new("D:/work/custom.lua"),
+            b"print('unchanged source')",
+        )
+        .unwrap();
+        assert_eq!(script.name, "custom.lua");
+        assert_eq!(script.source, "print('unchanged source')");
+        assert_eq!(
+            script_request(Some(&script)),
+            json!({"scripts":[{"name":"custom.lua","source":"print('unchanged source')"}]})
+        );
+        assert_eq!(script_request(None), json!({"scripts":[]}));
+        assert!(script_draft(std::path::Path::new("bad.txt"), b"print(1)").is_err());
+        assert!(script_draft(std::path::Path::new("bad.lua"), &[0xff]).is_err());
+    }
+
+    #[test]
+    fn json_prompts_accept_multiline_paste_without_touching_confirmation_prompts() {
+        let mut prompt = Prompt {
+            what: Ask::CreateBlock {
+                server: "server".into(),
+                session: "session".into(),
+                anchor: None,
+                flavor: "flavor".into(),
+                schema: json!({}),
+            },
+            label: "Options".into(),
+            value: String::new(),
+            scope: None,
+        };
+        prompt.paste("{\n\"path\":\"C:/a folder\"\n}");
+        assert_eq!(
+            json_object(&prompt.value).unwrap(),
+            json!({"path":"C:/a folder"})
+        );
+        prompt.what = Ask::CloseLayer("server".into(), "session".into(), "layer".into());
+        let value = prompt.value.clone();
+        prompt.paste("do not append");
+        assert_eq!(prompt.value, value);
+    }
+
+    #[test]
+    fn options_and_action_params_must_be_json_objects() {
+        assert_eq!(
+            json_object(" {\n\"cwd\": \"D:/work\"\n} ").unwrap(),
+            json!({"cwd":"D:/work"})
+        );
+        for invalid in ["", "[]", "null", "42", "{oops}"] {
+            assert!(json_object(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+}
+
+fn json_object(text: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if !value.is_object() {
+        return Err("Expected a JSON object, such as {}".into());
+    }
+    Ok(value)
+}
+
+fn palette_actions(
+    map: &serde_json::Value,
+    server: &str,
+    session: &str,
+    block: Option<String>,
+) -> Vec<PaletteActionItem> {
+    map.get("actions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let title = a.get("title")?.as_str()?.to_owned();
+            if title.is_empty() || a.get("kind").and_then(|v| v.as_str()) == Some("client") {
+                return None;
+            }
+            let name = a.get("name")?.as_str()?.to_owned();
+            // Creator actions already carry fixed arguments; only Lua actions accept user parameters.
+            let args_schema = if a.get("kind").and_then(|v| v.as_str()) == Some("lua") {
+                a.get("args")
+                    .filter(|v| !v.is_null() && **v != serde_json::Value::Bool(false))
+                    .cloned()
+            } else {
+                None
+            };
+            Some(PaletteActionItem {
+                server: server.to_owned(),
+                session: session.to_owned(),
+                block: block.clone(),
+                name,
+                title,
+                description: a
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                args_schema,
+            })
+        })
+        .collect()
+}
+
+fn creator_request(
+    session: &str,
+    anchor: Option<&str>,
+    flavor: &str,
+    options: serde_json::Value,
+) -> (&'static str, serde_json::Value) {
+    let mut payload =
+        json!({"session_id":session,"layout":{"block":{"flavor":flavor,"options":options}}});
+    if let Some(anchor) = anchor {
+        payload["anchor_id"] = json!(anchor);
+        payload["direction"] = json!("horizontal");
+        payload["side"] = json!("after");
+        payload["ratio"] = json!(0.5);
+        ("session.new_split", payload)
+    } else {
+        ("session.new_window", payload)
+    }
+}
+
+fn action_request(
+    session: &str,
+    block: Option<&str>,
+    name: &str,
+    args: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = json!({"action":name,"origin":"palette"});
+    if !session.is_empty() {
+        payload["session_id"] = json!(session);
+        if let Some(block) = block {
+            payload["block_id"] = json!(block);
+        }
+    }
+    if let Some(args) = args {
+        payload["args"] = args;
+    }
+    payload
+}
+
+fn keymap_resolution_changed(old: Option<&serde_json::Value>, new: &serde_json::Value) -> bool {
+    old.is_none_or(|old| {
+        [
+            "/bindings",
+            "/modes",
+            "/actions",
+            "/config/hash",
+            "/config/instance_id",
+        ]
+        .iter()
+        .any(|path| old.pointer(path) != new.pointer(path))
+    })
+}
+
+fn script_draft(path: &std::path::Path, bytes: &[u8]) -> Result<ScriptDraft, String> {
+    if !path
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("lua"))
+    {
+        return Err("Choose a .lua file".into());
+    }
+    let name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or("Script file name is not UTF-8")?
+        .to_owned();
+    let source = std::str::from_utf8(bytes)
+        .map_err(|_| "Script must contain UTF-8 text")?
+        .to_owned();
+    Ok(ScriptDraft { name, source })
+}
+
+fn script_request(script: Option<&ScriptDraft>) -> serde_json::Value {
+    json!({"scripts":script.map(|s|vec![json!({"name":s.name,"source":s.source})]).unwrap_or_default()})
+}
+
+impl Prompt {
+    fn paste(&mut self, text: &str) {
+        if self.what.wants_text() {
+            self.value.push_str(text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod focus_regression_tests {
+    use super::*;
+
+    fn block(id: &str, minimized: bool, floating: bool, creator: &str) -> BlockState {
+        BlockState {
+            id: id.into(),
+            layer_state: if minimized { "minimized" } else { "normal" }.into(),
+            floating,
+            creator_name: creator.into(),
+            rect: [0.2, 0.1, 0.4, 0.5],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn window_jump_prefers_its_focused_pane_over_the_first_pane() {
+        let blocks = vec![
+            block("first", false, false, ""),
+            block("focused", false, false, ""),
+        ];
+        assert_eq!(
+            visible_focus(&blocks, None, Some("focused")),
+            Some("focused".into())
+        );
+    }
+
+    #[test]
+    fn minimized_blocks_never_win_selection_or_pending_focus() {
+        let blocks = vec![
+            block("hidden", true, true, ""),
+            block("visible", false, false, ""),
+        ];
+        assert_eq!(
+            visible_focus(&blocks, Some("hidden"), Some("hidden")),
+            Some("visible".into())
+        );
+        assert_eq!(visible_focus(&blocks[..1], Some("hidden"), None), None);
+        assert!(!pane_visible(&blocks[0], None));
+    }
+
+    #[test]
+    fn unsupported_floating_blocks_follow_the_same_zoom_and_visibility_rules() {
+        let unknown = block("unknown", false, true, "example.unsupported");
+        assert!(!unknown.is_terminal());
+        assert!(pane_visible(&unknown, None));
+        assert!(!pane_visible(&unknown, Some("other")));
+        assert_eq!(
+            pane_geometry(&unknown, Some("unknown"), unknown.rect),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+        assert_eq!(pane_geometry(&unknown, None, unknown.rect), unknown.rect);
+        assert_eq!(
+            visible_focus(&[unknown], None, None),
+            Some("unknown".into())
+        );
+    }
+}
+
+fn visible_focus(
+    blocks: &[BlockState],
+    preferred: Option<&str>,
+    focused: Option<&str>,
+) -> Option<String> {
+    let visible = |b: &&BlockState| b.layer_state != "minimized";
+    preferred
+        .into_iter()
+        .chain(focused)
+        .find_map(|id| blocks.iter().filter(visible).find(|b| b.id == id))
+        .or_else(|| blocks.iter().find(|b| b.layer_state != "minimized"))
+        .map(|b| b.id.clone())
+}
+
+fn pane_visible(block: &BlockState, zoomed: Option<&str>) -> bool {
+    block.layer_state != "minimized" && zoomed.is_none_or(|id| id == block.id)
+}
+
+fn pane_geometry(block: &BlockState, zoomed: Option<&str>, live: [f64; 4]) -> [f64; 4] {
+    if zoomed == Some(block.id.as_str()) {
+        [0.0, 0.0, 1.0, 1.0]
+    } else {
+        live
     }
 }
