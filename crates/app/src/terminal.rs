@@ -1,14 +1,16 @@
 //! One Rex block, drawn as a pane.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_channel::Sender;
+use flex_engine::keybindings::{KeyBindings, Resolution};
 use flex_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, px, App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
-    Focusable, IntoElement, KeyDownEvent, MouseButton, Point, Render, SharedString, UTF16Selection,
-    Window,
+    Focusable, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Point, Render, SharedString,
+    UTF16Selection, Window,
 };
 use shrew_core::{ColorTheme, Frame, Rgb, Row, TerminalStatus};
 
@@ -48,15 +50,29 @@ const THEME: ColorTheme = ColorTheme {
 /// touching; 1.3 em is a comfortable terminal pitch. Raise this for more air.
 const LINE_HEIGHT_EM: f32 = 1.3;
 
+pub enum TerminalEvent {
+    ConfiguredAction {
+        name: String,
+        args: serde_json::Value,
+    },
+}
+
+impl gpui::EventEmitter<TerminalEvent> for TerminalView {}
+
 pub struct TerminalView {
     /// An input method is composing. Its pinyin letters arrive as ordinary key
     /// events and must not reach the terminal; only the committed text should,
     /// and that comes through `replace_text_in_range` instead.
-    composing: bool,
+    composition: Composition,
     /// The shell's prefix key is armed, so the next key belongs to the chrome.
     prefix: Arc<std::sync::atomic::AtomicBool>,
     /// Where a selection drag started, in cells. `None` outside a drag.
     selecting: Option<(u16, u16)>,
+    mouse_buttons: Vec<MouseButton>,
+    control_released: bool,
+    focused: bool,
+    forwarded: ForwardedKeys,
+    keybindings: Option<Arc<std::sync::Mutex<KeyBindings>>>,
     /// The pane's text origin and cell size, written by each paint and read by
     /// the mouse handlers. Shared because paint cannot touch the view.
     geometry: Arc<std::sync::Mutex<(gpui::Point<gpui::Pixels>, Metrics)>>,
@@ -73,6 +89,8 @@ pub struct TerminalView {
     /// letters arrive before the composition starts, so they have already
     /// reached the terminal by the time we know better; the composition start
     /// retracts them with backspaces.
+    // shortcut: PTY IME rollback is heuristic; replace it only with confirmed
+    // platform composition-start semantics, not a key-delay timer.
     leaked: String,
     /// The punctuation key last sent to the pty. A Chinese IME commits its own
     /// version of that key right afterwards, so the plain one has to go.
@@ -84,13 +102,20 @@ pub struct TerminalView {
     palette: paint::Palette,
 }
 
-struct Notifier(Sender<()>);
+enum Wake {
+    Changed,
+    Actions(Vec<(String, serde_json::Value)>),
+}
+
+struct Notifier(Sender<Wake>);
 
 impl TerminalListener for Notifier {
     fn frame_ready(&self) {
-        let _ = self.0.try_send(());
+        let _ = self.0.try_send(Wake::Changed);
     }
-    fn status_changed(&self, _: TerminalStatus) {}
+    fn status_changed(&self, _: TerminalStatus) {
+        let _ = self.0.try_send(Wake::Changed);
+    }
     /// A program copied text with OSC 52, or another client selected some. The
     /// text never passes through a GPUI action, so it goes to the clipboard the
     /// direct way.
@@ -98,6 +123,11 @@ impl TerminalListener for Notifier {
         crate::win32::set_clipboard_text(&text);
     }
     fn size_changed(&self, _cols: u16, _rows: u16) {}
+    fn client_actions(&self, actions: Vec<(String, serde_json::Value)>) {
+        if !actions.is_empty() {
+            let _ = self.0.try_send(Wake::Actions(actions));
+        }
+    }
 }
 
 /// Whether a committed string has to be typed into the pty.
@@ -201,7 +231,7 @@ fn find_all(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize
     } else {
         text.to_lowercase()
     };
-    // Folding can change the char count (ß becomes ss), which would put the
+    // Lowercasing can change the char count (İ becomes i + combining dot), which would put the
     // highlight on the wrong cells, so skip such a row rather than mislead.
     if haystack.chars().count() != text.chars().count() {
         return Vec::new();
@@ -217,10 +247,8 @@ fn find_all(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize
     while index + needle.len() <= haystack.len() {
         if haystack[index..index + needle.len()] == needle[..] {
             found.push((index, needle.len()));
-            index += needle.len();
-        } else {
-            index += 1;
         }
+        index += 1;
     }
     found
 }
@@ -230,6 +258,11 @@ fn row_cells(row: &Row) -> (String, Vec<u16>) {
     let mut text = String::new();
     let mut columns = Vec::new();
     for run in &row.runs {
+        // shortcut: Run widths count graphemes, not scalars; skip ambiguous rows
+        // until the public frame exposes grapheme boundaries.
+        if run.text.chars().count() != run.widths.len() {
+            return (String::new(), Vec::new());
+        }
         let mut column = run.col;
         for (index, ch) in run.text.chars().enumerate() {
             text.push(ch);
@@ -252,11 +285,129 @@ struct Match {
 
 /// An open find bar: the query, the buffer lines that contain it, and which one
 /// is being shown.
+#[derive(Default)]
+struct Composition {
+    active: bool,
+    canceled_search: bool,
+    marked_utf16: usize,
+    pending_result: bool,
+    key_echo: Option<String>,
+}
+
+impl Composition {
+    fn start_typing(&mut self) {
+        if self.canceled_search {
+            self.canceled_search = false;
+            self.pending_result = false;
+        }
+    }
+    fn mark(&mut self, text: &str) {
+        if self.canceled_search { return; }
+        self.marked_utf16 = text.encode_utf16().count();
+        self.active = !text.is_empty();
+        if self.active {
+            self.pending_result = true;
+            self.canceled_search = false;
+            self.key_echo = None;
+        }
+    }
+    fn should_type(&mut self, composing: bool, text: &str) -> bool {
+        let duplicate = self.key_echo.take().as_deref() == Some(text);
+        composing || (!duplicate && commit_needs_typing(false, text))
+    }
+    fn marked_range(&self) -> Option<std::ops::Range<usize>> {
+        self.active.then_some(0..self.marked_utf16)
+    }
+    fn close_search(&mut self) {
+        self.canceled_search |= self.active;
+        self.active = false;
+    }
+    fn commit(&mut self, text: &str) -> Option<bool> {
+        if self.canceled_search && text.is_empty() {
+            return None;
+        }
+        let composing = self.active || self.pending_result;
+        self.active = false;
+        self.pending_result = false;
+        if std::mem::take(&mut self.canceled_search) {
+            None
+        } else {
+            Some(composing)
+        }
+    }
+}
+
+#[derive(Default)]
+struct ForwardedKeys {
+    keys: HashMap<String, (gpui::Keystroke, Vec<String>)>,
+}
+
+impl ForwardedKeys {
+    fn press(&mut self, key: gpui::Keystroke, prefix: Vec<String>) {
+        self.keys.insert(key.key.clone(), (key, prefix));
+    }
+    fn repeat(&self, key: &str) -> Option<&(gpui::Keystroke, Vec<String>)> {
+        self.keys.get(key)
+    }
+    fn release(&mut self, key: &str) -> Option<(gpui::Keystroke, Vec<String>)> {
+        self.keys.remove(key)
+    }
+}
+
 struct Find {
     query: String,
+    key_echo: Option<String>,
     matches: Vec<Match>,
     current: usize,
     case_sensitive: bool,
+}
+
+fn mouse_button(button: MouseButton) -> Option<&'static str> {
+    match button {
+        MouseButton::Left => Some("left"),
+        MouseButton::Middle => Some("middle"),
+        MouseButton::Right => Some("right"),
+        _ => None,
+    }
+}
+
+/// Named keys are not query text ("left" must never become four letters).
+fn query_key_text<'a>(key: &'a str, text: Option<&'a str>) -> Option<&'a str> {
+    let text = text.unwrap_or(if key == "space" { " " } else { key });
+    (!text.is_empty()
+        && !text.chars().any(char::is_control)
+        && (text.chars().count() == 1 || key != text))
+        .then_some(text)
+}
+
+impl Find {
+    fn mark(&mut self, sent: &str, composition: &str) {
+        self.key_echo = None;
+        let take = retract_len(sent, composition);
+        for _ in 0..take {
+            self.query.pop();
+        }
+    }
+
+    fn commit(&mut self, composing: bool, text: &str, punctuation: Option<char>) {
+        let echo = self.key_echo.take();
+        if !composing && echo.as_deref() == Some(text) {
+            return;
+        }
+        if replaces_sent_punctuation(punctuation, text) && self.query.chars().last() == punctuation
+        {
+            self.query.pop();
+        }
+        self.query.extend(text.chars().filter(|c| !c.is_control()));
+    }
+}
+
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        if let Some(session) = &self.session {
+            session.close();
+        }
+    }
 }
 
 impl TerminalView {
@@ -284,8 +435,20 @@ impl TerminalView {
         }
         if session.is_some() {
             cx.spawn(async move |this, cx| {
-                while rx.recv().await.is_ok() {
-                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                while let Ok(wake) = rx.recv().await {
+                    if this
+                        .update(cx, |_, cx| {
+                            if let Wake::Actions(actions) = wake {
+                                for (name, args) in actions {
+                                    if shortcuts::configured_action(&name, &args).is_some() {
+                                        cx.emit(TerminalEvent::ConfiguredAction { name, args });
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -293,9 +456,14 @@ impl TerminalView {
             .detach();
         }
         Self {
-            composing: false,
+            composition: Composition::default(),
             prefix,
             selecting: None,
+            mouse_buttons: Vec::new(),
+            control_released: false,
+            focused: false,
+            forwarded: ForwardedKeys::default(),
+            keybindings: None,
             geometry: Arc::new(std::sync::Mutex::new((
                 gpui::Point::default(),
                 Metrics {
@@ -329,10 +497,39 @@ impl TerminalView {
     /// shortcut — a tool from the prefix menu, a fresh split — never sees one,
     /// and a terminal without control is never resized when it is zoomed.
     pub fn take_control(&self) {
+        if self.control_released {
+            return;
+        }
         if let Some(session) = &self.session {
             if !session.has_control() {
                 session.clone().take_control();
             }
+        }
+    }
+
+    pub fn set_keybindings(&mut self, bindings: Arc<std::sync::Mutex<KeyBindings>>) {
+        self.keybindings = Some(bindings);
+    }
+
+    pub fn force_control(&mut self) {
+        self.control_released = false;
+        if let Some(session) = &self.session {
+            session.take_control();
+        }
+    }
+
+    pub fn request_control(&mut self) {
+        // An explicit request must not become a forced take on the next paint.
+        self.control_released = true;
+        if let Some(session) = &self.session {
+            session.request_control();
+        }
+    }
+
+    pub fn release_control(&mut self) {
+        self.control_released = true;
+        if let Some(session) = &self.session {
+            session.release_control();
         }
     }
 
@@ -366,14 +563,22 @@ impl TerminalView {
     }
 
     /// Type the clipboard into the terminal, line breaks and all.
-    pub fn paste(&mut self, _cx: &mut Context<Self>) {
-        let Some(session) = &self.session else { return };
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(text) = crate::win32::clipboard_text() else {
             return;
         };
         if text.is_empty() {
             return;
         }
+        if let Some(find) = &mut self.find {
+            find.key_echo = None;
+            find.query.push_str(&text);
+            self.leaked.clear();
+            self.last_punct = None;
+            self.refind(cx);
+            return;
+        }
+        let Some(session) = &self.session else { return };
         // `paste`, not `send_text`: a program that turned on bracketed paste
         // (mode 2004 — vim, agents, readline) needs the text wrapped, or it
         // treats every newline as Enter and runs half the paste.
@@ -411,8 +616,11 @@ impl TerminalView {
             // The bar is open, so the same chord closes it.
             Some(_) => self.close_find(cx),
             None => {
+                self.leaked.clear();
+                self.last_punct = None;
                 self.find = Some(Find {
                     query: String::new(),
+                    key_echo: None,
                     matches: Vec::new(),
                     current: 0,
                     case_sensitive: false,
@@ -424,6 +632,9 @@ impl TerminalView {
 
     fn close_find(&mut self, cx: &mut Context<Self>) {
         self.find = None;
+        self.composition.close_search();
+        self.leaked.clear();
+        self.last_punct = None;
         if let Some(session) = &self.session {
             session.clear_selection();
         }
@@ -448,6 +659,9 @@ impl TerminalView {
                 let frame = session.frame();
                 bar = frame.scrollbar;
                 for (index, row) in frame.lines.iter().enumerate() {
+                    if bar.offset + (index as u64) < top {
+                        continue;
+                    }
                     let (text, columns) = row_cells(row);
                     for (start, len) in find_all(&text, &needle, case) {
                         let (Some(&from), Some(&to)) =
@@ -458,7 +672,16 @@ impl TerminalView {
                         matches.push(Match {
                             row: bar.offset + index as u64,
                             from,
-                            to,
+                            to: columns
+                                .get(start + len)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    row.runs
+                                        .last()
+                                        .map(|run| run.col.saturating_add(run.cells))
+                                        .unwrap_or(to + 1)
+                                })
+                                .saturating_sub(1),
                         });
                     }
                 }
@@ -473,6 +696,8 @@ impl TerminalView {
             self.frame = session.frame();
         }
         if let Some(find) = &mut self.find {
+            matches.sort_by_key(|m| (m.row, m.from, m.to));
+            matches.dedup_by_key(|m| (m.row, m.from, m.to));
             find.matches = matches;
             find.current = 0;
         }
@@ -491,10 +716,8 @@ impl TerminalView {
         let bar = session.frame().scrollbar;
         // Put the match near the middle of the view when it is far away.
         let wanted = found.row.saturating_sub(bar.len / 2);
-        let earliest = bar
-            .total
-            .saturating_sub((self.scrollback_lines as u64).min(bar.total));
         let latest = bar.total.saturating_sub(bar.len);
+        let earliest = latest.saturating_sub(self.scrollback_lines);
         let target = wanted.clamp(earliest, latest);
         let delta = target as i64 - bar.offset as i64;
         if delta != 0 {
@@ -502,7 +725,7 @@ impl TerminalView {
         }
         self.frame = session.frame();
         // Highlight just the matched cells, once the viewport has moved.
-        let row = found.row.saturating_sub(target) as u16;
+        let row = found.row.saturating_sub(self.frame.scrollbar.offset) as u16;
         session.select_range((found.from, row), (found.to, row));
         cx.notify();
     }
@@ -535,15 +758,22 @@ impl TerminalView {
         };
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
+        if self.composition.active {
+            return true;
+        }
         if key == "escape" {
             self.close_find(cx);
             return true;
         }
         if key == "enter" {
-            self.find_step(true, cx);
+            self.find_step(!modifiers.shift, cx);
             return true;
         }
-        if key == "up" || key == "f3" {
+        if key == "f3" {
+            self.find_step(!modifiers.shift, cx);
+            return true;
+        }
+        if key == "up" {
             self.find_step(false, cx);
             return true;
         }
@@ -560,17 +790,24 @@ impl TerminalView {
         }
         if key == "backspace" {
             find.query.pop();
+            find.key_echo = None;
+            self.leaked.clear();
+            self.last_punct = None;
             self.refind(cx);
             return true;
         }
         if !modifiers.alt {
-            if let Some(text) = event.keystroke.key_char.as_deref().or(Some(key)) {
-                let printable: String = text.chars().filter(|c| !c.is_control()).collect();
-                if !printable.is_empty() && printable != "space" {
-                    find.query.push_str(&printable);
-                    self.refind(cx);
-                    return true;
+            if let Some(text) = query_key_text(key, event.keystroke.key_char.as_deref()) {
+                find.key_echo = Some(text.to_owned());
+                find.query.push_str(text);
+                if text.chars().all(|c| c.is_ascii_alphabetic()) {
+                    self.leaked.push_str(text);
+                } else {
+                    self.leaked.clear();
                 }
+                self.last_punct = text.chars().next().filter(|c| c.is_ascii_punctuation());
+                self.refind(cx);
+                return true;
             }
         }
         // Anything else is still swallowed: it is not terminal input while the
@@ -589,6 +826,105 @@ impl TerminalView {
         let col = (x / metrics.cell_w.max(1.0) as f32).floor() as u16;
         let row = (y / metrics.cell_h.max(1.0) as f32).floor() as u16;
         (col, row)
+    }
+
+    fn mouse_cell(&self, at: gpui::Point<gpui::Pixels>) -> (u16, u16) {
+        let (origin, metrics) = *self.geometry.lock().unwrap();
+        let (col, row) = Self::cell_at(origin, metrics, at);
+        (
+            col.min(self.frame.cols.saturating_sub(1)),
+            row.min(self.frame.rows.saturating_sub(1)),
+        )
+    }
+
+    fn forward_mouse(
+        &self,
+        action: &str,
+        button: Option<MouseButton>,
+        at: (u16, u16),
+        mods: gpui::Modifiers,
+    ) {
+        let Some(session) = &self.session else { return };
+        let buttons: Vec<_> = self
+            .mouse_buttons
+            .iter()
+            .filter_map(|b| mouse_button(*b))
+            .collect();
+        session.mouse_event(
+            action,
+            button.and_then(mouse_button),
+            &buttons,
+            at.0,
+            at.1,
+            mods.control,
+            mods.alt,
+            mods.shift,
+            mods.platform,
+        );
+    }
+
+    fn mouse_down(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus);
+        self.take_control();
+        if self.find.is_some() {
+            self.close_find(cx);
+        }
+        let cell = self.mouse_cell(event.position);
+        if event.button == MouseButton::Left
+            && (event.modifiers.control || event.modifiers.platform)
+        {
+            if let Some(url) = self.url_at(cell.0, cell.1) {
+                crate::win32::open_url(&url);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if !event.modifiers.shift && self.session.as_ref().is_some_and(|s| s.mouse_tracking()) {
+            if !self.mouse_buttons.contains(&event.button) {
+                self.mouse_buttons.push(event.button);
+            }
+            self.forward_mouse("press", Some(event.button), cell, event.modifiers);
+            cx.notify();
+        } else if event.button == MouseButton::Left {
+            self.begin_selection(cell, cx);
+        }
+    }
+
+    fn mouse_up(&mut self, event: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+        if self.mouse_buttons.contains(&event.button) {
+            self.mouse_buttons.retain(|b| *b != event.button);
+            // Release even if Shift was pressed mid-drag: don't leave a remote button stuck.
+            self.forward_mouse(
+                "release",
+                Some(event.button),
+                self.mouse_cell(event.position),
+                event.modifiers,
+            );
+            cx.notify();
+        } else if event.button == MouseButton::Left && self.selecting.is_some() {
+            self.drag_selection(event.position, cx);
+            self.finish_selection(cx);
+        }
+    }
+
+    fn mouse_move(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.selecting.is_some() {
+            self.drag_selection(event.position, cx);
+        } else if !event.modifiers.shift
+            && self.session.as_ref().is_some_and(|s| s.mouse_tracking())
+        {
+            self.forward_mouse(
+                "move",
+                self.mouse_buttons.last().copied(),
+                self.mouse_cell(event.position),
+                event.modifiers,
+            );
+        }
     }
 
     fn begin_selection(&mut self, at: (u16, u16), cx: &mut Context<Self>) {
@@ -634,20 +970,19 @@ impl TerminalView {
     }
 
     /// Scroll by `lines` notches, never further back than the configured cap.
-    fn wheel(&mut self, notches: f32, at: (u16, u16), cx: &mut Context<Self>) {
+    fn wheel(&mut self, notches: f32, at: (u16, u16), shift: bool, cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
         // A program that tracks the mouse — pi, vim, less — scrolls itself, and
         // the alternate screen it draws in has no scrollback to move anyway.
-        if session.mouse_tracking() {
+        if session.mouse_tracking() && !shift {
             session.wheel(at.0, at.1, -notches * 3.0);
             return;
         }
         let bar = self.frame.scrollbar;
         // One notch is three lines, the usual terminal step.
         let delta = -(notches * 3.0) as i64;
-        let limit = (self.scrollback_lines as u64).min(bar.total);
-        let earliest = bar.total.saturating_sub(limit) as i64;
         let latest = bar.total.saturating_sub(bar.len) as i64;
+        let earliest = (latest as u64).saturating_sub(self.scrollback_lines) as i64;
         let want = (bar.offset as i64 + delta).clamp(earliest, latest);
         let actual = want - bar.offset as i64;
         if actual != 0 {
@@ -671,21 +1006,93 @@ impl TerminalView {
         }
     }
 
+    /// Bubbled terminal keys must reach Windows translation, not the chrome's fallback bindings.
+    pub fn owns_keyboard(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+            && self.find.is_none()
+            && (self.keybindings.is_some() || self.composition.active)
+    }
+
     fn press(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.find_key(event, cx) {
+        if self.find.is_some() {
+            self.find_key(event, cx);
             return;
         }
-        // An armed prefix means the next key is the shell's, not the pty's.
+        if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt && !event.keystroke.modifiers.platform
+            && keymap::translate(&event.keystroke).is_some_and(|p| matches!(p.key, shrew_core::Key::Char(c) if !c.is_whitespace()))
+        {
+            self.composition.start_typing();
+        }
+        // While an IME is composing, the keys belong to it.
+        if self.composition.active {
+            return;
+        }
+        // An armed shell prefix belongs to the workspace, even with a loaded map.
         if self.prefix.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        // While an IME is composing, the keys belong to it.
-        if self.composing {
+        if event.is_held {
+            let mut translate = false;
+            if let Some((stroke, prefix)) = self.forwarded.repeat(&event.keystroke.key) {
+                translate = prefix.is_empty();
+                if let (Some(p), Some(session)) = (keymap::translate(stroke), &self.session) {
+                    self.composition.key_echo = match p.key {
+                        shrew_core::Key::Char(c) if !p.ctrl && !p.alt && !p.meta => Some(c.to_string()),
+                        _ => None,
+                    };
+                    session.send_key_event(
+                        p.key,
+                        (p.ctrl, p.alt, p.shift, p.meta),
+                        "repeat",
+                        prefix,
+                    );
+                }
+            }
+            if !translate {
+                cx.stop_propagation();
+            }
             return;
         }
-        // Shell shortcuts are not the terminal's: leave them to bubble up.
-        if shortcuts::lookup(&event.keystroke).is_some() {
-            return;
+        self.composition.key_echo = None;
+        // A new physical key after an empty preedit is not the previous IME result.
+        self.composition.pending_result = false;
+        let mut sequence = None;
+        if let Some(bindings) = &self.keybindings {
+            let resolved = bindings.lock().unwrap().resolve_for_creator(
+                &keymap::binding_key(&event.keystroke),
+                "com.superlogical.terminal",
+                |name, args| shortcuts::configured_action(name, args).is_some(),
+            );
+            match resolved {
+                Resolution::Consumed => {
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                Resolution::Action { name, args } => {
+                    self.leaked.clear();
+                    self.last_punct = None;
+                    if shortcuts::configured_action(&name, &args).is_some() {
+                        cx.emit(TerminalEvent::ConfiguredAction { name, args });
+                    } else if let Some(session) = &self.session {
+                        session.send_action(&name, args);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                Resolution::Forward { prefix } => {
+                    sequence = Some(prefix);
+                    cx.stop_propagation();
+                }
+                Resolution::Pass => {}
+            }
+            // GPUI calls TranslateMessage only for propagated keys; unbound typing must pass.
+            cx.notify();
+        } else {
+            if shortcuts::lookup(&event.keystroke).is_some() {
+                return;
+            }
         }
         let Some(session) = &self.session else { return };
         match keymap::translate(&event.keystroke) {
@@ -705,7 +1112,13 @@ impl TerminalView {
                     (shrew_core::Key::Char(c), false) if c.is_ascii_punctuation() => Some(c),
                     _ => None,
                 };
-                session.send_key(p.key, p.ctrl, p.alt, p.shift, p.meta);
+                self.composition.key_echo = match p.key {
+                    shrew_core::Key::Char(c) if !p.ctrl && !p.alt && !p.meta => Some(c.to_string()),
+                    _ => None,
+                };
+                let prefix = sequence.unwrap_or_default();
+                session.send_key_event(p.key, (p.ctrl, p.alt, p.shift, p.meta), "press", &prefix);
+                self.forwarded.press(event.keystroke.clone(), prefix);
             }
             None => {
                 if std::env::var_os("FLEX_DEBUG").is_some() {
@@ -718,10 +1131,18 @@ impl TerminalView {
             }
         }
     }
+    fn release(&mut self, event: &KeyUpEvent) {
+        let Some((stroke, prefix)) = self.forwarded.release(&event.keystroke.key) else {
+            return;
+        };
+        if let (Some(p), Some(session)) = (keymap::translate(&stroke), &self.session) {
+            session.send_key_event(p.key, (p.ctrl, p.alt, p.shift, p.meta), "release", &prefix);
+        }
+    }
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(session) = self.session.clone() else {
             let message = self
                 .error
@@ -730,6 +1151,11 @@ impl Render for TerminalView {
             return div().size_full().p_2().child(message).into_any_element();
         };
 
+        let focused = self.focus.is_focused(window);
+        if self.focused != focused {
+            self.focused = focused;
+            session.focus_event(focused);
+        }
         self.frame = session.frame();
         // FLEX_DEBUG=1 explains an empty pane: no frames means the stream is
         // dead, frames with no lines means the snapshot failed to restore.
@@ -839,6 +1265,36 @@ impl Render for TerminalView {
                 .child(close)
                 .into_any_element()
         });
+        let binding_status = self.keybindings.as_ref().and_then(|bindings| {
+            let bindings = bindings.lock().unwrap();
+            let prefix = bindings.pending().join(" → ");
+            match (bindings.mode(), prefix.is_empty()) {
+                (Some(mode), false) => Some(format!("{mode}: {prefix}")),
+                (Some(mode), true) => Some(mode.to_owned()),
+                (None, false) => Some(prefix),
+                (None, true) => None,
+            }
+        });
+        let status_bar = match session.status() {
+            TerminalStatus::Live => binding_status,
+            TerminalStatus::Connecting => Some("Connecting…".to_owned()),
+            TerminalStatus::Reconnecting => Some("Reconnecting…".to_owned()),
+            TerminalStatus::Exited { code } => Some(format!("Exited ({code})")),
+            TerminalStatus::Ended { reason } => Some(format!("Ended: {reason}")),
+        }
+        .map(|text| {
+            div()
+                .absolute()
+                .bottom(px(6.0))
+                .left(px(8.0))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(gpui::rgb(0x21242e))
+                .text_xs()
+                .text_color(gpui::rgb(0xf0b429))
+                .child(text)
+        });
         let view = cx.entity();
         let focus = self.focus.clone();
         let over_picture = self.over_picture;
@@ -856,33 +1312,24 @@ impl Render for TerminalView {
                 }
                 this.press(event, cx)
             }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.release(event)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    window.focus(&this.focus);
-                    if this.find.is_some() {
-                        this.close_find(cx);
-                    }
-                    // Claim the size so the server reflows this terminal to this window.
-                    if let Some(session) = &this.session {
-                        session.clone().take_control();
-                    }
-                    let (origin, metrics) = *this.geometry.lock().unwrap();
-                    let cell = TerminalView::cell_at(origin, metrics, event.position);
-                    if event.modifiers.control || event.modifiers.platform {
-                        if let Some(url) = this.url_at(cell.0, cell.1) {
-                            crate::win32::open_url(&url);
-                            cx.stop_propagation();
-                            return;
-                        }
-                    }
-                    this.begin_selection(cell, cx);
-                }),
+                cx.listener(|this, event, window, cx| this.mouse_down(event, window, cx)),
             )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.finish_selection(cx)),
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event, window, cx| this.mouse_down(event, window, cx)),
             )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event, window, cx| this.mouse_down(event, window, cx)),
+            )
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if this.selecting.is_none() && this.mouse_buttons.is_empty() {
+                    this.mouse_move(event, cx);
+                }
+            }))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                 // Vertical wheel scrolls the scrollback; horizontal is ignored.
                 let notches: f32 = match event.delta {
@@ -891,29 +1338,43 @@ impl Render for TerminalView {
                 };
                 let (origin, metrics) = *this.geometry.lock().unwrap();
                 let at = TerminalView::cell_at(origin, metrics, event.position);
-                this.wheel(notches, at, cx);
+                this.wheel(notches, at, event.modifiers.shift, cx);
             }))
-            .when(self.selecting.is_some(), |el| {
-                let view = cx.entity().downgrade();
-                el.child(
-                    canvas(
-                        |_, _, _| (),
-                        move |_, _, window, _cx| {
-                            let this = view.clone();
-                            window.on_mouse_event(
-                                move |event: &gpui::MouseMoveEvent, _phase, _window, cx| {
-                                    let _ = this
-                                        .update(cx, |me, cx| me.drag_selection(event.position, cx));
-                                },
-                            );
-                        },
+            .when(
+                self.selecting.is_some() || !self.mouse_buttons.is_empty(),
+                |el| {
+                    let view = cx.entity().downgrade();
+                    el.child(
+                        canvas(
+                            |_, _, _| (),
+                            move |_, _, window, _cx| {
+                                let up_view = view.clone();
+                                window.on_mouse_event(
+                                    move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                                        if phase == gpui::DispatchPhase::Bubble {
+                                            let _ =
+                                                up_view.update(cx, |me, cx| me.mouse_up(event, cx));
+                                        }
+                                    },
+                                );
+                                let this = view.clone();
+                                window.on_mouse_event(
+                                    move |event: &gpui::MouseMoveEvent, _phase, _window, cx| {
+                                        if _phase == gpui::DispatchPhase::Bubble {
+                                            let _ =
+                                                this.update(cx, |me, cx| me.mouse_move(event, cx));
+                                        }
+                                    },
+                                );
+                            },
+                        )
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .size_full(),
                     )
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .size_full(),
-                )
-            })
+                },
+            )
             .child(
                 canvas(
                     move |bounds, _window, cx| {
@@ -958,6 +1419,7 @@ impl Render for TerminalView {
                 .size_full(),
             )
             .children(find_bar)
+            .children(status_bar)
             .into_any_element()
     }
 }
@@ -1025,7 +1487,8 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        None
+        let end = self.composition.marked_range().map(|r| r.end).unwrap_or(0);
+        Some(UTF16Selection { range: end..end, reversed: false })
     }
 
     fn marked_text_range(
@@ -1033,11 +1496,11 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        None
+        self.composition.marked_range()
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.composing = false;
+        self.composition.active = false;
     }
 
     /// The committed string, after the candidate window closes.
@@ -1046,16 +1509,24 @@ impl EntityInputHandler for TerminalView {
         _range: Option<std::ops::Range<usize>>,
         text: &str,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        let was_composing = std::mem::replace(&mut self.composing, false);
+        let Some(was_composing) = self.composition.commit(text) else {
+            return;
+        };
         if std::env::var_os("FLEX_DEBUG").is_some() {
             eprintln!("[ime] commit {text:?} composing={was_composing}");
+        }
+        if let Some(find) = &mut self.find {
+            find.commit(was_composing, text, self.last_punct.take());
+            self.leaked.clear();
+            self.refind(cx);
+            return;
         }
         // Punctuation reaches us twice: Windows sends the plain key, then the
         // IME commits its full-width version. Take the plain one back.
         let take_back = replaces_sent_punctuation(self.last_punct.take(), text);
-        if !commit_needs_typing(was_composing, text) {
+        if !self.composition.should_type(was_composing, text) {
             return;
         }
         self.leaked.clear();
@@ -1075,12 +1546,24 @@ impl EntityInputHandler for TerminalView {
         _new_text: &str,
         _new_selected_range: Option<std::ops::Range<usize>>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        if self.composition.canceled_search { return; }
         if _new_text.is_empty() {
+            self.composition.mark("");
             return;
         }
-        if !self.composing {
+        if self.find.is_some() {
+            if !self.composition.active {
+                self.find.as_mut().unwrap().mark(&self.leaked, _new_text);
+                self.leaked.clear();
+                self.last_punct = None;
+                self.refind(cx);
+            }
+            self.composition.mark(_new_text);
+            return;
+        }
+        if !self.composition.active {
             // The composition has just started. Take back the letters it typed
             // before this message arrived — and only those.
             let take = retract_len(&self.leaked, _new_text);
@@ -1091,8 +1574,8 @@ impl EntityInputHandler for TerminalView {
             }
             self.leaked.clear();
         }
-        // Composition in progress: swallow key events until it commits.
-        self.composing = true;
+        // GPUI uses the marked range to route subsequent keys directly through IME.
+        self.composition.mark(_new_text);
     }
 
     fn bounds_for_range(
@@ -1102,7 +1585,14 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<gpui::Pixels>> {
-        None
+        let (origin, metrics) = *self.geometry.lock().unwrap();
+        let (col, row) = self.frame.cursor.as_ref().map(|c| (c.col, c.row)).unwrap_or((0, 0));
+        let origin = if self.find.is_some() {
+            _element_bounds.origin
+        } else {
+            origin + gpui::point(px(col as f32 * metrics.cell_w as f32), px(row as f32 * metrics.cell_h as f32))
+        };
+        Some(Bounds::new(origin, gpui::size(px(metrics.cell_w.max(1.0) as f32), px(metrics.cell_h.max(1.0) as f32))))
     }
 
     fn character_index_for_point(
@@ -1121,6 +1611,52 @@ mod tests {
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
+    }
+
+    #[test]
+    fn platform_sees_marked_utf16_text_until_commit_or_cancel() {
+        let mut composition = super::Composition::default();
+        composition.mark("ni好🙂");
+        assert_eq!(composition.marked_range(), Some(0..5));
+        assert_eq!(composition.commit("你好"), Some(true));
+        assert_eq!(composition.marked_range(), None);
+        composition.mark("ni");
+        composition.mark("");
+        assert_eq!(composition.marked_range(), None);
+    }
+
+    #[test]
+    fn empty_preedit_keeps_ascii_result_provenance() {
+        let mut composition = super::Composition::default();
+        composition.mark("abc");
+        composition.mark("");
+        assert_eq!(composition.marked_range(), None);
+        assert_eq!(composition.commit("abc"), Some(true));
+        assert_eq!(composition.commit("a"), Some(false));
+    }
+
+    #[test]
+    fn new_composition_after_search_cancellation_is_not_discarded() {
+        let mut composition = super::Composition::default();
+        composition.mark("ni");
+        composition.close_search();
+        assert_eq!(composition.commit(""), None);
+        composition.start_typing();
+        composition.mark("hao");
+        assert_eq!(composition.marked_range(), Some(0..3));
+        assert_eq!(composition.commit("好"), Some(true));
+    }
+
+    #[test]
+    fn layout_character_echo_is_not_typed_twice_but_ime_commit_is() {
+        let mut composition = super::Composition::default();
+        composition.key_echo = Some("é".into());
+        assert!(!composition.should_type(false, "é"));
+        assert!(composition.should_type(false, "中文"));
+        composition.key_echo = Some("a".into());
+        assert!(!composition.should_type(false, "a"));
+        composition.mark("abc");
+        assert!(composition.should_type(true, "abc"));
     }
 
     #[test]
@@ -1199,5 +1735,72 @@ mod tests {
     #[test]
     fn find_all_reports_nothing_for_an_empty_query() {
         assert!(find_all("anything", "", false).is_empty());
+    }
+    #[test]
+    fn search_includes_overlapping_matches() {
+        assert_eq!(find_all("banana", "ana", true), vec![(1, 3), (3, 3)]);
+        assert_eq!(find_all("aaaa", "aa", true), vec![(0, 2), (1, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn search_text_ignores_named_keys_and_accepts_space() {
+        assert_eq!(super::query_key_text("space", None), Some(" "));
+        assert_eq!(super::query_key_text("left", None), None);
+        assert_eq!(super::query_key_text("f8", None), None);
+        assert_eq!(super::query_key_text("period", Some(".")), Some("."));
+    }
+
+    #[test]
+    fn search_ime_replaces_only_local_preedit_and_punctuation() {
+        let mut find = super::Find {
+            query: "Englishni".into(),
+            key_echo: None,
+            matches: vec![],
+            current: 0,
+            case_sensitive: false,
+        };
+        find.mark("ni", "nihao");
+        find.commit(true, "你好", None);
+        assert_eq!(find.query, "English你好");
+        find.query.push(',');
+        find.commit(false, "，", Some(','));
+        assert_eq!(find.query, "English你好，");
+        find.commit(false, "abc", None);
+        assert_eq!(find.query, "English你好，abc");
+        find.query.push('x');
+        find.key_echo = Some("x".into());
+        find.commit(false, "x", None);
+        assert_eq!(find.query, "English你好，abcx");
+        find.commit(false, "\r\t\u{8}", None);
+        assert_eq!(find.query, "English你好，abcx");
+    }
+    #[test]
+    fn closing_search_discards_its_late_commit_even_after_unmark() {
+        let mut composition = super::Composition::default();
+        composition.active = true;
+        composition.close_search();
+        composition.active = false; // platform unmark may precede the commit.
+        composition.mark("late search preedit");
+        assert_eq!(composition.marked_range(), None);
+        assert_eq!(composition.commit(""), None);
+        assert_eq!(composition.commit("中文"), None);
+        assert_eq!(composition.commit("next"), Some(false));
+    }
+
+    #[test]
+    fn forwarded_keys_keep_sequence_for_repeat_and_release_but_not_shortcuts() {
+        let mut keys = super::ForwardedKeys::default();
+        let stroke = gpui::Keystroke {
+            key: "x".into(),
+            key_char: Some("x".into()),
+            modifiers: gpui::Modifiers::default(),
+        };
+        assert!(keys.repeat(&stroke.key).is_none()); // consumed shortcut has no release.
+        keys.press(stroke.clone(), vec!["ctrl+b".into()]);
+        assert_eq!(keys.repeat("x").unwrap().1, vec!["ctrl+b"]);
+        let (pressed, prefix) = keys.release("x").unwrap();
+        assert_eq!(pressed.key_char.as_deref(), Some("x"));
+        assert_eq!(prefix, vec!["ctrl+b"]);
+        assert!(keys.release("x").is_none());
     }
 }

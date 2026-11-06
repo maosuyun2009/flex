@@ -19,6 +19,8 @@ pub struct Settings {
     /// How many lines above the screen scrolling may reach. The engine keeps a
     /// fixed 16 MiB of scrollback; this caps how much of it the view exposes.
     pub scrollback_lines: u64,
+    /// Explicit consent before other clients may drive this window.
+    pub allow_remote_actions: bool,
 }
 
 impl Default for Settings {
@@ -30,6 +32,7 @@ impl Default for Settings {
             background: None,
             background_opacity: 0.35,
             scrollback_lines: 10_000,
+            allow_remote_actions: false,
         }
     }
 }
@@ -59,6 +62,7 @@ impl Settings {
                 .clamp(FONT_MIN, FONT_MAX),
             sidebar: flag("flex.sidebar").unwrap_or(default.sidebar),
             acrylic: flag("flex.acrylic").unwrap_or(default.acrylic),
+            allow_remote_actions: flag("flex.allow_remote_actions").unwrap_or(false),
             background: setting("flex.background").and_then(|v| v.as_str().map(str::to_owned)),
             background_opacity: number("flex.background_opacity")
                 .unwrap_or(default.background_opacity)
@@ -75,6 +79,10 @@ impl Settings {
         store.set_setting("flex.font_size", json!(self.font_size));
         store.set_setting("flex.sidebar", json!(self.sidebar));
         store.set_setting("flex.acrylic", json!(self.acrylic));
+        store.set_setting(
+            "flex.allow_remote_actions",
+            json!(self.allow_remote_actions),
+        );
         store.set_setting(
             "flex.background",
             match &self.background {

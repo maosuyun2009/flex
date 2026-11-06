@@ -185,38 +185,6 @@ mod imp {
     }
     pub fn toggle_maximize() {}
     pub fn minimize() {}
-    /// Text on the Win32 clipboard. GPUI's own reader came back empty for text
-    /// another process put there, so read the format directly.
-    pub fn clipboard_text() -> Option<String> {
-        unsafe {
-            if OpenClipboard(std::ptr::null_mut()) == 0 {
-                return None;
-            }
-            let mut text = None;
-            if IsClipboardFormatAvailable(CF_UNICODETEXT as u32) != 0 {
-                let handle = GetClipboardData(CF_UNICODETEXT as u32);
-                if !handle.is_null() {
-                    let global = handle as HGLOBAL;
-                    let bytes = GlobalSize(global);
-                    let wide = GlobalLock(global) as *const u16;
-                    if !wide.is_null() {
-                        let limit = bytes / 2;
-                        let mut len = 0;
-                        while len < limit && *wide.add(len) != 0 {
-                            len += 1;
-                        }
-                        text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(
-                            wide, len,
-                        )));
-                        GlobalUnlock(global);
-                    }
-                }
-            }
-            CloseClipboard();
-            text
-        }
-    }
-
     pub fn round_corners() {}
 }
 

@@ -1,0 +1,22 @@
+[package]
+name = "shrew-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/teddytennant/shrew"
+rust-version = "1.90"
+
+[dependencies]
+futures-util = "0.3.34"
+parking_lot = "0.12.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+shrew-client = { version = "0.1.0", path = "../shrew-client" }
+shrew-proto = { version = "0.1.0", path = "../shrew-proto" }
+shrew-term = { git = "https://github.com/teddytennant/shrew", rev = "9cfc45ff91ab1d2283f7514f8a5d0096a0d68690" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["full"] }
