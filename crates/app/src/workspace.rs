@@ -1049,43 +1049,45 @@ impl Workspace {
             _ => {}
         }
 
+        // Everything else is a Rex call. A session id is not a precondition:
+        // creating the first session has to work when there is none.
+        let Some(address) = self.address() else {
+            return;
+        };
+        let session = self.session_id.clone();
         let fresh_session = matches!(&prompt.what, Ask::NewSession(..));
         let touched_hosts = matches!(&prompt.what, Ask::NewHost | Ask::DeleteHost(..));
         let deleted_session = matches!(&prompt.what, Ask::DeleteSession(..));
-        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
-            return;
-        };
         let engine = self.engine.clone();
-        // A new session can be asked for on any machine in the list, not only
-        // the one this window is showing.
-        let target = match &prompt.what {
-            Ask::NewSession(address) => address.clone(),
-            _ => address.clone(),
-        };
-        let (method, payload) = match &prompt.what {
+        let (target, method, payload) = match &prompt.what {
             Ask::RenameTab => {
-                let Some(window_id) = self.window_id.clone() else {
+                let (Some(window_id), Some(session)) = (self.window_id.clone(), session) else {
                     return;
                 };
                 (
+                    address.clone(),
                     "session.set_window_label",
                     json!({"session_id": session, "window_id": window_id, "label": value}),
                 )
             }
             Ask::RenamePane => {
-                let Some(block_id) = self.active_block.clone() else {
+                let (Some(block_id), Some(session)) = (self.active_block.clone(), session) else {
                     return;
                 };
                 (
+                    address.clone(),
                     "session.set_block_label",
                     json!({"session_id": session, "block_id": block_id, "label": value}),
                 )
             }
-            Ask::NewSession(address) => (
-                "session.create",
-                json!({"label": value, "address": address}),
+            Ask::NewSession(machine) => {
+                (machine.clone(), "session.create", json!({"label": value}))
+            }
+            Ask::DeleteSession(id, _) => (
+                address.clone(),
+                "session.destroy",
+                json!({"session_id": id}),
             ),
-            Ask::DeleteSession(id, _) => ("session.destroy", json!({"session_id": id})),
             Ask::NewHost => {
                 // "studio studio.tail1234.ts.net": the last word is the address.
                 let mut words: Vec<&str> = value.split_whitespace().collect();
@@ -1099,11 +1101,12 @@ impl Workspace {
                     label
                 };
                 (
+                    address.clone(),
                     "hosts.put",
                     json!({"host": {"label": label, "endpoints": [endpoint]}}),
                 )
             }
-            Ask::DeleteHost(id, _) => ("hosts.remove", json!({"id": id})),
+            Ask::DeleteHost(id, _) => (address.clone(), "hosts.remove", json!({"id": id})),
             Ask::AddServer | Ask::DeleteServer(..) => return,
         };
         cx.spawn(async move |this, cx| {
