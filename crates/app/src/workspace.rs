@@ -3134,7 +3134,14 @@ impl Workspace {
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
             // Ask for the foreground process directory when OSC 7 is unavailable.
-            let mut options = json!({"shell": "none", "command": command});
+            //
+            // Not `shell: none`: that execs the program with the server's own
+            // PATH, where a tool installed in ~/.local/bin (lazygit) or handed
+            // over by the shell's startup files (rg) is not found, and the block
+            // never starts. Running through the user's shell with its
+            // interactive startup files gives the tool the PATH their terminals
+            // have.
+            let mut options = json!({"command": command, "interactive": true});
             if let Some(cwd) = engine
                 .block_cwd(&address, &request.session, &request.origin)
                 .await
