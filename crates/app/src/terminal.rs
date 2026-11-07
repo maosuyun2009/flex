@@ -67,7 +67,9 @@ pub struct TerminalView {
     /// The shell's prefix key is armed, so the next key belongs to the chrome.
     prefix: Arc<std::sync::atomic::AtomicBool>,
     /// Where a selection drag started, in cells. `None` outside a drag.
-    selecting: Option<(u16, u16)>,
+    /// A selection being dragged. Nothing is selected until the pointer moves:
+    /// a click that only switches panes must not select or copy anything.
+    selecting: Option<Selecting>,
     mouse_buttons: Vec<MouseButton>,
     control_released: bool,
     focused: bool,
@@ -414,6 +416,24 @@ impl Composition {
             Some(composing)
         }
     }
+}
+
+/// A press that may become a text selection.
+struct Selecting {
+    /// The cell the press landed on, the anchor of the selection.
+    from: (u16, u16),
+    /// Where the pointer was, in pixels, to tell a drag from a click.
+    pressed: gpui::Point<gpui::Pixels>,
+    /// Whether it has moved far enough to be a drag.
+    dragging: bool,
+}
+
+/// Whether the pointer has moved far enough for this to be a drag rather than a
+/// click: switching panes jitters a pixel or two, and that must select nothing.
+fn is_drag(pressed: gpui::Point<gpui::Pixels>, at: gpui::Point<gpui::Pixels>) -> bool {
+    const SLOP: f32 = 4.0;
+    (f32::from(at.x) - f32::from(pressed.x)).abs() > SLOP
+        || (f32::from(at.y) - f32::from(pressed.y)).abs() > SLOP
 }
 
 #[derive(Default)]
@@ -958,8 +978,23 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The press that gives this pane the keyboard belongs to the chrome: a
+        // program that acts on clicks (a chat TUI copies the message under the
+        // pointer) must not see the click that only switched panes.
+        let switching = !self.focused;
         window.focus(&self.focus);
         self.take_control();
+        if switching {
+            // Nothing else: the press that gives this pane the keyboard belongs
+            // to the chrome. Forwarding it lets a program act on a click meant
+            // to switch panes, and starting a selection on it turns a slightly
+            // moving click into a copied swath of text.
+            if std::env::var_os("FLEX_DEBUG").is_some() {
+                eprintln!("[mouse] switch: focus only");
+            }
+            cx.notify();
+            return;
+        }
         if self.find.is_some() {
             self.close_find(cx);
         }
@@ -974,13 +1009,19 @@ impl TerminalView {
             }
         }
         if !event.modifiers.shift && self.session.as_ref().is_some_and(|s| s.mouse_tracking()) {
+            if std::env::var_os("FLEX_DEBUG").is_some() {
+                eprintln!("[mouse] forward press {cell:?} (the program tracks the mouse)");
+            }
             if !self.mouse_buttons.contains(&event.button) {
                 self.mouse_buttons.push(event.button);
             }
             self.forward_mouse("press", Some(event.button), cell, event.modifiers);
             cx.notify();
         } else if event.button == MouseButton::Left {
-            self.begin_selection(cell, cx);
+            if std::env::var_os("FLEX_DEBUG").is_some() {
+                eprintln!("[mouse] down cell={cell:?} at={:?}", event.position);
+            }
+            self.begin_selection(cell, event.position, cx);
         }
     }
 
@@ -1003,6 +1044,17 @@ impl TerminalView {
 
     fn mouse_move(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
         if self.selecting.is_some() {
+            // A click can be quicker than a frame, and then the release never
+            // reaches the overlay that waits for it. Without this, the stale
+            // anchor turns the next pointer movement into a selection dragged
+            // across half the screen.
+            if std::env::var_os("FLEX_DEBUG").is_some() {
+                eprintln!("[mouse] move pressed={:?}", event.pressed_button);
+            }
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.cancel_selection(cx);
+                return;
+            }
             self.drag_selection(event.position, cx);
         } else if !event.modifiers.shift
             && self.session.as_ref().is_some_and(|s| s.mouse_tracking())
@@ -1016,12 +1068,17 @@ impl TerminalView {
         }
     }
 
-    fn begin_selection(&mut self, at: (u16, u16), cx: &mut Context<Self>) {
-        if let Some(session) = &self.session {
-            session.clear_selection();
-            session.select_range(at, at);
-        }
-        self.selecting = Some(at);
+    fn begin_selection(
+        &mut self,
+        at: (u16, u16),
+        pressed: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selecting = Some(Selecting {
+            from: at,
+            pressed,
+            dragging: false,
+        });
         cx.notify();
     }
 
@@ -1035,7 +1092,23 @@ impl TerminalView {
     /// Finish a drag: put the selection on the clipboard, the way a terminal does.
     /// While a selection is being dragged, extend it with the pointer.
     fn drag_selection(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        let Some(from) = self.selecting else { return };
+        let Some(selecting) = &mut self.selecting else {
+            return;
+        };
+        let from = selecting.from;
+        if !selecting.dragging {
+            if !is_drag(selecting.pressed, at) {
+                return;
+            }
+            if std::env::var_os("FLEX_DEBUG").is_some() {
+                eprintln!("[mouse] drag starts from={from:?} at={at:?}");
+            }
+            selecting.dragging = true;
+            if let Some(session) = &self.session {
+                session.clear_selection();
+                session.select_range(from, from);
+            }
+        }
         let (origin, metrics) = *self.geometry.lock().unwrap();
         let to = TerminalView::cell_at(origin, metrics, at);
         if to != from {
@@ -1043,9 +1116,34 @@ impl TerminalView {
         }
     }
 
-    fn finish_selection(&mut self, cx: &mut Context<Self>) {
+    /// Drop a selection that nothing is holding down any more.
+    fn cancel_selection(&mut self, cx: &mut Context<Self>) {
         self.selecting = None;
+        if let Some(session) = &self.session {
+            session.clear_selection();
+        }
+        cx.notify();
+    }
+
+    fn finish_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(selecting) = self.selecting.take() else {
+            return;
+        };
         let Some(session) = &self.session else { return };
+        if std::env::var_os("FLEX_DEBUG").is_some() {
+            let text = session.selection_text().unwrap_or_default();
+            eprintln!(
+                "[mouse] finish dragging={} text={:?}",
+                selecting.dragging,
+                text.chars().take(40).collect::<String>()
+            );
+        }
+        if !selecting.dragging {
+            // A click, not a drag: it switched panes and nothing is selected.
+            session.clear_selection();
+            cx.notify();
+            return;
+        }
         let Some(text) = session.selection_text() else {
             session.clear_selection();
             cx.notify();
@@ -1422,6 +1520,10 @@ impl Render for TerminalView {
                 this.press(event, cx)
             }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.release(event)))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| this.mouse_up(event, cx)),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event, window, cx| this.mouse_down(event, window, cx)),
@@ -1728,6 +1830,19 @@ mod tests {
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
+    }
+
+    #[test]
+    fn a_click_that_switches_panes_is_not_a_drag() {
+        use gpui::{point, px};
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        // A click jitters a pixel or two; that must not select text.
+        assert!(!super::is_drag(at(100.0, 50.0), at(101.0, 51.0)));
+        assert!(!super::is_drag(at(100.0, 50.0), at(104.0, 54.0)));
+        assert!(!super::is_drag(at(100.0, 50.0), at(100.0, 50.0)));
+        // Crossing the slop in either axis is a drag.
+        assert!(super::is_drag(at(100.0, 50.0), at(105.0, 50.0)));
+        assert!(super::is_drag(at(100.0, 50.0), at(100.0, 45.0)));
     }
 
     #[test]
