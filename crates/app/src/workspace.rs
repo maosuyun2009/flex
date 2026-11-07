@@ -71,6 +71,17 @@ struct ParkedBlock {
 /// visible around it, the way a floating terminal is usually wanted.
 const FLOAT_BOUNDS: [f64; 4] = [0.14, 0.12, 0.72, 0.7];
 
+/// Where another floating pane lands: the same box, stepped down and right for
+/// every float already open, so two of them are not stacked exactly and both
+/// keep a title bar to grab.
+fn float_bounds(open: usize) -> [f64; 4] {
+    const STEP: f64 = 0.035;
+    // Four steps fill the free space: 4 * 0.035 + 0.72 + 0.14 = 1.0.
+    let step = STEP * (open % 4) as f64;
+    let [x, y, w, h] = FLOAT_BOUNDS;
+    [x + step, y + step, w, h]
+}
+
 /// What the pointer grabbed on a floating pane.
 #[derive(Clone, Copy, PartialEq)]
 enum Grab {
@@ -706,7 +717,7 @@ impl Workspace {
             .find(|w| Some(&w.id) == self.window_id.as_ref())
             .and_then(|w| w.focused_block_id.as_deref());
         let active = visible_focus(&blocks, self.active_block.as_deref(), focused);
-        if !tool_waiting && self.active_block != active {
+        if !tool_waiting && !self.arriving(&blocks) && self.active_block != active {
             self.active_block = active.clone();
             self.pending_focus = active;
         }
@@ -783,6 +794,19 @@ impl Workspace {
             }
         }
         blocks
+    }
+
+    /// Whether the pane that was just created is still on its way.
+    ///
+    /// A block from `session.new_layer` reaches the state snapshot a moment after
+    /// the reply, and until then it is missing from `blocks`. Without this, the
+    /// reload and the render both treated it as gone and moved the selection back
+    /// to the pane the user came from, so the keyboard stayed there while the new
+    /// float looked focused.
+    fn arriving(&self, blocks: &[BlockState]) -> bool {
+        self.active_block
+            .as_deref()
+            .is_some_and(|id| self.pending_focus.as_deref() == Some(id) && blocks.iter().all(|b| b.id != id))
     }
 
     fn active(&self) -> Option<BlockState> {
@@ -954,6 +978,7 @@ impl Workspace {
             Action::SplitDown => self.split(true, cx),
             Action::ClosePane => self.close_pane(cx),
             Action::ToggleFloat => self.toggle_float(cx),
+            Action::NewFloat => self.new_float(cx),
             Action::NextPane => self.step_focus("session.focus_next_pane", cx),
             Action::PrevPane => self.step_focus("session.focus_previous_pane", cx),
             Action::NextTab => self.step_focus("session.focus_next_window", cx),
@@ -3086,6 +3111,160 @@ impl Workspace {
         .detach();
     }
 
+    /// Open a new terminal in a floating layer over this tab, leaving the tiled
+    /// panes underneath exactly as they are. A tab with no tiled pane has nothing
+    /// to float over — Rex can only add blocks beside an existing one — so there
+    /// the key gives the tab the pane it lacks instead.
+    fn new_float(&mut self, cx: &mut Context<Self>) {
+        if self.blocks().iter().all(|block| block.floating) {
+            return self.pane_for_float_only_tab(cx);
+        }
+        let (Some(address), Some(session_id), Some(window_id)) =
+            (self.address(), self.session_id.clone(), self.window_id.clone())
+        else {
+            return;
+        };
+        let engine = self.engine.clone();
+        let block_id = self.active().map(|block| block.id);
+        // A second float lands a step away from the first, not exactly on it.
+        let bounds = float_bounds(self.blocks().iter().filter(|b| b.floating).count());
+        cx.spawn(async move |this, cx| {
+            // Land where the pane you came from is, not in `$HOME`.
+            let mut layout = json!({"block": {"flavor": "com.superlogical.terminal.shell"}});
+            let cwd = match &block_id {
+                Some(block_id) => engine.block_cwd(&address, &session_id, block_id).await,
+                None => None,
+            };
+            if let Some(cwd) = cwd {
+                layout["block"]["options"] = json!({"cwd": cwd});
+            }
+            let payload = json!({
+                "session_id": session_id,
+                "window_id": window_id,
+                "focus": true,
+                "bounds": bounds,
+                "layout": layout,
+            });
+            match engine.call(&address, "session.new_layer", payload).await {
+                Ok(view) => {
+                    let opened = view
+                        .pointer("/block_ids/0")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned);
+                    this.update(cx, |me, cx| {
+                        if let Some(opened) = opened {
+                            me.active_block = Some(opened.clone());
+                            me.pending_focus = Some(opened);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    this.update(cx, |me, cx| me.rpc_error("session.new_layer", e, cx))
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Give a tab that holds only floating panes the tiled pane it has none of.
+    ///
+    /// Rex cannot place a block into an empty tiled layer: `session.new_split`
+    /// needs an anchor and falls back to the floating layer without one. So the
+    /// tab is rebuilt around a new one — a new tab with a tiled shell, this tab's
+    /// panes moved over and floated again where they were, and the old tab, now
+    /// empty, disappears on its own.
+    fn pane_for_float_only_tab(&mut self, cx: &mut Context<Self>) {
+        let (Some(address), Some(session), Some(old_window)) =
+            (self.address(), self.session_id.clone(), self.window_id.clone())
+        else {
+            return;
+        };
+        let label = self
+            .windows()
+            .into_iter()
+            .find(|w| w.id == old_window)
+            .map(|w| w.label)
+            .unwrap_or_default();
+        let panes: Vec<(String, [f64; 4])> = self
+            .blocks()
+            .into_iter()
+            .map(|block| (block.id, block.rect))
+            .collect();
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let created = engine
+                .call(
+                    &address,
+                    "session.new_window",
+                    json!({
+                        "session_id": session,
+                        "focus": true,
+                        "window_label": label,
+                        "layout": {"block": {"flavor": "com.superlogical.terminal.shell"}},
+                    }),
+                )
+                .await;
+            let (window, anchor) = match created {
+                Ok(view) => (
+                    view["window_id"].as_str().map(str::to_owned),
+                    view["block_ids"][0].as_str().map(str::to_owned),
+                ),
+                Err(e) => {
+                    this.update(cx, |me, cx| me.rpc_error("session.new_window", e, cx))
+                        .ok();
+                    return;
+                }
+            };
+            let (Some(window), Some(anchor)) = (window, anchor) else {
+                return;
+            };
+            for (block, rect) in panes {
+                // A pane that cannot be moved keeps its program where it is; that
+                // beats closing the tab over it.
+                let moved = engine
+                    .call(
+                        &address,
+                        "session.move_block",
+                        json!({
+                            "session_id": session,
+                            "block_id": block,
+                            "anchor_block_id": anchor,
+                            "direction": "horizontal",
+                            "ratio": 0.5,
+                        }),
+                    )
+                    .await;
+                if let Err(e) = moved {
+                    this.update(cx, |me, cx| me.rpc_error("session.move_block", e, cx))
+                        .ok();
+                    return;
+                }
+                let floated = engine
+                    .call(
+                        &address,
+                        "session.float_block",
+                        json!({"session_id": session, "block_id": block, "bounds": rect}),
+                    )
+                    .await;
+                if let Err(e) = floated {
+                    this.update(cx, |me, cx| me.rpc_error("session.float_block", e, cx))
+                        .ok();
+                }
+            }
+            this.update(cx, |me, cx| {
+                me.window_id = Some(window.clone());
+                me.active_block = Some(anchor.clone());
+                me.pending_focus = Some(anchor);
+                me.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Open a tool beside the active pane: lazygit, or an fzf picker whose choice
     /// is typed back into the pane it came from.
     fn run_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
@@ -4519,7 +4698,7 @@ impl Workspace {
             .cloned()
             .collect();
         let visible = visible_focus(&blocks, self.active_block.as_deref(), None);
-        if !tool_waiting && self.active_block != visible {
+        if !tool_waiting && !self.arriving(&blocks) && self.active_block != visible {
             self.active_block = visible.clone();
             if self.pending_focus.is_none() {
                 self.pending_focus = visible;
@@ -4602,9 +4781,15 @@ impl Workspace {
         let active = self.active_block.clone();
         let chrome = self.chrome();
         let mut elements: Vec<AnyElement> = Vec::with_capacity(views.len());
-        // Floating layers paint last, so they sit above the tiled panes.
-        for floating_pass in [false, true] {
-            for (block, view) in views.iter().filter(|(b, _)| b.floating == floating_pass) {
+        // Tiled panes paint first, then the floating ones; the float with the
+        // keyboard paints last, so it is the one you see when two share bounds.
+        let mut draw: Vec<&(BlockState, Option<Entity<TerminalView>>)> = Vec::with_capacity(views.len());
+        draw.extend(views.iter().filter(|(b, _)| !b.floating));
+        let mut floats: Vec<_> = views.iter().filter(|(b, _)| b.floating).collect();
+        floats.sort_by_key(|(b, _)| paints_later(b, active.as_deref()));
+        draw.append(&mut floats);
+        {
+            for (block, view) in draw {
                 // A zoomed block is the only one the window shows.
                 let [x, y, w, h] = pane_geometry(block, zoomed.as_deref(), self.rect_of(block));
                 let is_active = active.as_deref() == Some(block.id.as_str());
@@ -4784,9 +4969,15 @@ impl Workspace {
                     .h(relative(h as f32))
                     .border_1()
                     .border_color(outline)
-                    .when(floating, |el| el.shadow_lg().rounded_md())
+                    // A float sits on other panes, so it carries the chrome's
+                    // translucent surface: enough of a backdrop to read the text
+                    // over the picture behind it, and the glass setting still
+                    // shows through.
+                    .when(floating, |el| {
+                        el.shadow_lg().rounded_md().bg(chrome.surface())
+                    })
                     .when(
-                        self.tinted.as_deref() == Some(block.id.as_str()) && floating_pass,
+                        self.tinted.as_deref() == Some(block.id.as_str()) && floating,
                         |el| el.opacity(0.45),
                     )
                     .child(body)
@@ -6357,6 +6548,26 @@ fn split_hint([x, y, w, h]: [f64; 4]) -> (&'static str, &'static str, f64) {
 }
 
 #[cfg(test)]
+mod float_tests {
+    use super::{float_bounds, FLOAT_BOUNDS};
+
+    #[test]
+    fn a_second_float_lands_a_step_away_from_the_first() {
+        assert_eq!(float_bounds(0), FLOAT_BOUNDS);
+        let [x, y, w, h] = float_bounds(1);
+        assert!(x > FLOAT_BOUNDS[0] && y > FLOAT_BOUNDS[1]);
+        // Same size, so a float is not squeezed by the ones after it.
+        assert_eq!([w, h], [FLOAT_BOUNDS[2], FLOAT_BOUNDS[3]]);
+        // The steps wrap, and stay inside the pane area.
+        assert_eq!(float_bounds(4), FLOAT_BOUNDS);
+        for open in 0..8 {
+            let [x, y, w, h] = float_bounds(open);
+            assert!(x + w <= 1.0 + 1e-9 && y + h <= 1.0 + 1e-9, "{open}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod split_tests {
     use super::{nudge_ratio, split_hint};
 
@@ -6673,6 +6884,18 @@ impl Prompt {
 
 #[cfg(test)]
 mod focus_regression_tests {
+    #[test]
+    fn the_float_with_the_keyboard_paints_last() {
+        use super::paints_later;
+        let tiled = block("tiled", false, false, "com.superlogical.terminal.shell");
+        let behind = block("behind", false, true, "com.superlogical.terminal.shell");
+        let front = block("front", false, true, "com.superlogical.terminal.shell");
+        // The float with the keyboard sorts after the other floats, and every
+        // float after the tiled panes.
+        assert!(paints_later(&front, Some("front")) > paints_later(&behind, Some("front")));
+        assert!(paints_later(&behind, None) > paints_later(&tiled, None));
+    }
+
     use super::*;
 
     fn block(id: &str, minimized: bool, floating: bool, creator: &str) -> BlockState {
@@ -6742,6 +6965,13 @@ fn visible_focus(
         .find_map(|id| blocks.iter().filter(visible).find(|b| b.id == id))
         .or_else(|| blocks.iter().find(|b| b.layer_state != "minimized"))
         .map(|b| b.id.clone())
+}
+
+/// Where a pane sorts in the paint order: tiled panes first, floating ones after
+/// them, and the float that has the keyboard after the other floats, so it is the
+/// one on top when two of them share space.
+fn paints_later(block: &BlockState, active: Option<&str>) -> (bool, bool) {
+    (block.floating, block.floating && active == Some(block.id.as_str()))
 }
 
 fn pane_visible(block: &BlockState, zoomed: Option<&str>) -> bool {

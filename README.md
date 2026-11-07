@@ -169,7 +169,8 @@ all (found by screenshotting the title bar).
 
 `Ctrl-h/j/k/l` move focus between panes (vim/tmux-navigator style, geometrically:
 no move when nothing lies that way) · `Ctrl-Shift-d` split right · `Ctrl-Shift-e` split down · `Ctrl-Shift-w` close pane
-· `Ctrl-Shift-f` float the pane or tile it again · `Ctrl-Shift-t` new tab ·
+· `Ctrl-Shift-f` float the pane or tile it again · `Ctrl-Shift-n` open a new
+floating terminal in this tab · `Ctrl-Shift-t` new tab ·
 `Alt-1`…`Alt-9` jump to that tab (past the last one, nothing moves) ·
 `Ctrl-Shift-Enter` zoom · `Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
 matcher and the settings page, so the list you read is the list that works.

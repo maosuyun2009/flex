@@ -12,6 +12,7 @@ pub enum Action {
     SplitDown,
     ClosePane,
     ToggleFloat,
+    NewFloat,
     ZoomPane,
     Find,
     Copy,
@@ -68,6 +69,11 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         "ctrl-shift-f",
         Action::ToggleFloat,
         "Float the pane, or tile it again",
+    ),
+    (
+        "ctrl-shift-n",
+        Action::NewFloat,
+        "Open a floating terminal in this tab",
     ),
     (
         "ctrl-shift-enter",
