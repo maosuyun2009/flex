@@ -92,9 +92,15 @@ pub struct TerminalView {
     // shortcut: PTY IME rollback is heuristic; replace it only with confirmed
     // platform composition-start semantics, not a key-delay timer.
     leaked: String,
-    /// The punctuation key last sent to the pty. A Chinese IME commits its own
-    /// version of that key right afterwards, so the plain one has to go.
-    last_punct: Option<char>,
+    /// The key last sent to the pty that an input method may answer for: the
+    /// plain `,` a Chinese IME turns into `，`, or the space that picks a
+    /// candidate and is swallowed. The plain one has to go when that happens.
+    last_punct: Option<Sent>,
+    /// The key the input method is about to answer for, when its text arrived
+    /// first. Windows does not always deliver the keystroke before the commit,
+    /// and when it does not, the key is still on its way and has to be dropped
+    /// instead of typed.
+    ime_answer: Option<Pending>,
     session: Option<Arc<TerminalSession>>,
     error: Option<String>,
     frame: Frame,
@@ -140,36 +146,109 @@ fn commit_needs_typing(was_composing: bool, text: &str) -> bool {
     was_composing || text.chars().any(|c| !c.is_ascii())
 }
 
-/// The Chinese IME's punctuation for a US-keyboard key.
-///
-/// A Chinese input method commits `，` for the `,` key — but Windows also sends
-/// the plain key first, so the terminal types `,` and then the IME's `，`, and
-/// the user sees both. Knowing the pair lets the shell take the plain one back.
-fn cjk_punctuation(ascii: char) -> Option<char> {
-    Some(match ascii {
-        ',' => '，',
-        '.' => '。',
-        '?' => '？',
-        '!' => '！',
-        ':' => '：',
-        ';' => '；',
-        '(' => '（',
-        ')' => '）',
-        '<' => '《',
-        '>' => '》',
-        '[' => '【',
-        ']' => '】',
-        _ => return None,
+/// What the shell sent that an input method may answer for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sent {
+    /// A punctuation key, which a Chinese IME commits as its own mark: `,` as
+    /// `，`, `"` as `“`, `\\` as `、`.
+    Punct(char),
+    /// The space that picks a candidate. Windows sends the key on, then the IME
+    /// commits the text and never a space, so the space is left behind.
+    Space,
+}
+
+/// A key the input method has already answered for, still in flight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Pending {
+    kind: Kind,
+    at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// A punctuation key, answered with its full-width mark.
+    Punct,
+    /// The space that picked a candidate, answered with the candidate.
+    Space,
+}
+
+impl Pending {
+    /// Whether `key` is the keystroke this commit answered.
+    ///
+    /// The window is the point: the key that caused a commit follows it within
+    /// the same message loop turn, while the next hand-typed key is tens of
+    /// times later. Nothing is delayed — a key outside the window is typed as
+    /// usual.
+    fn answers(self, key: char) -> bool {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+        self.at.elapsed() < WINDOW
+            && match self.kind {
+                Kind::Space => key == ' ',
+                Kind::Punct => key.is_ascii_punctuation(),
+            }
+    }
+}
+
+/// The key a commit answers, when its text is the only evidence of it.
+fn pending_answer(text: &str, composing: bool) -> Option<Pending> {
+    if text.is_empty() {
+        return None;
+    }
+    let kind = if text.chars().all(is_cjk_punctuation) {
+        Kind::Punct
+    } else if composing && text != " " {
+        // Chinese chosen out of a composition was picked with a key, and that key
+        // is usually the space that also takes the first candidate.
+        Kind::Space
+    } else {
+        return None;
+    };
+    Some(Pending {
+        kind,
+        at: std::time::Instant::now(),
     })
 }
 
-/// Whether the committed text is the IME's version of the key just sent.
-fn replaces_sent_punctuation(sent: Option<char>, text: &str) -> bool {
-    let mut chars = text.chars();
-    let (Some(committed), None) = (chars.next(), chars.next()) else {
-        return false;
-    };
-    sent.and_then(cjk_punctuation) == Some(committed)
+/// Whether the committed text is the input method's answer to that key.
+///
+/// A Chinese IME answers a punctuation key with punctuation only, so any run of
+/// full-width marks is its version of the key — the exact pair cannot be listed,
+/// because an IME picks `“` or `”` by what came before, commits `——` for two
+/// dashes, and has its own idea of every other key.
+fn replaces_sent(sent: Option<Sent>, text: &str) -> bool {
+    match sent {
+        // shortcut: a plain key we sent is taken back when the IME's answer is
+        // punctuation and nothing else. A mark typed in English mode and then
+        // replaced by an IME commit in the same breath would be lost.
+        Some(Sent::Punct(_)) => !text.is_empty() && text.chars().all(is_cjk_punctuation),
+        Some(Sent::Space) => !text.is_empty() && text != " ",
+        None => false,
+    }
+}
+
+/// Full-width marks: what a Chinese IME commits for a plain key. Written as the
+/// ranges they come in, since each keyboard key maps to a different block.
+fn is_cjk_punctuation(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x2013..=0x201F   // – — ‘ ’ “ ”
+            | 0x2026      // …
+            | 0x3000..=0x303F // 、。〈〉《》「」
+            | 0xFF01..=0xFF0F // ！＂＃＄％＆＇（）＊＋，－．／
+            | 0xFF1A..=0xFF20 // ：；＜＝＞？
+            | 0xFF3B..=0xFF40 // ［＼］＾＿｀
+            | 0xFF5B..=0xFF65 // ｛｜｝～…
+            | 0xFFE0..=0xFFE6 // ￥
+    )
+}
+
+/// The key an input method may answer for, if this is one of them.
+fn sent_key(c: Option<char>) -> Option<Sent> {
+    match c? {
+        ' ' => Some(Sent::Space),
+        c if c.is_ascii_punctuation() => Some(Sent::Punct(c)),
+        _ => None,
+    }
 }
 
 /// How much of what we already sent the IME is about to take back.
@@ -389,14 +468,20 @@ impl Find {
         }
     }
 
-    fn commit(&mut self, composing: bool, text: &str, punctuation: Option<char>) {
+    fn commit(&mut self, composing: bool, text: &str, sent: Option<Sent>) {
         let echo = self.key_echo.take();
         if !composing && echo.as_deref() == Some(text) {
             return;
         }
-        if replaces_sent_punctuation(punctuation, text) && self.query.chars().last() == punctuation
-        {
-            self.query.pop();
+        if replaces_sent(sent, text) {
+            let plain = match sent {
+                Some(Sent::Punct(c)) => Some(c),
+                Some(Sent::Space) => Some(' '),
+                None => None,
+            };
+            if plain.is_some() && self.query.chars().last() == plain {
+                self.query.pop();
+            }
         }
         self.query.extend(text.chars().filter(|c| !c.is_control()));
     }
@@ -477,6 +562,7 @@ impl TerminalView {
             background_opacity,
             leaked: String::new(),
             last_punct: None,
+            ime_answer: None,
             session,
             error,
             frame: empty_frame(),
@@ -798,6 +884,9 @@ impl TerminalView {
         }
         if !modifiers.alt {
             if let Some(text) = query_key_text(key, event.keystroke.key_char.as_deref()) {
+                if std::env::var_os("FLEX_DEBUG").is_some() {
+                    eprintln!("[find] key {text:?} for {key:?}");
+                }
                 find.key_echo = Some(text.to_owned());
                 find.query.push_str(text);
                 if text.chars().all(|c| c.is_ascii_alphabetic()) {
@@ -805,7 +894,7 @@ impl TerminalView {
                 } else {
                     self.leaked.clear();
                 }
-                self.last_punct = text.chars().next().filter(|c| c.is_ascii_punctuation());
+                self.last_punct = sent_key(text.chars().next());
                 self.refind(cx);
                 return true;
             }
@@ -1031,6 +1120,20 @@ impl TerminalView {
         if self.prefix.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        // The commit beat the keystroke here: that key belongs to the input
+        // method and must not reach the terminal as well.
+        if let (Some(answer), Some(p)) = (self.ime_answer.take(), keymap::translate(&event.keystroke))
+        {
+            if let shrew_core::Key::Char(c) = p.key {
+                if !p.ctrl && !p.alt && !p.meta && answer.answers(c) {
+                    if std::env::var_os("FLEX_DEBUG").is_some() {
+                        eprintln!("[ime] dropped {c:?} — already answered with {:?}", answer.kind);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+        }
         if event.is_held {
             let mut translate = false;
             if let Some((stroke, prefix)) = self.forwarded.repeat(&event.keystroke.key) {
@@ -1109,7 +1212,7 @@ impl TerminalView {
                     self.leaked.push(c);
                 }
                 self.last_punct = match (p.key, p.ctrl || p.alt || p.meta) {
-                    (shrew_core::Key::Char(c), false) if c.is_ascii_punctuation() => Some(c),
+                    (shrew_core::Key::Char(c), false) => sent_key(Some(c)),
                     _ => None,
                 };
                 self.composition.key_echo = match p.key {
@@ -1117,6 +1220,12 @@ impl TerminalView {
                     _ => None,
                 };
                 let prefix = sequence.unwrap_or_default();
+                if std::env::var_os("FLEX_DEBUG").is_some() {
+                    eprintln!(
+                        "[key] send {:?} ctrl={} alt={} meta={}",
+                        p.key, p.ctrl, p.alt, p.meta
+                    );
+                }
                 session.send_key_event(p.key, (p.ctrl, p.alt, p.shift, p.meta), "press", &prefix);
                 self.forwarded.press(event.keystroke.clone(), prefix);
             }
@@ -1514,9 +1623,7 @@ impl EntityInputHandler for TerminalView {
         let Some(was_composing) = self.composition.commit(text) else {
             return;
         };
-        if std::env::var_os("FLEX_DEBUG").is_some() {
-            eprintln!("[ime] commit {text:?} composing={was_composing}");
-        }
+        let debug = std::env::var_os("FLEX_DEBUG").is_some();
         if let Some(find) = &mut self.find {
             find.commit(was_composing, text, self.last_punct.take());
             self.leaked.clear();
@@ -1525,7 +1632,16 @@ impl EntityInputHandler for TerminalView {
         }
         // Punctuation reaches us twice: Windows sends the plain key, then the
         // IME commits its full-width version. Take the plain one back.
-        let take_back = replaces_sent_punctuation(self.last_punct.take(), text);
+        let sent = self.last_punct.take();
+        let take_back = replaces_sent(sent, text);
+        // Either the key came first (take it back) or it is still coming (drop it
+        // when it arrives). Both orders are seen on the same Windows box.
+        self.ime_answer = if take_back { None } else { pending_answer(text, was_composing) };
+        if debug {
+            // The ordering of a key and the commit it causes is what decides
+            // whether the plain key can be taken back at all.
+            eprintln!("[ime] commit {text:?} composing={was_composing} sent={sent:?} take_back={take_back}");
+        }
         if !self.composition.should_type(was_composing, text) {
             return;
         }
@@ -1607,7 +1723,8 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_needs_typing, replaces_sent_punctuation, retract_len, url_token};
+    use super::{commit_needs_typing, is_cjk_punctuation, pending_answer, replaces_sent,
+        retract_len, sent_key, url_token, Kind, Pending, Sent};
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
@@ -1673,16 +1790,67 @@ mod tests {
 
     #[test]
     fn the_imes_punctuation_replaces_the_plain_key() {
-        assert!(replaces_sent_punctuation(Some(','), "，"));
-        assert!(replaces_sent_punctuation(Some('.'), "。"));
-        assert!(replaces_sent_punctuation(Some('?'), "？"));
+        let comma = Some(Sent::Punct(','));
+        assert!(replaces_sent(comma, "，"));
+        assert!(replaces_sent(Some(Sent::Punct('.')), "。"));
+        // An IME picks the mark itself: a quote comes back as “ or ”, two dashes
+        // as one long dash.
+        assert!(replaces_sent(Some(Sent::Punct('"')), "“"));
+        assert!(replaces_sent(Some(Sent::Punct('"')), "”"));
+        assert!(replaces_sent(Some(Sent::Punct('-')), "——"));
+        assert!(replaces_sent(Some(Sent::Punct('\\')), "、"));
+        assert!(replaces_sent(Some(Sent::Punct('~')), "～"));
         // A Chinese character is not a punctuation replacement.
-        assert!(!replaces_sent_punctuation(Some(','), "中"));
-        // Nothing was sent, or the text is not a single character.
-        assert!(!replaces_sent_punctuation(None, "，"));
-        assert!(!replaces_sent_punctuation(Some(','), "，。"));
-        // The IME chose a different mark than the key suggests.
-        assert!(!replaces_sent_punctuation(Some(';'), "，"));
+        assert!(!replaces_sent(comma, "中"));
+        assert!(!replaces_sent(comma, "中，"));
+        // Nothing was sent.
+        assert!(!replaces_sent(None, "，"));
+    }
+
+    #[test]
+    fn the_space_that_picks_a_candidate_is_taken_back() {
+        assert!(replaces_sent(Some(Sent::Space), "你好"));
+        assert!(replaces_sent(Some(Sent::Space), "nǐhǎo"));
+        // The IME committed a space of its own: the key was not swallowed twice.
+        assert!(!replaces_sent(Some(Sent::Space), " "));
+        assert!(!replaces_sent(Some(Sent::Space), ""));
+        // A letter key is never a replacement source.
+        assert_eq!(sent_key(Some('n')), None);
+        assert_eq!(sent_key(Some(' ')), Some(Sent::Space));
+        assert_eq!(sent_key(Some(',')), Some(Sent::Punct(',')));
+    }
+
+    #[test]
+    fn a_commit_that_came_first_drops_the_key_behind_it() {
+        // Typing `,` on a Chinese IME: the `，` sometimes arrives first.
+        let punct = pending_answer("，", true).expect("punctuation answers a key");
+        assert!(punct.answers(','));
+        assert!(punct.answers('['));
+        assert!(!punct.answers('a'));
+        assert!(!punct.answers(' '));
+        // Chinese picked with the space: the space is still coming.
+        let space = pending_answer("欧文", true).expect("a composition answers the space");
+        assert!(space.answers(' '));
+        assert!(!space.answers(','));
+        // Text that no key answers for.
+        assert_eq!(pending_answer(" ", true), None);
+        assert_eq!(pending_answer("ouwen", false), None);
+        // Too late to be the key that caused it.
+        let stale = Pending {
+            kind: Kind::Space,
+            at: std::time::Instant::now() - std::time::Duration::from_millis(400),
+        };
+        assert!(!stale.answers(' '));
+    }
+
+    #[test]
+    fn full_width_marks_are_recognised_by_range() {
+        for mark in ['，', '。', '、', '“', '”', '—', '…', '～', '￥', '（', '！'] {
+            assert!(is_cjk_punctuation(mark), "{mark:?}");
+        }
+        for other in ['中', 'a', ',', ' ', '1', '🙂'] {
+            assert!(!is_cjk_punctuation(other), "{other:?}");
+        }
     }
 
     #[test]
@@ -1763,7 +1931,14 @@ mod tests {
         find.commit(true, "你好", None);
         assert_eq!(find.query, "English你好");
         find.query.push(',');
-        find.commit(false, "，", Some(','));
+        find.commit(false, "，", Some(super::Sent::Punct(',')));
+        // The space that picked the candidate is not wanted in the query either.
+        find.query.push(' ');
+        find.commit(false, "好", Some(super::Sent::Space));
+        assert_eq!(find.query, "English你好，好");
+        find.commit(false, "abc", None);
+        assert_eq!(find.query, "English你好，好abc");
+        find.query.truncate("English你好，".len());
         assert_eq!(find.query, "English你好，");
         find.commit(false, "abc", None);
         assert_eq!(find.query, "English你好，abc");
