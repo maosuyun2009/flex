@@ -1,5 +1,5 @@
 ; flex installer. Build with:
-;   makensis /DAPP_VERSION=0.0.8 installer\flex.nsi
+;   makensis /DAPP_VERSION=0.0.9 installer\flex.nsi
 ; from the repo root, after `build.bat build --release`.
 
 Unicode true
@@ -7,7 +7,7 @@ Unicode true
 !include "FileFunc.nsh"
 
 !ifndef APP_VERSION
-  !define APP_VERSION "0.0.8"
+  !define APP_VERSION "0.0.9"
 !endif
 
 !define APP_NAME "flex"
