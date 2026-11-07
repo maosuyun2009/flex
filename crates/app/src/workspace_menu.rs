@@ -385,6 +385,35 @@ impl Workspace {
         .detach();
     }
 
+    /// Bring a saved WSL entry back to life: start its server when nothing
+    /// answers, then reconnect. Every other address is left untouched — there is
+    /// no server on it this shell could start.
+    pub(super) fn revive_wsl(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        let Some(server) = self.state.server(server_id) else {
+            return;
+        };
+        if !crate::wsl::is_wsl(&server.address) {
+            return;
+        }
+        let engine = self.engine.clone();
+        let id = server_id.to_owned();
+        cx.spawn(async move |this, cx| {
+            let started = cx
+                .background_executor()
+                .spawn(async { crate::wsl::start_if_down() })
+                .await;
+            this.update(cx, |me, cx| match started {
+                Ok(()) => {
+                    engine.reconnect(&id);
+                    me.reload(cx);
+                }
+                Err(e) => me.rpc_error("Open WSL", e, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Show the saved entry for `address`, or add it, and select it.
     fn connect_wsl(&mut self, address: String, cx: &mut Context<Self>) {
         self.state = self.engine.state();
@@ -679,6 +708,7 @@ impl Workspace {
             Action::Reconnect => {
                 if let Some(target) = target {
                     self.engine.reconnect(&target.server);
+                    self.revive_wsl(&target.server, cx);
                 }
             }
             Action::Move(step) => {

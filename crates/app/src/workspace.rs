@@ -3959,6 +3959,9 @@ impl Workspace {
                                 this.active_block = None;
                                 this.reload(cx);
                             }
+                            // Clicking a WSL entry is a request for that server, so
+                            // a distro reboot does not leave a dead row behind.
+                            this.revive_wsl(&id, cx);
                             cx.stop_propagation();
                         }),
                     )
@@ -5259,6 +5262,7 @@ impl Workspace {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(id) = this.server_id.clone() {
                                         this.engine.reconnect(&id);
+                                        this.revive_wsl(&id, cx);
                                         cx.notify();
                                     }
                                 })),
