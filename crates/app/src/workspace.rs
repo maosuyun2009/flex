@@ -958,6 +958,17 @@ impl Workspace {
             Action::PrevPane => self.step_focus("session.focus_previous_pane", cx),
             Action::NextTab => self.step_focus("session.focus_next_window", cx),
             Action::PrevTab => self.step_focus("session.focus_previous_window", cx),
+            Action::GotoTab(tab) => {
+                let id = self
+                    .windows()
+                    .get(usize::from(tab).saturating_sub(1))
+                    .map(|window| window.id.clone());
+                // Past the last tab there is nothing to show, and switching
+                // nowhere would look like the key did not work.
+                if let Some(id) = id {
+                    self.focus_window(&id, cx);
+                }
+            }
             Action::SwapPane => self.swap_pane(cx),
             Action::ClearPane => self.clear_pane(cx),
             Action::RenameTab => {

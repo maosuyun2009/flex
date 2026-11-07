@@ -24,6 +24,8 @@ pub enum Action {
     PrevPane,
     NextTab,
     PrevTab,
+    /// The tab at this 1-based position in the session's window order.
+    GotoTab(u8),
     SwapPane,
     ClearPane,
     RenameTab,
@@ -79,6 +81,15 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
     ),
     ("ctrl-pagedown", Action::NextTab, "Show the next tab"),
     ("ctrl-pageup", Action::PrevTab, "Show the previous tab"),
+    ("alt-1", Action::GotoTab(1), "Show tab 1"),
+    ("alt-2", Action::GotoTab(2), "Show tab 2"),
+    ("alt-3", Action::GotoTab(3), "Show tab 3"),
+    ("alt-4", Action::GotoTab(4), "Show tab 4"),
+    ("alt-5", Action::GotoTab(5), "Show tab 5"),
+    ("alt-6", Action::GotoTab(6), "Show tab 6"),
+    ("alt-7", Action::GotoTab(7), "Show tab 7"),
+    ("alt-8", Action::GotoTab(8), "Show tab 8"),
+    ("alt-9", Action::GotoTab(9), "Show tab 9"),
     (
         "ctrl-shift-x",
         Action::SwapPane,
@@ -142,6 +153,11 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
 
 /// Stable action names are shared by the keymap and remote client.perform.
 fn action_name(action: Action) -> String {
+    // `GotoTab(3)` would name the action "flex.goto_tab(3)"; the keymap wants a
+    // plain identifier.
+    if let Action::GotoTab(tab) = action {
+        return format!("flex.goto_tab{tab}");
+    }
     let debug = format!("{action:?}");
     let mut name = String::from("flex.");
     for (i, c) in debug.chars().enumerate() {
@@ -280,6 +296,18 @@ mod tests {
                 shift,
                 ..Default::default()
             },
+        }
+    }
+
+    #[test]
+    fn tab_bindings_name_plain_identifiers() {
+        assert_eq!(action_name(Action::GotoTab(3)), "flex.goto_tab3");
+        for tab in 1..=9u8 {
+            let keys = format!("alt-{tab}");
+            assert!(
+                BINDINGS.iter().any(|(k, a, _)| *k == keys && *a == Action::GotoTab(tab)),
+                "{keys} is missing"
+            );
         }
     }
 
