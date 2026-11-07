@@ -32,7 +32,12 @@ pub enum Action {
     RenamePane,
     MoveTabLeft,
     MoveTabRight,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
     MinimizeFloat,
+    /// No default key of their own; still bindable through the keymap.
     RaiseFloat,
     LowerFloat,
     ParkPane,
@@ -98,26 +103,32 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
     ("ctrl-shift-k", Action::ClearPane, "Clear the pane's screen"),
     ("ctrl-shift-r", Action::RenameTab, "Rename this tab"),
     ("ctrl-alt-r", Action::RenamePane, "Rename this pane"),
-    ("ctrl-shift-left", Action::MoveTabLeft, "Move this tab left"),
+    ("ctrl-alt-left", Action::MoveTabLeft, "Move this tab left"),
+    ("ctrl-alt-right", Action::MoveTabRight, "Move this tab right"),
+    (
+        "ctrl-shift-left",
+        Action::ResizeLeft,
+        "Make this pane bigger to the left",
+    ),
     (
         "ctrl-shift-right",
-        Action::MoveTabRight,
-        "Move this tab right",
+        Action::ResizeRight,
+        "Make this pane bigger to the right",
+    ),
+    (
+        "ctrl-shift-up",
+        Action::ResizeUp,
+        "Make this pane bigger upwards",
+    ),
+    (
+        "ctrl-shift-down",
+        Action::ResizeDown,
+        "Make this pane bigger downwards",
     ),
     (
         "ctrl-shift-m",
         Action::MinimizeFloat,
         "Tuck the floating pane away, or bring it back",
-    ),
-    (
-        "ctrl-shift-up",
-        Action::RaiseFloat,
-        "Bring this floating pane to the front",
-    ),
-    (
-        "ctrl-shift-down",
-        Action::LowerFloat,
-        "Send this floating pane behind the others",
     ),
     (
         "ctrl-shift-o",
@@ -183,6 +194,9 @@ pub fn configured_action(name: &str, args: &serde_json::Value) -> Option<Action>
             "pane.close" => Some(Action::ClosePane),
             "pane.zoom" => Some(Action::ZoomPane),
             "pane.float" => Some(Action::ToggleFloat),
+            // Kept bindable, but without a default key of their own.
+            "flex.raise_float" => Some(Action::RaiseFloat),
+            "flex.lower_float" => Some(Action::LowerFloat),
             _ => None,
         };
     }
@@ -219,6 +233,8 @@ pub fn keymap_request() -> serde_json::Value {
         "pane.close",
         "pane.zoom",
         "pane.float",
+        "flex.raise_float",
+        "flex.lower_float",
     ] {
         actions.push(json!({"name":name,"kind":"client","args":empty}));
     }

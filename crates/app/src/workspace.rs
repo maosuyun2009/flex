@@ -983,6 +983,10 @@ impl Workspace {
             }
             Action::MoveTabLeft => self.move_tab(-1, cx),
             Action::MoveTabRight => self.move_tab(1, cx),
+            Action::ResizeLeft => self.resize_split("left", cx),
+            Action::ResizeRight => self.resize_split("right", cx),
+            Action::ResizeUp => self.resize_split("up", cx),
+            Action::ResizeDown => self.resize_split("down", cx),
             Action::MinimizeFloat => self.toggle_minimized(cx),
             Action::RaiseFloat => self.stack_float(true, cx),
             Action::LowerFloat => self.stack_float(false, cx),
@@ -2887,6 +2891,52 @@ impl Workspace {
         };
         let (before, after) = (divider.before, divider.after);
         let direction = divider.direction;
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let payload = json!({
+                "session_id": session,
+                "direction": direction,
+                "before_block_id": before,
+                "after_block_id": after,
+                "ratio": ratio,
+            });
+            if let Err(e) = engine.call(&address, "session.resize_pane", payload).await {
+                eprintln!("flex: resize_pane: {e}");
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Keyboard resize: give the pane that has the keyboard more room on the
+    /// side `direction` names, at the expense of the pane across that edge.
+    fn resize_split(&mut self, direction: &str, cx: &mut Context<Self>) {
+        let blocks = self.blocks();
+        let Some(me) = self.active().filter(|b| !b.floating) else {
+            return;
+        };
+        // Same neighbour test the divider grip uses, for the edge this key moves.
+        let Some((other, horizontal, mine_is_after, ratio)) = blocks
+            .iter()
+            .filter(|o| !o.floating && o.id != me.id)
+            .find_map(|o| {
+                nudge_ratio(me.rect, o.rect, direction)
+                    .map(|(horizontal, after, ratio)| (o, horizontal, after, ratio))
+            })
+        else {
+            return;
+        };
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            return;
+        };
+        let direction = if horizontal { "horizontal" } else { "vertical" };
+        // `resize_pane` splits the pair into a before half and an after half.
+        let (before, after) = if mine_is_after {
+            (other.id.clone(), me.id.clone())
+        } else {
+            (me.id.clone(), other.id.clone())
+        };
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
             let payload = json!({
@@ -6232,6 +6282,57 @@ fn find_layer(view: &serde_json::Value, block_id: &str) -> Option<String> {
     None
 }
 
+/// One keypress of a keyboard resize: `Some((horizontal, mine_is_after, ratio))`
+/// when there is a divider to move, with the share the before half should get.
+///
+/// The divider on the edge `direction` names moves first. With no pane there,
+/// the divider behind the pane moves the same way instead, so the key that grew
+/// a pane takes the growth back — the pane at the edge of the window is not a
+/// dead end.
+fn nudge_ratio(me: [f64; 4], other: [f64; 4], direction: &str) -> Option<(bool, bool, f64)> {
+    const STEP: f64 = 0.06;
+    const EDGE: f64 = 0.004;
+    let [x, y, w, h] = me;
+    let [ox, oy, ow, oh] = other;
+    let overlaps_y = oy < y + h - EDGE && oy + oh > y + EDGE;
+    let overlaps_x = ox < x + w - EDGE && ox + ow > x + EDGE;
+    // The pair a divider joins, if `edge` is where it is.
+    let pair = |edge: &str| -> Option<(bool, bool, f64)> {
+        let (horizontal, mine_is_after) = match edge {
+            "left" if overlaps_y && (ox + ow - x).abs() < EDGE => (true, true),
+            "right" if overlaps_y && (ox - (x + w)).abs() < EDGE => (true, false),
+            "up" if overlaps_x && (oy + oh - y).abs() < EDGE => (false, true),
+            "down" if overlaps_x && (oy - (y + h)).abs() < EDGE => (false, false),
+            _ => return None,
+        };
+        let (mine, theirs) = if horizontal { (w, ow) } else { (h, oh) };
+        if mine + theirs <= 0.0 {
+            return None;
+        }
+        let before = if mine_is_after { theirs } else { mine };
+        Some((horizontal, mine_is_after, before / (mine + theirs)))
+    };
+    // True when the named edge is the divider that moves; false when it is the
+    // one behind the pane, whose movement flips.
+    let (horizontal, mine_is_after, before, forward) = match pair(direction) {
+        Some((horizontal, mine_is_after, before)) => (horizontal, mine_is_after, before, 1.0),
+        None => {
+            let behind = match direction {
+                "left" => "right",
+                "right" => "left",
+                "up" => "down",
+                _ => "up",
+            };
+            let (horizontal, mine_is_after, before) = pair(behind)?;
+            (horizontal, mine_is_after, before, -1.0)
+        }
+    };
+    // The pane being resized always grows on the side the key names; the before
+    // half of the pair is what it takes the room from, or gives it back to.
+    let step = if mine_is_after { -STEP } else { STEP } * forward;
+    Some((horizontal, mine_is_after, (before + step).clamp(0.08, 0.92)))
+}
+
 fn split_hint([x, y, w, h]: [f64; 4]) -> (&'static str, &'static str, f64) {
     // Taller than wide means it was divided left/right.
     let (side, direction, ratio) = if h >= w {
@@ -6250,7 +6351,41 @@ fn split_hint([x, y, w, h]: [f64; 4]) -> (&'static str, &'static str, f64) {
 
 #[cfg(test)]
 mod split_tests {
-    use super::split_hint;
+    use super::{nudge_ratio, split_hint};
+
+    #[test]
+    fn a_resize_grows_the_pane_the_key_points_away_from() {
+        let near = |got: Option<(bool, bool, f64)>, want: (bool, bool, f64)| match got {
+            Some(got) => got.0 == want.0 && got.1 == want.1 && (got.2 - want.2).abs() < 1e-9,
+            None => false,
+        };
+        let left = [0.0, 0.0, 0.5, 1.0];
+        let right = [0.5, 0.0, 0.5, 1.0];
+        // The left pane takes room from its neighbour, and the right one takes it back.
+        assert!(near(nudge_ratio(left, right, "right"), (true, false, 0.56)));
+        assert!(near(nudge_ratio(right, left, "left"), (true, true, 0.44)));
+        let top = [0.0, 0.0, 1.0, 0.5];
+        let bottom = [0.0, 0.5, 1.0, 0.5];
+        assert!(near(nudge_ratio(bottom, top, "up"), (false, true, 0.44)));
+        assert!(near(nudge_ratio(top, bottom, "down"), (false, false, 0.56)));
+        // No pane across that edge: the divider behind the pane takes the key
+        // instead, so Left on the left pane shrinks what Right just grew.
+        assert!(near(nudge_ratio(left, right, "left"), (true, false, 0.44)));
+        assert!(near(nudge_ratio(right, left, "right"), (true, true, 0.56)));
+        assert!(near(nudge_ratio(top, bottom, "up"), (false, false, 0.44)));
+        // Nothing on either side of that axis: nothing moves.
+        assert_eq!(nudge_ratio(left, right, "up"), None);
+        assert_eq!(nudge_ratio(left, right, "down"), None);
+        // A pane that is already the smallest it may be stays there.
+        assert!(near(
+            nudge_ratio([0.0, 0.0, 0.1, 1.0], [0.1, 0.0, 0.9, 1.0], "right"),
+            (true, false, 0.16)
+        ));
+        assert!(near(
+            nudge_ratio([0.0, 0.0, 0.92, 1.0], [0.92, 0.0, 0.08, 1.0], "right"),
+            (true, false, 0.92)
+        ));
+    }
 
     #[test]
     fn remembers_the_side_and_share() {
