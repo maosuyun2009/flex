@@ -26,6 +26,37 @@ pub(super) fn is_wsl(address: &str) -> bool {
     address.trim() == ENDPOINT
 }
 
+/// What clicking a saved entry should do, if anything.
+#[derive(Debug, PartialEq)]
+pub(super) enum Click {
+    /// The endpoint answers: let the client retry.
+    Reconnect,
+    /// Nothing answers, and starting may have to replace a running server, so
+    /// the shell asks before it touches anything.
+    Ask,
+}
+
+pub(super) fn click(address: &str, listening: bool) -> Option<Click> {
+    if !is_wsl(address) {
+        return None;
+    }
+    Some(if listening {
+        Click::Reconnect
+    } else {
+        Click::Ask
+    })
+}
+
+/// Whether the endpoint answers. Cheap enough for the UI thread: a refused
+/// loopback connection returns at once.
+pub(super) fn listening() -> bool {
+    ENDPOINT
+        .parse::<SocketAddr>()
+        .ok()
+        .and_then(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok())
+        .is_some()
+}
+
 /// Start the WSL server if it is not up, and return the address to connect to.
 pub(super) fn connect() -> Result<String, String> {
     let start = |restart: bool| {
@@ -38,30 +69,6 @@ pub(super) fn connect() -> Result<String, String> {
         run(START)
     };
     ensure(start, listening).map(|()| ENDPOINT.to_owned())
-}
-
-/// Start the server when nothing answers on the endpoint. A server that is
-/// already up keeps its sessions: replacing it is what [`connect`] does last.
-pub(super) fn start_if_down() -> Result<(), String> {
-    start_if_down_with(|| run(START), listening)
-}
-
-fn start_if_down_with(
-    mut start: impl FnMut() -> Result<(), String>,
-    probe: impl Fn() -> bool,
-) -> Result<(), String> {
-    if probe() {
-        return Ok(());
-    }
-    start()?;
-    if probe() {
-        return Ok(());
-    }
-    // Still nothing: the server is up but never took the listener, and only it
-    // can give the port up, by stopping.
-    Err(format!(
-        "no server is answering on {ENDPOINT}; run `rex server stop` inside WSL, then click again"
-    ))
 }
 
 /// `start(false)` launches the server, `start(true)` replaces a running one;
@@ -81,14 +88,6 @@ fn ensure(
     Err(format!(
         "no server is answering on {ENDPOINT}; see `rex server logs` inside WSL"
     ))
-}
-
-fn listening() -> bool {
-    ENDPOINT
-        .parse::<SocketAddr>()
-        .ok()
-        .and_then(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok())
-        .is_some()
 }
 
 fn run(args: &[&str]) -> Result<(), String> {
@@ -125,7 +124,7 @@ fn text(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure, is_wsl, start_if_down_with, text, ENDPOINT};
+    use super::{click, ensure, is_wsl, text, Click, ENDPOINT};
 
     #[test]
     fn a_server_that_already_answers_is_left_alone() {
@@ -190,43 +189,11 @@ mod tests {
         assert!(!is_wsl(""));
     }
 
-    #[test]
-    fn a_server_that_answers_is_not_started_again() {
-        let mut starts = 0;
-        let ok = start_if_down_with(
-            || {
-                starts += 1;
-                Ok(())
-            },
-            || true,
-        );
-        assert!(ok.is_ok());
-        assert_eq!(starts, 0);
-    }
 
     #[test]
-    fn a_missing_server_is_started_once() {
-        let starts = std::cell::Cell::new(0);
-        let ok = start_if_down_with(
-            || {
-                starts.set(starts.get() + 1);
-                Ok(())
-            },
-            || starts.get() > 0,
-        );
-        assert!(ok.is_ok());
-        assert_eq!(starts.get(), 1);
-    }
-
-    #[test]
-    fn a_server_that_will_not_take_the_port_says_how_to_fix_it() {
-        let err = start_if_down_with(|| Ok(()), || false).unwrap_err();
-        assert!(err.contains("rex server stop"), "{err}");
-    }
-
-    #[test]
-    fn a_failing_start_is_reported_by_start_if_down() {
-        let err = start_if_down_with(|| Err("no distribution".to_owned()), || false).unwrap_err();
-        assert_eq!(err, "no distribution");
+    fn a_click_only_touches_the_wsl_entry() {
+        assert_eq!(click(ENDPOINT, true), Some(Click::Reconnect));
+        assert_eq!(click(ENDPOINT, false), Some(Click::Ask));
+        assert_eq!(click("192.168.1.39:7297", false), None);
     }
 }

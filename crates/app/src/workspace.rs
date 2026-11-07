@@ -123,6 +123,9 @@ enum Ask {
     /// Host id and label.
     DeleteHost(String, String),
     AddServer,
+    /// A saved WSL entry whose port nothing answers on: server id, to reconnect
+    /// once the server is started.
+    StartWsl(String),
     CreateBlock {
         server: String,
         session: String,
@@ -164,6 +167,7 @@ impl Ask {
             Ask::DeleteSession(..) | Ask::CloseLayer(..) => "Enter to delete · Esc to cancel",
             Ask::DeleteHost(..) | Ask::DeleteServer(..) => "Enter to remove · Esc to cancel",
             Ask::NewHost | Ask::AddServer => "Enter to add · Esc to cancel",
+            Ask::StartWsl(..) => "Enter to connect · Esc to cancel",
             Ask::CreateBlock { .. } | Ask::RunAction { .. } => {
                 "Paste JSON with Ctrl-V · Enter to submit · Esc to cancel"
             }
@@ -1571,6 +1575,27 @@ impl Workspace {
                 self.reload(cx);
                 return;
             }
+            Ask::StartWsl(id) => {
+                // Confirmed: a restart here ends the programs in the server's
+                // sessions, which is what the prompt just said.
+                let (engine, id) = (self.engine.clone(), id.clone());
+                cx.spawn(async move |this, cx| {
+                    let started = cx
+                        .background_executor()
+                        .spawn(async { crate::wsl::connect() })
+                        .await;
+                    this.update(cx, |me, cx| match started {
+                        Ok(_) => {
+                            engine.reconnect(&id);
+                            me.reload(cx);
+                        }
+                        Err(e) => me.rpc_error("Open WSL", e, cx),
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
             Ask::DeleteServer(id, _) => {
                 self.engine.shrew().remove_server(id);
                 self.state = self.engine.state();
@@ -1704,6 +1729,8 @@ impl Workspace {
         let deleted_session = matches!(&prompt.what, Ask::DeleteSession(_, id, _) if self.session_id.as_ref() == Some(id));
         let engine = self.engine.clone();
         let (target, method, payload) = match &prompt.what {
+            // Handled above, before any request is built.
+            Ask::StartWsl(..) => return,
             Ask::RenameSession(server, id, _) => {
                 let Some(address) = self.state.server(server).map(|s| s.address.clone()) else {
                     return;
@@ -3951,7 +3978,7 @@ impl Workspace {
                     .child(self.menu_button(format!("server-menu:{id}"), target, cx))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
                             if this.server_id.as_ref() != Some(&id) {
                                 this.server_id = Some(id.clone());
                                 this.session_id = None;
@@ -3961,7 +3988,7 @@ impl Workspace {
                             }
                             // Clicking a WSL entry is a request for that server, so
                             // a distro reboot does not leave a dead row behind.
-                            this.revive_wsl(&id, cx);
+                            this.revive_wsl(&id, window);
                             cx.stop_propagation();
                         }),
                     )
@@ -5259,10 +5286,10 @@ impl Workspace {
                                 .py_1()
                                 .text_xs()
                                 .child("Reconnect")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
                                     if let Some(id) = this.server_id.clone() {
                                         this.engine.reconnect(&id);
-                                        this.revive_wsl(&id, cx);
+                                        this.revive_wsl(&id, window);
                                         cx.notify();
                                     }
                                 })),

@@ -385,33 +385,29 @@ impl Workspace {
         .detach();
     }
 
-    /// Bring a saved WSL entry back to life: start its server when nothing
-    /// answers, then reconnect. Every other address is left untouched — there is
-    /// no server on it this shell could start.
-    pub(super) fn revive_wsl(&mut self, server_id: &str, cx: &mut Context<Self>) {
+    /// A saved WSL entry is a promise this shell can keep: when nothing answers
+    /// on its port, offer to start the server. Every other address is left
+    /// untouched — there is no server on it this shell could start.
+    pub(super) fn revive_wsl(
+        &mut self,
+        server_id: &str,
+        window: &mut Window,
+    ) {
         let Some(server) = self.state.server(server_id) else {
             return;
         };
-        if !crate::wsl::is_wsl(&server.address) {
-            return;
+        // Starting is not always enough: rex gives the port only to the server
+        // it launches, so a running one may have to be restarted, which ends the
+        // programs in its sessions. Ask before that.
+        match crate::wsl::click(&server.address, crate::wsl::listening()) {
+            None => {}
+            Some(crate::wsl::Click::Reconnect) => self.engine.reconnect(server_id),
+            Some(crate::wsl::Click::Ask) => self.open_prompt(
+                Ask::StartWsl(server_id.to_owned()),
+                "Connect to WSL — a server already running without the TCP port is restarted, and that ends the programs in its sessions",
+                window,
+            ),
         }
-        let engine = self.engine.clone();
-        let id = server_id.to_owned();
-        cx.spawn(async move |this, cx| {
-            let started = cx
-                .background_executor()
-                .spawn(async { crate::wsl::start_if_down() })
-                .await;
-            this.update(cx, |me, cx| match started {
-                Ok(()) => {
-                    engine.reconnect(&id);
-                    me.reload(cx);
-                }
-                Err(e) => me.rpc_error("Open WSL", e, cx),
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// Show the saved entry for `address`, or add it, and select it.
@@ -708,7 +704,7 @@ impl Workspace {
             Action::Reconnect => {
                 if let Some(target) = target {
                     self.engine.reconnect(&target.server);
-                    self.revive_wsl(&target.server, cx);
+                    self.revive_wsl(&target.server, window);
                 }
             }
             Action::Move(step) => {
