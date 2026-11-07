@@ -669,16 +669,13 @@ impl TerminalView {
     }
 
     /// Type the clipboard into the terminal, line breaks and all.
-    pub fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = crate::win32::clipboard_text() else {
-            return;
-        };
+    pub fn paste(&mut self, text: &str, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;
         }
         if let Some(find) = &mut self.find {
             find.key_echo = None;
-            find.query.push_str(&text);
+            find.query.push_str(text);
             self.leaked.clear();
             self.last_punct = None;
             self.refind(cx);
@@ -688,7 +685,7 @@ impl TerminalView {
         // `paste`, not `send_text`: a program that turned on bracketed paste
         // (mode 2004 — vim, agents, readline) needs the text wrapped, or it
         // treats every newline as Enter and runs half the paste.
-        session.paste(&text);
+        session.paste(text);
     }
 
     /// The link under a cell, if the text there is one.

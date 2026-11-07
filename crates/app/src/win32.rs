@@ -8,6 +8,8 @@
 mod imp {
     use std::sync::atomic::{AtomicIsize, Ordering};
 
+    use super::Pasted;
+
     use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::HGLOBAL;
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
@@ -19,7 +21,8 @@ mod imp {
     use windows_sys::Win32::System::Memory::{
         GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
     };
-    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+    use windows_sys::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+    use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -116,6 +119,119 @@ mod imp {
         }
     }
 
+    /// The text a terminal should type for Ctrl-V.
+    ///
+    /// Clipboards are not only text: a screenshot tool copies the picture as a
+    /// file (`CF_HDROP`) or as a bare bitmap, and the system terminal pastes the
+    /// path of the file it makes in both cases. GPUI's reader knows neither, so
+    /// the path is built here.
+    pub fn clipboard_paste() -> Option<Pasted> {
+        if let Some(text) = clipboard_text().filter(|text| !text.is_empty()) {
+            return Some(Pasted {
+                text,
+                windows_paths: false,
+            });
+        }
+        let paths = clipboard_files().or_else(clipboard_image)?;
+        Some(Pasted {
+            text: paths,
+            windows_paths: true,
+        })
+    }
+
+    /// Files on the clipboard, quoted, so a path with a space still reaches the
+    /// program as one argument.
+    fn clipboard_files() -> Option<String> {
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return None;
+            }
+            let mut paths = Vec::new();
+            if IsClipboardFormatAvailable(CF_HDROP as u32) != 0 {
+                let handle = GetClipboardData(CF_HDROP as u32);
+                if !handle.is_null() {
+                    let drop = handle as HDROP;
+                    let count = DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0);
+                    for index in 0..count {
+                        let len = DragQueryFileW(drop, index, std::ptr::null_mut(), 0) as usize;
+                        if len == 0 {
+                            continue;
+                        }
+                        let mut buf = vec![0u16; len + 1];
+                        let written = DragQueryFileW(drop, index, buf.as_mut_ptr(), len as u32 + 1)
+                            as usize;
+                        if written == 0 {
+                            continue;
+                        }
+                        let path = String::from_utf16_lossy(&buf[..written]);
+                        paths.push(if path.contains(' ') {
+                            format!("\"{path}\"")
+                        } else {
+                            path
+                        });
+                    }
+                }
+            }
+            CloseClipboard();
+            (!paths.is_empty()).then(|| paths.join(" "))
+        }
+    }
+
+    /// A bitmap on the clipboard, written to a PNG in the temp directory: what
+    /// Win-Shift-S leaves behind, and what the system terminal turns into a path.
+    fn clipboard_image() -> Option<String> {
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return None;
+            }
+            let mut dib = None;
+            if IsClipboardFormatAvailable(CF_DIB as u32) != 0 {
+                let handle = GetClipboardData(CF_DIB as u32);
+                if !handle.is_null() {
+                    let global = handle as HGLOBAL;
+                    let size = GlobalSize(global);
+                    let data = GlobalLock(global) as *const u8;
+                    if !data.is_null() && size > 40 {
+                        dib = Some(std::slice::from_raw_parts(data, size).to_vec());
+                    }
+                    GlobalUnlock(global);
+                }
+            }
+            CloseClipboard();
+            dib
+        }
+        .and_then(|dib| save_dib(&dib))
+    }
+
+    /// The clipboard's DIB carries no file header: add one and let `image` write
+    /// the file. A bitmap that will not decode is kept as a BMP rather than lost.
+    pub(super) fn save_dib(dib: &[u8]) -> Option<String> {
+        let header = u32::from_le_bytes(dib.get(0..4)?.try_into().ok()?) as usize;
+        if header < 12 || header > dib.len() {
+            return None;
+        }
+        let mut bmp = Vec::with_capacity(14 + dib.len());
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&((14 + dib.len()) as u32).to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&((14 + header) as u32).to_le_bytes());
+        bmp.extend_from_slice(dib);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir();
+        if let Ok(image) = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp) {
+            let path = dir.join(format!("flex-paste-{stamp}.png"));
+            if image.save(&path).is_ok() {
+                return Some(path.display().to_string());
+            }
+        }
+        let path = dir.join(format!("flex-paste-{stamp}.bmp"));
+        std::fs::write(&path, &bmp).ok()?;
+        Some(path.display().to_string())
+    }
+
     /// Put text on the clipboard. A program copying with OSC 52 (vim, tmux, an
     /// agent's copy button) never reaches GPUI's clipboard API, because the text
     /// arrives on a stream callback, not in a UI action.
@@ -175,6 +291,10 @@ mod imp {
         None
     }
 
+    pub fn clipboard_paste() -> Option<super::Pasted> {
+        None
+    }
+
     pub fn set_clipboard_text(_: &str) {}
 
     pub fn open_url(_: &str) {}
@@ -188,7 +308,52 @@ mod imp {
     pub fn round_corners() {}
 }
 
+/// What Ctrl-V should type: the text itself, and whether that text is a list of
+/// Windows paths this file made up (a WSL server names those differently).
+pub struct Pasted {
+    pub text: String,
+    pub windows_paths: bool,
+}
+
 pub use imp::{
-    clipboard_text, drag, is_maximized, minimize, open_url, round_corners, set_clipboard_text,
+    clipboard_paste, clipboard_text, drag, is_maximized, minimize, open_url, round_corners,
+    set_clipboard_text,
     toggle_maximize,
 };
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::imp::save_dib;
+
+    /// A 1x1 24-bit bottom-up DIB, the shape the clipboard hands over.
+    fn dib() -> Vec<u8> {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // header size
+        dib.extend_from_slice(&1i32.to_le_bytes()); // width
+        dib.extend_from_slice(&1i32.to_le_bytes()); // height
+        dib.extend_from_slice(&1u16.to_le_bytes()); // planes
+        dib.extend_from_slice(&24u16.to_le_bytes()); // bits per pixel
+        dib.extend_from_slice(&0u32.to_le_bytes()); // compression
+        dib.extend_from_slice(&4u32.to_le_bytes()); // size of the pixels
+        for _ in 0..4 {
+            dib.extend_from_slice(&0u32.to_le_bytes());
+        }
+        dib.extend_from_slice(&[0x30, 0x60, 0x90, 0x00]); // blue, green, red, padding
+        dib
+    }
+
+    #[test]
+    fn a_copied_bitmap_becomes_a_file_path() {
+        let path = save_dib(&dib()).expect("a 1x1 dib saves");
+        assert!(path.ends_with(".png"), "{path}");
+        let image = image::open(&path).expect("the png reads back");
+        assert_eq!((image.width(), image.height()), (1, 1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_dib_without_a_header_is_refused() {
+        assert!(save_dib(b"nope").is_none());
+        assert!(save_dib(&[]).is_none());
+    }
+}

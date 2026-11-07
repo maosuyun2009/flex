@@ -332,6 +332,9 @@ pub struct Workspace {
     named_client: HashSet<String>,
     /// `server.whoami` and `server.status`, fetched when Connection is opened.
     server_info: ServerCache<serde_json::Value>,
+    /// Whether this server's filesystem mounts the Windows drives, so a pasted
+    /// `C:\...` has to be written `/mnt/c/...` for its shells.
+    wsl: ServerCache<bool>,
     /// `client.keymap`: the bindings Rex itself would apply, from init.lua.
     keymap: ServerCache<serde_json::Value>,
     keybindings: ServerCache<Arc<std::sync::Mutex<KeyBindings>>>,
@@ -413,6 +416,7 @@ impl Workspace {
             last_geometry: None,
             named_client: HashSet::new(),
             server_info: ServerCache::default(),
+            wsl: ServerCache::default(),
             keymap: ServerCache::default(),
             keybindings: ServerCache::default(),
             configured_actions: Vec::new(),
@@ -3005,8 +3009,63 @@ impl Workspace {
         let Some(block) = self.active_block.clone() else {
             return;
         };
-        if let Some(view) = self.terminals.get(&block) {
-            view.update(cx, |terminal, cx| terminal.paste(cx));
+        let Some(view) = self.terminals.get(&block).cloned() else {
+            return;
+        };
+        let Some(pasted) = crate::win32::clipboard_paste() else {
+            return;
+        };
+        let write = |text: String, cx: &mut Context<Self>| {
+            view.update(cx, |terminal, cx| terminal.paste(&text, cx));
+            cx.notify();
+        };
+        // Text the user copied is typed as it is. A path this shell made up (a
+        // copied file, a copied bitmap) has to be named the way the server's
+        // filesystem does, which is `/mnt/c/...` on WSL.
+        if !pasted.windows_paths {
+            write(pasted.text, cx);
+            return;
+        }
+        let (Some(address), Some(session)) = (self.address(), self.session_id.clone()) else {
+            write(pasted.text, cx);
+            return;
+        };
+        match self.wsl.get(Some(&address)).copied() {
+            Some(true) => write(model::to_wsl_paths(&pasted.text), cx),
+            Some(false) => write(pasted.text, cx),
+            None => {
+                // Ask once whether the drives are mounted there, by looking for
+                // the C: mount itself; the answer is kept per server.
+                let engine = self.engine.clone();
+                let probe_block = block.clone();
+                cx.spawn(async move |this, cx| {
+                    let probe = engine
+                        .call(
+                            &address,
+                            "com.superlogical.terminal.list_dir",
+                            json!({
+                                "session_id": session,
+                                "block_id": probe_block,
+                                "path": "/mnt/c",
+                                "limit": 1,
+                            }),
+                        )
+                        .await;
+                    let wsl = probe.is_ok_and(|view| view["status"] == "ok");
+                    let text = if wsl {
+                        model::to_wsl_paths(&pasted.text)
+                    } else {
+                        pasted.text
+                    };
+                    view.update(cx, |terminal, cx| terminal.paste(&text, cx)).ok();
+                    this.update(cx, |me, cx| {
+                        me.wsl.insert(address, wsl);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
         }
     }
 

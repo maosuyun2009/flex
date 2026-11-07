@@ -608,3 +608,84 @@ mod tool_request_tests {
         assert_eq!(payload["layout"]["block"]["options"], options);
     }
 }
+
+/// Windows paths written the way a WSL server names them: `C:\a\b.png` becomes
+/// `/mnt/c/a/b.png`, and a quoted path keeps its quotes. Only absolute paths
+/// with a drive letter are touched, so ordinary pasted text is left alone.
+pub(super) fn to_wsl_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '"' if token.is_empty() => quoted = !quoted,
+            '"' => {
+                out.push_str(&convert_token(&token, quoted));
+                token.clear();
+                quoted = !quoted;
+            }
+            ' ' if !quoted => {
+                out.push_str(&convert_token(&token, false));
+                token.clear();
+                out.push(' ');
+            }
+            _ => token.push(c),
+        }
+    }
+    out.push_str(&convert_token(&token, quoted));
+    out
+}
+
+fn convert_token(token: &str, quoted: bool) -> String {
+    match (windows_to_wsl(token), quoted) {
+        (Some(path), true) => format!("\"{path}\""),
+        (Some(path), false) => path,
+        (None, true) => format!("\"{token}\""),
+        (None, false) => token.to_owned(),
+    }
+}
+
+fn windows_to_wsl(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    let absolute = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    absolute.then(|| {
+        format!(
+            "/mnt/{}{}",
+            (bytes[0] as char).to_ascii_lowercase(),
+            token[2..].replace('\\', "/")
+        )
+    })
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::to_wsl_paths;
+
+    #[test]
+    fn windows_paths_become_wsl_mounts() {
+        assert_eq!(
+            to_wsl_paths(r"C:\Users\me\shot.png"),
+            "/mnt/c/Users/me/shot.png"
+        );
+        assert_eq!(to_wsl_paths(r"D:\rexbuild\flex"), "/mnt/d/rexbuild/flex");
+        // Several files, and a path with a space keeps its quotes.
+        assert_eq!(
+            to_wsl_paths(r#"C:\a.png D:\b.png"#),
+            "/mnt/c/a.png /mnt/d/b.png"
+        );
+        assert_eq!(
+            to_wsl_paths(r#""C:\my shots\a.png" C:\b.png"#),
+            "\"/mnt/c/my shots/a.png\" /mnt/c/b.png"
+        );
+    }
+
+    #[test]
+    fn everything_else_is_left_alone() {
+        for text in ["plain text", "C:", r"foo\bar", "https://example.com", "/mnt/c/x"] {
+            assert_eq!(to_wsl_paths(text), text);
+        }
+    }
+}
