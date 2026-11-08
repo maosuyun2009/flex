@@ -886,7 +886,7 @@ impl TerminalView {
         }
         // Anything with control or command is a shortcut for the app, not a
         // character for the query; let it through so the window keeps working.
-        // Ctrl-Shift-H reaches the window's own handler, which toggles the bar
+        // Ctrl-Shift-F reaches the window's own handler, which toggles the bar
         // closed; closing it here as well would only reopen it.
         if modifiers.control || modifiers.platform {
             return false;
@@ -1283,7 +1283,24 @@ impl TerminalView {
                     sequence = Some(prefix);
                     cx.stop_propagation();
                 }
-                Resolution::Pass => {}
+                Resolution::Pass => {
+                    // Rex's copy of this client's keymap can be missing or stale —
+                    // a shell that ships new defaults does not get them registered
+                    // again on a server that already holds the old ones — and then
+                    // every shortcut the shell owns would be dead: the key goes to
+                    // the program and the window never sees it. The table in
+                    // `shortcuts.rs` is what the shell itself applies, so it is the
+                    // fallback whenever the keymap says nothing about a key.
+                    if let Some(action) = shortcuts::lookup(&event.keystroke) {
+                        cx.emit(TerminalEvent::ConfiguredAction {
+                            name: shortcuts::action_name(action),
+                            args: serde_json::Value::Null,
+                        });
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
             }
             // GPUI calls TranslateMessage only for propagated keys; unbound typing must pass.
             cx.notify();

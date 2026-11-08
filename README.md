@@ -169,8 +169,8 @@ all (found by screenshotting the title bar).
 
 `Ctrl-h/j/k/l` move focus between panes (vim/tmux-navigator style, geometrically:
 no move when nothing lies that way) · `Ctrl-Shift-d` split right · `Ctrl-Shift-e` split down · `Ctrl-Shift-w` close pane
-· `Ctrl-Shift-f` float the pane or tile it again · `Ctrl-Shift-n` open a new
-floating terminal in this tab · `Ctrl-Shift-t` new tab ·
+· `Ctrl-Shift-u` float the pane or tile it again · `Ctrl-Shift-n` open a new
+floating terminal in this tab · `Ctrl-Shift-f` find in the terminal · `Ctrl-Shift-t` new tab ·
 `Alt-1`…`Alt-9` jump to that tab (past the last one, nothing moves) ·
 `Ctrl-Shift-Enter` zoom · `Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
 matcher and the settings page, so the list you read is the list that works.
@@ -197,7 +197,7 @@ the size of the client that *owns* it, and owning is a separate call
 not just to the pane that was clicked. Without that, a pane opened from the
 prefix menu — never clicked — keeps its small grid when it is zoomed.
 
-`Ctrl-Shift-F` on the last tiled pane in a tab now floats it **locally** (the
+`Ctrl-Shift-U` on the last tiled pane in a tab now floats it **locally** (the
 header says `local`). Its server placement and process stay unchanged; pressing
 the shortcut again restores it without creating a pane or tab. Drag, resize and
 minimize are also local. Other clients keep their existing layout. A server-side
@@ -405,7 +405,7 @@ that cannot paste is not worth arguing with.
 
 ## Finding text
 
-`Ctrl-Shift-H` opens the find bar over the top of the pane, and the same chord,
+`Ctrl-Shift-F` opens the find bar over the top of the pane, and the same chord,
 `Esc`, `×` or a click in the text closes it: type to search, `Enter` or `↓` for
 the next match, `↑` for the previous, `Aa` for case sensitivity. Chords with
 Ctrl still reach the window while the bar is open, so no other shortcut goes
@@ -440,7 +440,7 @@ everything else.
 - Window drag, minimize, maximize/restore and close — verified by moving the
   window over synthetic mouse input and reading its rect back.
 - Splits and floats — verified end to end: `ctrl-shift-d` added a second block to
-  the window, `ctrl-shift-f` moved it into a `floating` layer at the bounds the
+  the window, `ctrl-shift-u` moved it into a `floating` layer at the bounds the
   shell asked for.
 - Floating pane drag and resize — verified against the server: dragging the
   title bar moved the layer from `[0.14, 0.12, …]` to `[0.28, 0.30, …]`, and

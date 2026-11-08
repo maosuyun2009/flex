@@ -66,7 +66,7 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
     ),
     ("ctrl-shift-w", Action::ClosePane, "Close the pane"),
     (
-        "ctrl-shift-f",
+        "ctrl-shift-u",
         Action::ToggleFloat,
         "Float the pane, or tile it again",
     ),
@@ -152,7 +152,7 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         "Copy the pane's screen and scrollback",
     ),
     ("ctrl-shift-t", Action::NewTab, "Open a new tab"),
-    ("ctrl-shift-h", Action::Find, "Find in the terminal"),
+    ("ctrl-shift-f", Action::Find, "Find in the terminal"),
     ("ctrl-shift-c", Action::Copy, "Copy the selection"),
     (
         "ctrl-shift-v",
@@ -169,7 +169,7 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
 ];
 
 /// Stable action names are shared by the keymap and remote client.perform.
-fn action_name(action: Action) -> String {
+pub(crate) fn action_name(action: Action) -> String {
     // `GotoTab(3)` would name the action "flex.goto_tab(3)"; the keymap wants a
     // plain identifier.
     if let Action::GotoTab(tab) = action {

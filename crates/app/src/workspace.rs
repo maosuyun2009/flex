@@ -2586,7 +2586,7 @@ impl Workspace {
             return;
         };
         if self.is_local_float(&block) {
-            self.rpc_error("Local floating pane", "Local panes have no server layer order; restore with Ctrl-Shift-F first.", cx);
+            self.rpc_error("Local floating pane", "Local panes have no server layer order; restore with Ctrl-Shift-U first.", cx);
             return;
         }
         let engine = self.engine.clone();
