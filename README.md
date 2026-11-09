@@ -167,13 +167,17 @@ all (found by screenshotting the title bar).
 
 ## Shortcuts
 
-`Ctrl-h/j/k/l` move focus between panes (vim/tmux-navigator style, geometrically:
+`Ctrl-Shift-h/j/k/l` move focus between panes (vim/tmux-navigator style, geometrically:
 no move when nothing lies that way) · `Ctrl-Shift-d` split right · `Ctrl-Shift-e` split down · `Ctrl-Shift-w` close pane
 · `Ctrl-Shift-u` float the pane or tile it again · `Ctrl-Shift-n` open a new
 floating terminal in this tab · `Ctrl-Shift-f` find in the terminal · `Ctrl-Shift-t` new tab ·
 `Alt-1`…`Alt-9` jump to that tab (past the last one, nothing moves) ·
 `Ctrl-Shift-Enter` zoom · `Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
 matcher and the settings page, so the list you read is the list that works.
+
+`Ctrl-Alt-k` clears the pane's screen and scrollback. Plain `Ctrl-h/j/k/l`
+are no longer reserved by flex and remain available to terminal programs unless
+your server keymap binds them.
 
 Pane focus moves geometrically — Rex picks the nearest block in that direction,
 so pressing left at the left edge does nothing rather than jumping somewhere

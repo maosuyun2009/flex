@@ -13,7 +13,7 @@ pub struct Press {
 }
 
 pub fn translate(k: &Keystroke) -> Option<Press> {
-    let key = named(&k.key).or_else(|| {
+    let mut key = named(&k.key).or_else(|| {
         let s = k.key_char.as_deref().unwrap_or(&k.key);
         let mut chars = s.chars();
         match (chars.next(), chars.next()) {
@@ -21,6 +21,14 @@ pub fn translate(k: &Keystroke) -> Option<Press> {
             _ => None,
         }
     })?;
+    // Some IMEs report the unshifted letter in key_char; Shift still means uppercase.
+    if k.modifiers.shift && !k.modifiers.control && !k.modifiers.alt && !k.modifiers.platform {
+        if let Key::Char(c) = key {
+            if c.is_ascii_lowercase() {
+                key = Key::Char(c.to_ascii_uppercase());
+            }
+        }
+    }
     Some(Press {
         key,
         ctrl: k.modifiers.control,
@@ -28,6 +36,19 @@ pub fn translate(k: &Keystroke) -> Option<Press> {
         shift: k.modifiers.shift,
         meta: k.modifiers.platform,
     })
+}
+
+impl Press {
+    /// Printable text goes to the pty as text; key encoding is for control keys.
+    pub fn typed_text(&self) -> Option<char> {
+        if self.ctrl || self.alt || self.meta {
+            return None;
+        }
+        match self.key {
+            Key::Char(c) if !c.is_control() => Some(c),
+            _ => None,
+        }
+    }
 }
 
 pub fn binding_key(k: &Keystroke) -> String {
@@ -123,6 +144,28 @@ mod tests {
             Key::Char('7')
         );
         assert_eq!(translate(&stroke("f5", None)).unwrap().key, Key::F(5));
+    }
+
+    #[test]
+    fn printable_characters_are_text_and_modified_keys_are_not() {
+        let mut press = stroke("c", Some("c"));
+        press.modifiers.shift = true;
+        assert_eq!(translate(&press).unwrap().typed_text(), Some('C'));
+        assert_eq!(translate(&stroke("c", Some("c"))).unwrap().typed_text(), Some('c'));
+        assert_eq!(translate(&stroke("space", None)).unwrap().typed_text(), Some(' '));
+        let mut ctrl = stroke("c", Some("c"));
+        ctrl.modifiers.control = true;
+        assert_eq!(translate(&ctrl).unwrap().typed_text(), None);
+        assert_eq!(translate(&stroke("enter", None)).unwrap().typed_text(), None);
+    }
+
+    #[test]
+    fn shift_with_a_lowercase_ime_echo_still_types_uppercase() {
+        let mut press = stroke("c", Some("c"));
+        press.modifiers.shift = true;
+        let press = translate(&press).unwrap();
+        assert_eq!(press.key, Key::Char('C'));
+        assert!(press.shift);
     }
 
     /// A bare modifier must not be sent as text.

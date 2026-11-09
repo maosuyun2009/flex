@@ -388,11 +388,7 @@ impl Workspace {
     /// A saved WSL entry is a promise this shell can keep: when nothing answers
     /// on its port, offer to start the server. Every other address is left
     /// untouched — there is no server on it this shell could start.
-    pub(super) fn revive_wsl(
-        &mut self,
-        server_id: &str,
-        window: &mut Window,
-    ) {
+    pub(super) fn revive_wsl(&mut self, server_id: &str, window: &mut Window) {
         let Some(server) = self.state.server(server_id) else {
             return;
         };

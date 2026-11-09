@@ -779,15 +779,22 @@ impl Workspace {
     }
 
     fn local_float_key(&self, block: &str) -> Option<model::LocalFloatKey> {
-        Some((self.server_id.clone()?, self.session_id.clone()?, self.window_id.clone()?, block.to_owned()))
+        Some((
+            self.server_id.clone()?,
+            self.session_id.clone()?,
+            self.window_id.clone()?,
+            block.to_owned(),
+        ))
     }
 
     fn is_local_float(&self, block: &str) -> bool {
-        self.local_float_key(block).is_some_and(|key| self.local_floats.0.contains_key(&key))
+        self.local_float_key(block)
+            .is_some_and(|key| self.local_floats.0.contains_key(&key))
     }
 
     fn blocks(&self) -> Vec<BlockState> {
-        let mut blocks = self.windows()
+        let mut blocks = self
+            .windows()
             .into_iter()
             .find(|w| Some(&w.id) == self.window_id.as_ref())
             .map(|w| w.blocks)
@@ -808,9 +815,9 @@ impl Workspace {
     /// to the pane the user came from, so the keyboard stayed there while the new
     /// float looked focused.
     fn arriving(&self, blocks: &[BlockState]) -> bool {
-        self.active_block
-            .as_deref()
-            .is_some_and(|id| self.pending_focus.as_deref() == Some(id) && blocks.iter().all(|b| b.id != id))
+        self.active_block.as_deref().is_some_and(|id| {
+            self.pending_focus.as_deref() == Some(id) && blocks.iter().all(|b| b.id != id)
+        })
     }
 
     fn active(&self) -> Option<BlockState> {
@@ -1987,9 +1994,16 @@ impl Workspace {
         if !block.floating {
             return;
         }
-        if let Some(local) = self.local_float_key(&block.id).and_then(|key| self.local_floats.0.get_mut(&key)) {
+        if let Some(local) = self
+            .local_float_key(&block.id)
+            .and_then(|key| self.local_floats.0.get_mut(&key))
+        {
             local.minimized = !local.minimized;
-            self.pending_focus = if local.minimized { None } else { Some(block.id.clone()) };
+            self.pending_focus = if local.minimized {
+                None
+            } else {
+                Some(block.id.clone())
+            };
             cx.notify();
             return;
         }
@@ -2586,7 +2600,11 @@ impl Workspace {
             return;
         };
         if self.is_local_float(&block) {
-            self.rpc_error("Local floating pane", "Local panes have no server layer order; restore with Ctrl-Shift-U first.", cx);
+            self.rpc_error(
+                "Local floating pane",
+                "Local panes have no server layer order; restore with Ctrl-Shift-U first.",
+                cx,
+            );
             return;
         }
         let engine = self.engine.clone();
@@ -3057,7 +3075,8 @@ impl Workspace {
                     } else {
                         pasted.text
                     };
-                    view.update(cx, |terminal, cx| terminal.paste(&text, cx)).ok();
+                    view.update(cx, |terminal, cx| terminal.paste(&text, cx))
+                        .ok();
                     this.update(cx, |me, cx| {
                         me.wsl.insert(address, wsl);
                         cx.notify();
@@ -3099,8 +3118,16 @@ impl Workspace {
         let block_id = block.id.clone();
         let window_id = self.window_id.clone();
         let floating = block.floating;
-        let Some(raw_window) = self.windows().into_iter().find(|w| Some(&w.id) == window_id.as_ref()) else { return; };
-        let Some(key) = self.local_float_key(&block_id) else { return; };
+        let Some(raw_window) = self
+            .windows()
+            .into_iter()
+            .find(|w| Some(&w.id) == window_id.as_ref())
+        else {
+            return;
+        };
+        let Some(key) = self.local_float_key(&block_id) else {
+            return;
+        };
         if self.local_floats.toggle(key, &raw_window, FLOAT_BOUNDS) {
             self.pull = None;
             self.settled = None;
@@ -3178,9 +3205,11 @@ impl Workspace {
         if self.blocks().iter().all(|block| block.floating) {
             return self.pane_for_float_only_tab(cx);
         }
-        let (Some(address), Some(session_id), Some(window_id)) =
-            (self.address(), self.session_id.clone(), self.window_id.clone())
-        else {
+        let (Some(address), Some(session_id), Some(window_id)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.window_id.clone(),
+        ) else {
             return;
         };
         let engine = self.engine.clone();
@@ -3236,9 +3265,11 @@ impl Workspace {
     /// panes moved over and floated again where they were, and the old tab, now
     /// empty, disappears on its own.
     fn pane_for_float_only_tab(&mut self, cx: &mut Context<Self>) {
-        let (Some(address), Some(session), Some(old_window)) =
-            (self.address(), self.session_id.clone(), self.window_id.clone())
-        else {
+        let (Some(address), Some(session), Some(old_window)) = (
+            self.address(),
+            self.session_id.clone(),
+            self.window_id.clone(),
+        ) else {
             return;
         };
         let label = self
@@ -3730,7 +3761,9 @@ impl Workspace {
         self.active_block = Some(block.id.clone());
         self.pull = Some(Pull {
             block_id: block.id.clone(),
-            local_key: self.local_float_key(&block.id).filter(|key| self.local_floats.0.contains_key(key)),
+            local_key: self
+                .local_float_key(&block.id)
+                .filter(|key| self.local_floats.0.contains_key(key)),
             grab,
             start,
             rect: block.rect,
@@ -3939,7 +3972,8 @@ impl Workspace {
             .occlude()
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .map(|mut el| {
-                el.interactivity().on_any_mouse_up(|_, _, cx| cx.stop_propagation());
+                el.interactivity()
+                    .on_any_mouse_up(|_, _, cx| cx.stop_propagation());
                 el
             })
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
@@ -4050,7 +4084,8 @@ impl Workspace {
             .occlude()
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .map(|mut el| {
-                el.interactivity().on_any_mouse_up(|_, _, cx| cx.stop_propagation());
+                el.interactivity()
+                    .on_any_mouse_up(|_, _, cx| cx.stop_propagation());
                 el
             })
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
@@ -4588,8 +4623,7 @@ impl Workspace {
                     .unwrap_or_default();
                 let progress = head.and_then(|block| block.progress);
                 let bell = head.is_some_and(|block| block.has_bell);
-                let mut tint = theme::accent();
-                tint.a = 0.16;
+                let appearance = theme::tab_appearance(chrome, active, bell);
                 div()
                     .id(SharedString::from(id.clone()))
                     .relative()
@@ -4600,18 +4634,38 @@ impl Workspace {
                     .items_center()
                     .gap_1()
                     .text_xs()
-                    .when(active, |el| {
-                        el.bg(chrome.active()).text_color(theme::text())
+                    .text_color(appearance.foreground)
+                    .when_some(appearance.background, |el, background| el.bg(background))
+                    .when(!active, |el| {
+                        el.hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
                     })
-                    .when(!active && bell, |el| {
-                        el.bg(tint).text_color(theme::accent())
-                    })
-                    .when(!active && !bell, |el| {
-                        el.text_color(theme::muted())
-                            .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                    .when(appearance.underline, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(px(6.0))
+                                .right(px(6.0))
+                                .bottom(px(0.0))
+                                .h(px(2.0))
+                                .rounded_full()
+                                .bg(theme::accent()),
+                        )
                     })
                     .when_some(window_agent(&window), |el, state| {
-                        el.child(theme::dot(theme::agent(state)))
+                        let hint = match state {
+                            shrew_core::AgentState::Idle => "Agent: idle",
+                            shrew_core::AgentState::Working => "Agent: working",
+                            shrew_core::AgentState::Blocked => "Agent: waiting for you",
+                            shrew_core::AgentState::Error => "Agent: error",
+                            shrew_core::AgentState::Done => "Agent: done",
+                        };
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("agent-status-{id}")))
+                                .flex_none()
+                                .child(theme::dot(theme::agent(state)))
+                                .tooltip(move |_, cx| cx.new(|_| theme::Hint(hint)).into()),
+                        )
                     })
                     .child(
                         // A shell titles itself with whatever is running, which
@@ -4625,15 +4679,28 @@ impl Workspace {
                                 .child(format!("· {process}")),
                         )
                     })
+                    .when(appearance.bell, |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("bell-{id}")))
+                                .ml_1()
+                                .flex_none()
+                                .child(theme::dot(theme::accent()))
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| theme::Hint("Terminal bell — not the active tab"))
+                                        .into()
+                                }),
+                        )
+                    })
                     .when_some(progress, |el, percent| {
-                        let mut fill = theme::accent();
+                        let mut fill = theme::muted();
                         fill.a = 0.85;
                         el.child(
                             div()
                                 .absolute()
                                 .left(px(4.0))
                                 .right(px(4.0))
-                                .bottom(px(1.0))
+                                .top(px(0.0))
                                 .h(px(2.0))
                                 .rounded_full()
                                 .bg(theme::border())
@@ -4842,7 +4909,8 @@ impl Workspace {
         let mut elements: Vec<AnyElement> = Vec::with_capacity(views.len());
         // Tiled panes paint first, then the floating ones; the float with the
         // keyboard paints last, so it is the one you see when two share bounds.
-        let mut draw: Vec<&(BlockState, Option<Entity<TerminalView>>)> = Vec::with_capacity(views.len());
+        let mut draw: Vec<&(BlockState, Option<Entity<TerminalView>>)> =
+            Vec::with_capacity(views.len());
         draw.extend(views.iter().filter(|(b, _)| !b.floating));
         let mut floats: Vec<_> = views.iter().filter(|(b, _)| b.floating).collect();
         floats.sort_by_key(|(b, _)| paints_later(b, active.as_deref()));
@@ -4928,7 +4996,11 @@ impl Workspace {
                                         .truncate()
                                         .text_xs()
                                         .text_color(theme::muted())
-                                        .child(if block.layer_kind == "local" { format!("{} · local", block.display_name()) } else { block.display_name() }),
+                                        .child(if block.layer_kind == "local" {
+                                            format!("{} · local", block.display_name())
+                                        } else {
+                                            block.display_name()
+                                        }),
                                 )
                                 .when(is_active, |el| {
                                     el.child(self.menu_button(
@@ -6342,7 +6414,10 @@ impl Render for Workspace {
                 // Windows/IME without resurrecting a removed default shortcut here.
                 if !this.show_settings
                     && !this.prefix.load(std::sync::atomic::Ordering::Relaxed)
-                    && this.terminals.values().any(|view| view.read(cx).owns_keyboard(window))
+                    && this
+                        .terminals
+                        .values()
+                        .any(|view| view.read(cx).owns_keyboard(window))
                 {
                     return;
                 }
@@ -6365,7 +6440,11 @@ impl Render for Workspace {
                             _ => {}
                         }
                     }
-                    if this.pending_tool.as_ref().is_some_and(|tool| !tool.observed) {
+                    if this
+                        .pending_tool
+                        .as_ref()
+                        .is_some_and(|tool| !tool.observed)
+                    {
                         window.focus(&this.focus);
                     }
                     cx.notify();
@@ -7030,7 +7109,10 @@ fn visible_focus(
 /// them, and the float that has the keyboard after the other floats, so it is the
 /// one on top when two of them share space.
 fn paints_later(block: &BlockState, active: Option<&str>) -> (bool, bool) {
-    (block.floating, block.floating && active == Some(block.id.as_str()))
+    (
+        block.floating,
+        block.floating && active == Some(block.id.as_str()),
+    )
 }
 
 fn pane_visible(block: &BlockState, zoomed: Option<&str>) -> bool {

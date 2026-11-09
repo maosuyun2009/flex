@@ -74,6 +74,47 @@ impl Chrome {
         }
     }
 }
+/// Tab selection owns the surface and underline; notifications have a separate marker.
+pub struct TabAppearance {
+    pub background: Option<Hsla>,
+    pub foreground: Hsla,
+    pub underline: bool,
+    pub bell: bool,
+}
+
+pub fn tab_appearance(chrome: Chrome, active: bool, bell: bool) -> TabAppearance {
+    TabAppearance {
+        background: active.then(|| chrome.active()),
+        foreground: if active { text() } else { muted() },
+        underline: active,
+        bell: !active && bell,
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn background_bell_cannot_look_like_the_selected_tab() {
+        for glass in [false, true] {
+            let chrome = Chrome { glass };
+            let quiet = tab_appearance(chrome, false, false);
+            let alert = tab_appearance(chrome, false, true);
+            assert_eq!(alert.background, quiet.background);
+            assert_eq!(alert.foreground, quiet.foreground);
+            assert!(!alert.underline);
+            assert!(alert.bell);
+            assert!(!quiet.bell);
+            let selected = tab_appearance(chrome, true, true);
+            assert_eq!(selected.background, Some(chrome.active()));
+            assert_eq!(selected.foreground, text());
+            assert!(selected.underline);
+            assert!(!selected.bell);
+        }
+    }
+}
+
 pub fn border() -> Hsla {
     translucent(BORDER, 0.9)
 }
@@ -101,6 +142,27 @@ pub fn agent(state: shrew_core::AgentState) -> Hsla {
         AgentState::Error => 0xe0_a0_4f,
         AgentState::Done => 0x6e_a8_d8,
     })
+}
+
+pub struct Hint(pub &'static str);
+
+impl gpui::Render for Hint {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(color(SURFACE))
+            .border_1()
+            .border_color(border())
+            .text_xs()
+            .text_color(text())
+            .child(self.0)
+    }
 }
 
 /// A 6px status dot.

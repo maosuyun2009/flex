@@ -373,6 +373,8 @@ struct Composition {
     marked_utf16: usize,
     pending_result: bool,
     key_echo: Option<String>,
+    /// Letters typed before this composition started, removed only if it commits.
+    pending_retract: usize,
 }
 
 impl Composition {
@@ -383,7 +385,9 @@ impl Composition {
         }
     }
     fn mark(&mut self, text: &str) {
-        if self.canceled_search { return; }
+        if self.canceled_search {
+            return;
+        }
         self.marked_utf16 = text.encode_utf16().count();
         self.active = !text.is_empty();
         if self.active {
@@ -392,9 +396,20 @@ impl Composition {
             self.key_echo = None;
         }
     }
+    fn begin_retract(&mut self, leaked: &str, preedit: &str) {
+        self.pending_retract = retract_len(leaked, preedit);
+    }
+    fn take_retract(&mut self) -> usize {
+        std::mem::take(&mut self.pending_retract)
+    }
     fn should_type(&mut self, composing: bool, text: &str) -> bool {
-        let duplicate = self.key_echo.take().as_deref() == Some(text);
-        composing || (!duplicate && commit_needs_typing(false, text))
+        // The platform echoes a propagated key as a "commit" of the same text.
+        // It is the key itself, not an IME result: drop it and its retraction.
+        if self.key_echo.take().as_deref() == Some(text) {
+            self.pending_retract = 0;
+            return false;
+        }
+        composing || commit_needs_typing(false, text)
     }
     fn marked_range(&self) -> Option<std::ops::Range<usize>> {
         self.active.then_some(0..self.marked_utf16)
@@ -1202,8 +1217,11 @@ impl TerminalView {
             self.find_key(event, cx);
             return;
         }
-        if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt && !event.keystroke.modifiers.platform
-            && keymap::translate(&event.keystroke).is_some_and(|p| matches!(p.key, shrew_core::Key::Char(c) if !c.is_whitespace()))
+        if !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+            && keymap::translate(&event.keystroke)
+                .is_some_and(|p| matches!(p.key, shrew_core::Key::Char(c) if !c.is_whitespace()))
         {
             self.composition.start_typing();
         }
@@ -1217,12 +1235,16 @@ impl TerminalView {
         }
         // The commit beat the keystroke here: that key belongs to the input
         // method and must not reach the terminal as well.
-        if let (Some(answer), Some(p)) = (self.ime_answer.take(), keymap::translate(&event.keystroke))
+        if let (Some(answer), Some(p)) =
+            (self.ime_answer.take(), keymap::translate(&event.keystroke))
         {
             if let shrew_core::Key::Char(c) = p.key {
                 if !p.ctrl && !p.alt && !p.meta && answer.answers(c) {
                     if std::env::var_os("FLEX_DEBUG").is_some() {
-                        eprintln!("[ime] dropped {c:?} — already answered with {:?}", answer.kind);
+                        eprintln!(
+                            "[ime] dropped {c:?} — already answered with {:?}",
+                            answer.kind
+                        );
                     }
                     cx.stop_propagation();
                     return;
@@ -1230,12 +1252,25 @@ impl TerminalView {
             }
         }
         if event.is_held {
+            // Printable keys are sent as text, so their auto-repeat never went
+            // through the forwarded key queue.
+            if let (Some(p), Some(session)) =
+                (keymap::translate(&event.keystroke), &self.session)
+            {
+                if let Some(text) = p.typed_text() {
+                    self.composition.key_echo = Some(text.to_string());
+                    session.send_text(&text.to_string());
+                    return;
+                }
+            }
             let mut translate = false;
             if let Some((stroke, prefix)) = self.forwarded.repeat(&event.keystroke.key) {
                 translate = prefix.is_empty();
                 if let (Some(p), Some(session)) = (keymap::translate(stroke), &self.session) {
                     self.composition.key_echo = match p.key {
-                        shrew_core::Key::Char(c) if !p.ctrl && !p.alt && !p.meta => Some(c.to_string()),
+                        shrew_core::Key::Char(c) if !p.ctrl && !p.alt && !p.meta => {
+                            Some(c.to_string())
+                        }
                         _ => None,
                     };
                     session.send_key_event(
@@ -1331,15 +1366,27 @@ impl TerminalView {
                     shrew_core::Key::Char(c) if !p.ctrl && !p.alt && !p.meta => Some(c.to_string()),
                     _ => None,
                 };
-                let prefix = sequence.unwrap_or_default();
                 if std::env::var_os("FLEX_DEBUG").is_some() {
                     eprintln!(
                         "[key] send {:?} ctrl={} alt={} meta={}",
                         p.key, p.ctrl, p.alt, p.meta
                     );
                 }
-                session.send_key_event(p.key, (p.ctrl, p.alt, p.shift, p.meta), "press", &prefix);
-                self.forwarded.press(event.keystroke.clone(), prefix);
+                if let Some(text) = p.typed_text() {
+                    // Text is bytes, not a key the server has to re-encode:
+                    // this survives Shift, IMEs and layouts that report a
+                    // lowercased key_char. WM_CHAR is deduped by key_echo.
+                    session.send_text(&text.to_string());
+                } else {
+                    let prefix = sequence.unwrap_or_default();
+                    session.send_key_event(
+                        p.key,
+                        (p.ctrl, p.alt, p.shift, p.meta),
+                        "press",
+                        &prefix,
+                    );
+                    self.forwarded.press(event.keystroke.clone(), prefix);
+                }
             }
             None => {
                 if std::env::var_os("FLEX_DEBUG").is_some() {
@@ -1713,7 +1760,10 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let end = self.composition.marked_range().map(|r| r.end).unwrap_or(0);
-        Some(UTF16Selection { range: end..end, reversed: false })
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
     }
 
     fn marked_text_range(
@@ -1739,6 +1789,8 @@ impl EntityInputHandler for TerminalView {
         let Some(was_composing) = self.composition.commit(text) else {
             return;
         };
+        // A mark that never commits must not delete a letter already sent.
+        let retract = self.composition.take_retract();
         let debug = std::env::var_os("FLEX_DEBUG").is_some();
         if let Some(find) = &mut self.find {
             find.commit(was_composing, text, self.last_punct.take());
@@ -1752,7 +1804,11 @@ impl EntityInputHandler for TerminalView {
         let take_back = replaces_sent(sent, text);
         // Either the key came first (take it back) or it is still coming (drop it
         // when it arrives). Both orders are seen on the same Windows box.
-        self.ime_answer = if take_back { None } else { pending_answer(text, was_composing) };
+        self.ime_answer = if take_back {
+            None
+        } else {
+            pending_answer(text, was_composing)
+        };
         if debug {
             // The ordering of a key and the commit it causes is what decides
             // whether the plain key can be taken back at all.
@@ -1763,6 +1819,9 @@ impl EntityInputHandler for TerminalView {
         }
         self.leaked.clear();
         if let Some(session) = &self.session {
+            for _ in 0..retract {
+                session.send_text("\u{7f}");
+            }
             if take_back {
                 session.send_text("\u{7f}");
             }
@@ -1780,7 +1839,9 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.composition.canceled_search { return; }
+        if self.composition.canceled_search {
+            return;
+        }
         if _new_text.is_empty() {
             self.composition.mark("");
             return;
@@ -1796,14 +1857,9 @@ impl EntityInputHandler for TerminalView {
             return;
         }
         if !self.composition.active {
-            // The composition has just started. Take back the letters it typed
-            // before this message arrived — and only those.
-            let take = retract_len(&self.leaked, _new_text);
-            if take > 0 {
-                if let Some(session) = &self.session {
-                    session.send_text(&"\u{7f}".repeat(take));
-                }
-            }
+            // Defer removal until commit: an IME echo that never commits
+            // must not delete a letter the key itself already typed.
+            self.composition.begin_retract(&self.leaked, _new_text);
             self.leaked.clear();
         }
         // GPUI uses the marked range to route subsequent keys directly through IME.
@@ -1818,13 +1874,28 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<gpui::Pixels>> {
         let (origin, metrics) = *self.geometry.lock().unwrap();
-        let (col, row) = self.frame.cursor.as_ref().map(|c| (c.col, c.row)).unwrap_or((0, 0));
+        let (col, row) = self
+            .frame
+            .cursor
+            .as_ref()
+            .map(|c| (c.col, c.row))
+            .unwrap_or((0, 0));
         let origin = if self.find.is_some() {
             _element_bounds.origin
         } else {
-            origin + gpui::point(px(col as f32 * metrics.cell_w as f32), px(row as f32 * metrics.cell_h as f32))
+            origin
+                + gpui::point(
+                    px(col as f32 * metrics.cell_w as f32),
+                    px(row as f32 * metrics.cell_h as f32),
+                )
         };
-        Some(Bounds::new(origin, gpui::size(px(metrics.cell_w.max(1.0) as f32), px(metrics.cell_h.max(1.0) as f32))))
+        Some(Bounds::new(
+            origin,
+            gpui::size(
+                px(metrics.cell_w.max(1.0) as f32),
+                px(metrics.cell_h.max(1.0) as f32),
+            ),
+        ))
     }
 
     fn character_index_for_point(
@@ -1839,8 +1910,10 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_needs_typing, is_cjk_punctuation, pending_answer, replaces_sent,
-        retract_len, sent_key, url_token, Kind, Pending, Sent};
+    use super::{
+        commit_needs_typing, is_cjk_punctuation, pending_answer, replaces_sent, retract_len,
+        sent_key, url_token, Kind, Pending, Sent,
+    };
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
@@ -1903,6 +1976,35 @@ mod tests {
         assert!(!composition.should_type(false, "a"));
         composition.mark("abc");
         assert!(composition.should_type(true, "abc"));
+    }
+
+    #[test]
+    fn retraction_waits_for_a_commit_so_a_bare_mark_cannot_delete_a_sent_letter() {
+        let mut composition = super::Composition::default();
+        composition.begin_retract("C", "C");
+        assert_eq!(composition.take_retract(), 1);
+        assert_eq!(composition.take_retract(), 0);
+        composition.begin_retract("C", "C");
+        composition.mark("C");
+        composition.key_echo = Some("C".into());
+        assert!(
+            !composition.should_type(true, "C"),
+            "the platform echo must not retype, even as a composition"
+        );
+        assert_eq!(
+            composition.take_retract(),
+            0,
+            "the echo must drop its retraction"
+        );
+    }
+
+    #[test]
+    fn pinyin_letters_are_retracted_when_the_composition_really_commits() {
+        let mut composition = super::Composition::default();
+        composition.begin_retract("ni", "nihao");
+        composition.mark("nihao");
+        assert!(composition.should_type(true, "你好"));
+        assert_eq!(composition.take_retract(), 2);
     }
 
     #[test]

@@ -80,10 +80,18 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         Action::ZoomPane,
         "Zoom the pane, or restore the layout",
     ),
-    ("ctrl-h", Action::FocusLeft, "Focus the pane to the left"),
-    ("ctrl-j", Action::FocusDown, "Focus the pane below"),
-    ("ctrl-k", Action::FocusUp, "Focus the pane above"),
-    ("ctrl-l", Action::FocusRight, "Focus the pane to the right"),
+    (
+        "ctrl-shift-h",
+        Action::FocusLeft,
+        "Focus the pane to the left",
+    ),
+    ("ctrl-shift-j", Action::FocusDown, "Focus the pane below"),
+    ("ctrl-shift-k", Action::FocusUp, "Focus the pane above"),
+    (
+        "ctrl-shift-l",
+        Action::FocusRight,
+        "Focus the pane to the right",
+    ),
     ("ctrl-tab", Action::NextPane, "Focus the next pane"),
     (
         "ctrl-shift-tab",
@@ -106,11 +114,15 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         Action::SwapPane,
         "Swap this pane with the next one",
     ),
-    ("ctrl-shift-k", Action::ClearPane, "Clear the pane's screen"),
+    ("ctrl-alt-k", Action::ClearPane, "Clear the pane's screen"),
     ("ctrl-shift-r", Action::RenameTab, "Rename this tab"),
     ("ctrl-alt-r", Action::RenamePane, "Rename this pane"),
     ("ctrl-alt-left", Action::MoveTabLeft, "Move this tab left"),
-    ("ctrl-alt-right", Action::MoveTabRight, "Move this tab right"),
+    (
+        "ctrl-alt-right",
+        Action::MoveTabRight,
+        "Move this tab right",
+    ),
     (
         "ctrl-shift-left",
         Action::ResizeLeft,
@@ -327,7 +339,9 @@ mod tests {
         for tab in 1..=9u8 {
             let keys = format!("alt-{tab}");
             assert!(
-                BINDINGS.iter().any(|(k, a, _)| *k == keys && *a == Action::GotoTab(tab)),
+                BINDINGS
+                    .iter()
+                    .any(|(k, a, _)| *k == keys && *a == Action::GotoTab(tab)),
                 "{keys} is missing"
             );
         }
@@ -385,6 +399,45 @@ mod tests {
             request["defaults"][0]["bindings"].as_array().unwrap().len(),
             BINDINGS.len()
         );
+    }
+
+    #[test]
+    fn pane_navigation_requires_shift_and_leaves_control_keys_to_terminal() {
+        for (key, action) in [
+            ("h", Action::FocusLeft),
+            ("j", Action::FocusDown),
+            ("k", Action::FocusUp),
+            ("l", Action::FocusRight),
+        ] {
+            assert_eq!(lookup(&stroke(key, true, true)), Some(action));
+            assert_eq!(lookup(&stroke(key, true, false)), None);
+        }
+        let mut clear = stroke("k", true, false);
+        clear.modifiers.alt = true;
+        assert_eq!(lookup(&clear), Some(Action::ClearPane));
+    }
+
+    #[test]
+    fn server_defaults_register_shift_navigation_and_alt_clear() {
+        let request = keymap_request();
+        let bindings = request["defaults"][0]["bindings"].as_array().unwrap();
+        for (key, action) in [
+            ("h", "flex.focus_left"),
+            ("j", "flex.focus_down"),
+            ("k", "flex.focus_up"),
+            ("l", "flex.focus_right"),
+        ] {
+            assert!(bindings.iter().any(|b| b["keys"]
+                == serde_json::json!([format!("ctrl+shift+{key}")])
+                && b["action"] == action));
+            assert!(!bindings
+                .iter()
+                .any(|b| b["keys"] == serde_json::json!([format!("ctrl+{key}")])));
+        }
+        assert!(bindings
+            .iter()
+            .any(|b| b["keys"] == serde_json::json!(["ctrl+alt+k"])
+                && b["action"] == "flex.clear_pane"));
     }
 
     #[test]

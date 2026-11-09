@@ -684,7 +684,13 @@ mod path_tests {
 
     #[test]
     fn everything_else_is_left_alone() {
-        for text in ["plain text", "C:", r"foo\bar", "https://example.com", "/mnt/c/x"] {
+        for text in [
+            "plain text",
+            "C:",
+            r"foo\bar",
+            "https://example.com",
+            "/mnt/c/x",
+        ] {
             assert_eq!(to_wsl_paths(text), text);
         }
     }
