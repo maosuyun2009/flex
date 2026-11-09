@@ -1,0 +1,11 @@
+[package]
+name = "shrew-term"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/teddytennant/shrew"
+rust-version = "1.90"
+
+[dependencies]
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "575ed6b8ceb79ffaf247ecf7e34333876b0d5be4" }
+shrew-proto = { version = "0.1.0", path = "../shrew-proto" }

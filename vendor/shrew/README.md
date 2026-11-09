@@ -3,7 +3,8 @@
 Source: [teddytennant/shrew](https://github.com/teddytennant/shrew), commit
 `9cfc45ff91ab1d2283f7514f8a5d0096a0d68690` (MIT; see `LICENSE`).
 
-Only `shrew-core`, `shrew-client`, and `shrew-proto` are copied here. The root
+Only `shrew-core`, `shrew-client`, `shrew-proto`, and the small `shrew-term`
+patch are copied here. The root
 Cargo workspace patches these packages, so Windows builds and CI use the same
 sources. `shrew-term` and Ghostty remain pinned upstream; no Cargo cache edits
 are required. Vendored package metadata is explicit rather than inherited from
@@ -22,6 +23,8 @@ Local changes:
   Terminal metadata is applied only to terminal blocks.
 - Terminal input and control requests are ordered. Closing a terminal stops its
   input and stream tasks rather than leaving an Arc/task retention cycle.
+- `shrew-term` keeps the caret cell in `Frame::cursor_position` even when a
+  program hides the cursor, so an IME can place its preedit and candidates.
 - Ownership claims are not treated as successful before the server replies.
 
 The control handshake advertises revision 10 with minimum revision 8. An

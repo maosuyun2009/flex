@@ -23,6 +23,7 @@ pub fn paint(
     palette: &Palette,
     over_picture: bool,
     background_opacity: f32,
+    preedit: Option<(&str, u16, u16)>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -122,6 +123,39 @@ pub fn paint(
                 let at = cell(run.col.saturating_add(offset), row as u16);
                 let _ = shaped.paint(at, cell_h, window, cx);
             }
+        }
+    }
+
+    // The pty has no buffer for an IME preedit, so draw it over the cursor cell.
+    if let Some((text, col, row)) = preedit {
+        if !text.is_empty() {
+            let at = cell(col.min(frame.cols.saturating_sub(1)), row.min(frame.rows.saturating_sub(1)));
+            let columns = frame.cols.saturating_sub(col) as f32;
+            let w = cell_w * columns.max(1.0);
+            window.paint_quad(fill(
+                Bounds::new(at, size(w, cell_h)),
+                Hsla { a: 0.92, ..backdrop },
+            ));
+            let fg = color(frame.foreground);
+            let shape = TextRun {
+                len: text.len(),
+                font: font(palette.family.clone()),
+                color: fg,
+                background_color: None,
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(fg),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            let shaped = window.text_system().shape_line(
+                SharedString::from(printable(text)),
+                palette.font_size,
+                &[shape],
+                None,
+            );
+            let _ = shaped.paint(at, cell_h, window, cx);
         }
     }
 }

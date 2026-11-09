@@ -106,6 +106,8 @@ pub struct TerminalView {
     session: Option<Arc<TerminalSession>>,
     error: Option<String>,
     frame: Frame,
+    /// Last cell the terminal reported, used when a TUI hides its cursor.
+    last_cursor: (u16, u16),
     focus: FocusHandle,
     palette: paint::Palette,
 }
@@ -375,6 +377,10 @@ struct Composition {
     key_echo: Option<String>,
     /// Letters typed before this composition started, removed only if it commits.
     pending_retract: usize,
+    /// The IME's current preedit, drawn at the cursor because the pty has no buffer for it.
+    preedit: String,
+    /// Cells the preedit covers to the left, over letters already echoed by the pty.
+    preedit_back: u16,
 }
 
 impl Composition {
@@ -390,6 +396,7 @@ impl Composition {
         }
         self.marked_utf16 = text.encode_utf16().count();
         self.active = !text.is_empty();
+        self.preedit = text.to_owned();
         if self.active {
             self.pending_result = true;
             self.canceled_search = false;
@@ -425,6 +432,8 @@ impl Composition {
         let composing = self.active || self.pending_result;
         self.active = false;
         self.pending_result = false;
+        self.preedit.clear();
+        self.preedit_back = 0;
         if std::mem::take(&mut self.canceled_search) {
             None
         } else {
@@ -530,7 +539,26 @@ impl Drop for TerminalView {
     }
 }
 
+fn ime_cell_for(cursor: Option<(u16, u16)>, _last: (u16, u16), rows: u16) -> (u16, u16) {
+    // A hidden cursor means a full-screen TUI; their input box sits at the bottom.
+    cursor.unwrap_or((2, rows.saturating_sub(3)))
+}
+
 impl TerminalView {
+    /// Where the IME should draw: the real cursor, else the last one, else the
+    /// bottom row of a full-screen TUI whose input box lives there.
+    fn ime_cell(&self) -> (u16, u16) {
+        ime_cell_for(
+            self.frame
+                .cursor
+                .as_ref()
+                .map(|c| (c.col, c.row))
+                .or(self.frame.cursor_position),
+            self.last_cursor,
+            self.frame.rows,
+        )
+    }
+
     pub fn new(
         engine: &Engine,
         server: &str,
@@ -601,6 +629,7 @@ impl TerminalView {
             session,
             error,
             frame: empty_frame(),
+            last_cursor: (0, 0),
             focus: cx.focus_handle(),
             palette: paint::Palette {
                 family: font,
@@ -1425,6 +1454,9 @@ impl Render for TerminalView {
             session.focus_event(focused);
         }
         self.frame = session.frame();
+        if let Some(cursor) = &self.frame.cursor {
+            self.last_cursor = (cursor.col, cursor.row);
+        }
         // FLEX_DEBUG=1 explains an empty pane: no frames means the stream is
         // dead, frames with no lines means the snapshot failed to restore.
         if debug() {
@@ -1438,6 +1470,11 @@ impl Render for TerminalView {
             );
         }
         let frame = self.frame.clone();
+        let preedit = (!self.composition.preedit.is_empty()).then(|| self.composition.preedit.clone());
+        // Full-screen programs such as pi hide the terminal cursor; keep the
+        // preedit near the last known input position, or the bottom input row.
+        let (ime_col, ime_row) = self.ime_cell();
+        let preedit_at = (ime_col.saturating_sub(self.composition.preedit_back), ime_row);
         let palette = paint::Palette {
             family: self.palette.family.clone(),
             font_size: self.palette.font_size,
@@ -1683,6 +1720,7 @@ impl Render for TerminalView {
                             &palette,
                             over_picture,
                             picture_opacity,
+                            preedit.as_deref().map(|text| (text, preedit_at.0, preedit_at.1)),
                             window,
                             cx,
                         )
@@ -1732,6 +1770,7 @@ fn empty_frame() -> Frame {
         foreground: shrew_core::Rgb::new(0xdd, 0xdd, 0xdd),
         cursor_color: None,
         cursor: None,
+        cursor_position: None,
         lines: Vec::new(),
         scrollbar: Default::default(),
         alternate_screen: false,
@@ -1774,8 +1813,11 @@ impl EntityInputHandler for TerminalView {
         self.composition.marked_range()
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.composition.active = false;
+        self.composition.preedit.clear();
+        self.composition.preedit_back = 0;
+        cx.notify();
     }
 
     /// The committed string, after the candidate window closes.
@@ -1860,10 +1902,16 @@ impl EntityInputHandler for TerminalView {
             // Defer removal until commit: an IME echo that never commits
             // must not delete a letter the key itself already typed.
             self.composition.begin_retract(&self.leaked, _new_text);
+            self.composition.preedit_back = self
+                .leaked
+                .chars()
+                .count()
+                .min(_new_text.chars().count()) as u16;
             self.leaked.clear();
         }
         // GPUI uses the marked range to route subsequent keys directly through IME.
         self.composition.mark(_new_text);
+        cx.notify();
     }
 
     fn bounds_for_range(
@@ -1873,22 +1921,15 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<gpui::Pixels>> {
-        let (origin, metrics) = *self.geometry.lock().unwrap();
-        let (col, row) = self
-            .frame
-            .cursor
-            .as_ref()
-            .map(|c| (c.col, c.row))
-            .unwrap_or((0, 0));
-        let origin = if self.find.is_some() {
-            _element_bounds.origin
-        } else {
-            origin
-                + gpui::point(
-                    px(col as f32 * metrics.cell_w as f32),
-                    px(row as f32 * metrics.cell_h as f32),
-                )
-        };
+        let (_, metrics) = *self.geometry.lock().unwrap();
+        let (col, row) = self.ime_cell();
+        // Element-relative IME coordinates; a cached pane origin can be relative
+        // to the pane's parent and put the candidate window at the screen edge.
+        let origin = _element_bounds.origin
+            + gpui::point(
+                px(PAD + col as f32 * metrics.cell_w as f32),
+                px(row as f32 * metrics.cell_h as f32),
+            );
         Some(Bounds::new(
             origin,
             gpui::size(
@@ -1976,6 +2017,25 @@ mod tests {
         assert!(!composition.should_type(false, "a"));
         composition.mark("abc");
         assert!(composition.should_type(true, "abc"));
+    }
+
+    #[test]
+    fn preedit_covers_already_echoed_letters_without_deleting_them() {
+        let mut composition = super::Composition::default();
+        composition.begin_retract("n", "nihao");
+        composition.preedit_back = 1;
+        composition.mark("nihao");
+        assert_eq!(composition.preedit_back, 1);
+        composition.commit("你");
+        assert_eq!(composition.preedit_back, 0);
+    }
+
+    #[test]
+    fn hidden_tui_cursor_falls_back_to_the_bottom_input_row() {
+        assert_eq!(super::ime_cell_for(Some((4, 7)), (9, 9), 30), (4, 7));
+        assert_eq!(super::ime_cell_for(None, (5, 24), 30), (2, 27));
+        assert_eq!(super::ime_cell_for(None, (0, 0), 30), (2, 27));
+        assert_eq!(super::ime_cell_for(None, (0, 0), 2), (2, 0));
     }
 
     #[test]

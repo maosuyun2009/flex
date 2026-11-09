@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/engine", "crates/app",
-    "vendor/shrew/shrew-core", "vendor/shrew/shrew-client", "vendor/shrew/shrew-proto",
+    "vendor/shrew/shrew-core", "vendor/shrew/shrew-client", "vendor/shrew/shrew-proto", "vendor/shrew/shrew-term",
 ]
 
 [workspace.package]
@@ -19,6 +19,7 @@ flex-engine = { path = "crates/engine" }
 shrew-core = { path = "vendor/shrew/shrew-core" }
 shrew-client = { path = "vendor/shrew/shrew-client" }
 shrew-proto = { path = "vendor/shrew/shrew-proto" }
+shrew-term = { path = "vendor/shrew/shrew-term" }
 
 [profile.dev]
 opt-level = 1

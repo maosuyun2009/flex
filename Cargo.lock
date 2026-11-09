@@ -4966,7 +4966,6 @@ dependencies = [
 [[package]]
 name = "shrew-term"
 version = "0.1.0"
-source = "git+https://github.com/teddytennant/shrew?rev=9cfc45ff91ab1d2283f7514f8a5d0096a0d68690#9cfc45ff91ab1d2283f7514f8a5d0096a0d68690"
 dependencies = [
  "libghostty-vt",
  "shrew-proto",
