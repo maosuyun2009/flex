@@ -65,7 +65,9 @@ impl Engine {
         &self.shrew
     }
 
-    pub fn state(&self) -> AppState {
+    /// The engine's current snapshot. The same `Arc` comes back until
+    /// something changes, so asking is cheap.
+    pub fn state(&self) -> Arc<AppState> {
         self.shrew.state()
     }
 

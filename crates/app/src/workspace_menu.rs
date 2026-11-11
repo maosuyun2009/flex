@@ -59,6 +59,8 @@ pub(super) enum Action {
     RestoreLocal,
     /// This machine's WSL server: start it if need be, then connect.
     OpenWsl,
+    /// One of the shell's own actions, for the pane the menu was opened on.
+    Shell(crate::shortcuts::Action),
 }
 
 #[derive(Clone)]
@@ -193,6 +195,24 @@ mod tests {
     use super::*;
     use flex_engine::{ServerState, SessionState, WindowState};
     use serde_json::json;
+
+    #[test]
+    fn a_pane_menu_offers_copy_only_with_a_selection_and_names_each_key() {
+        let labels = |has_selection| -> Vec<String> {
+            pane_menu_items(has_selection)
+                .into_iter()
+                .map(|item| item.label)
+                .collect()
+        };
+        assert_eq!(labels(false)[0], "Paste    ctrl-shift-v");
+        assert_eq!(labels(true)[0], "Copy    ctrl-shift-c");
+        assert_eq!(labels(true).len(), labels(false).len() + 1);
+        for item in pane_menu_items(true) {
+            assert!(matches!(item.action, Some(Action::Shell(_))));
+            // Every entry is bound: none shows a blank where its key belongs.
+            assert!(!item.label.ends_with(' '), "{:?}", item.label);
+        }
+    }
 
     fn target() -> Target {
         Target {
@@ -329,6 +349,34 @@ use crate::theme;
 use gpui::prelude::*;
 use gpui::{div, hsla, px, AnyElement, Context, KeyDownEvent, MouseButton, SharedString, Window};
 
+/// A pane's right-click menu. Copy is only offered with something to copy.
+fn pane_menu_items(has_selection: bool) -> Vec<Item> {
+    use crate::shortcuts::{Action as Shell, BINDINGS};
+    let item = |label: &str, action: Shell| {
+        let keys = BINDINGS
+            .iter()
+            .find(|(_, bound, _)| *bound == action)
+            .map(|(keys, _, _)| *keys)
+            .unwrap_or_default();
+        Item::enabled(format!("{label}    {keys}"), Action::Shell(action))
+    };
+    let mut items = Vec::new();
+    if has_selection {
+        items.push(item("Copy", Shell::Copy));
+    }
+    items.extend([
+        item("Paste", Shell::Paste),
+        item("Find…", Shell::Find),
+        item("Copy screen and scrollback", Shell::CopyTranscript),
+        item("Clear", Shell::ClearPane),
+        item("Split right", Shell::SplitRight),
+        item("Split down", Shell::SplitDown),
+        item("Zoom", Shell::ZoomPane),
+        item("Close pane", Shell::ClosePane),
+    ]);
+    items
+}
+
 impl Workspace {
     fn show_menu(&mut self, menu: Menu, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = Some(menu);
@@ -336,6 +384,37 @@ impl Workspace {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         window.focus(&self.focus);
         cx.notify();
+    }
+
+    /// The menu a right-click in a terminal opens: the clipboard first, then
+    /// what the pane can do, each with the key that also does it.
+    pub(super) fn open_pane_menu(
+        &mut self,
+        block: &str,
+        at: gpui::Point<gpui::Pixels>,
+        has_selection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(server), Some(address), Some(session)) = (
+            self.server_id.clone(),
+            self.address(),
+            self.session_id.clone(),
+        ) else {
+            return;
+        };
+        let target = Target {
+            server,
+            address,
+            session: Some(session),
+            block: Some(block.to_owned()),
+        };
+        let Some(title) = target.block(&self.state).map(BlockState::display_name) else {
+            return;
+        };
+        let mut menu = Menu::new(title, Some(target), pane_menu_items(has_selection));
+        menu.anchor = Some(at);
+        self.show_menu(menu, window, cx);
     }
 
     pub(super) fn open_add_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -448,6 +527,7 @@ impl Workspace {
             .text_color(theme::muted())
             .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
             .child("⋯")
+            .tooltip(|_, cx| cx.new(|_| theme::Hint("More actions")).into())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
@@ -675,8 +755,8 @@ impl Workspace {
                     .engine
                     .state()
                     .servers
-                    .into_iter()
-                    .map(|s| s.address)
+                    .iter()
+                    .map(|s| s.address.clone())
                     .collect();
                 if directory_entries(
                     &serde_json::json!([{"label":name,"endpoints":[endpoint]}]),
@@ -740,6 +820,19 @@ impl Workspace {
                             }
                         }
                     }
+                }
+            }
+            Action::Shell(action) => {
+                // The menu's pane, not whichever one focus has moved to since.
+                if let Some(block) = target.and_then(|target| {
+                    (self.server_id.as_ref() == Some(&target.server)
+                        && self.session_id == target.session)
+                        .then_some(target.block)
+                        .flatten()
+                }) {
+                    self.active_block = Some(block.clone());
+                    self.pending_focus = Some(block);
+                    self.run(action, window, cx);
                 }
             }
             Action::Control(mode) => {

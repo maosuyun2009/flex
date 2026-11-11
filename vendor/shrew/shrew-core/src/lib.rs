@@ -72,6 +72,8 @@ struct Inner {
     foreground: watch::Sender<bool>,
     client: ClientInfo,
     inbox: Mutex<ClientInbox>,
+    /// The last snapshot handed out, reused until a server's model changes.
+    state: Mutex<Option<Arc<AppState>>>,
 }
 
 impl Sink for Inner {
@@ -180,6 +182,7 @@ impl Shrew {
             dirty_notify: tokio::sync::Notify::new(),
             foreground: watch::channel(true).0,
             inbox: Mutex::new(ClientInbox::default()),
+            state: Mutex::new(None),
             client: ClientInfo {
                 kind: Some("app".into()),
                 platform: Some(config.platform),
@@ -209,6 +212,7 @@ impl Shrew {
     fn start(&self, p: Profile) -> Arc<ServerEntry> {
         let entry = ServerEntry::new(p);
         self.inner.servers.write().push(entry.clone());
+        self.forget_state();
         let sink: Arc<dyn Sink> = Arc::new(SinkRef(self.inner.clone()));
         self.rt.spawn(entry.clone().run(sink));
         self.inner.changed();
@@ -232,8 +236,24 @@ impl Shrew {
         self.rt.handle()
     }
 
-    pub fn state(&self) -> AppState {
-        AppState { servers: self.inner.servers.read().iter().map(|s| s.snapshot()).collect() }
+    /// The current snapshot. Cheap when nothing changed since the last call:
+    /// the same `Arc` comes back, so callers can ask as often as they like.
+    pub fn state(&self) -> Arc<AppState> {
+        let mut cached = self.inner.state.lock();
+        let servers = self.inner.servers.read();
+        // Ask every entry (`any` would stop at the first and leave the rest marked).
+        let changed = servers.iter().fold(false, |changed, s| s.take_changed() | changed);
+        if !changed && let Some(state) = cached.as_ref() {
+            return state.clone();
+        }
+        let state = Arc::new(AppState { servers: servers.iter().map(|s| s.snapshot()).collect() });
+        *cached = Some(state.clone());
+        state
+    }
+
+    /// The server list itself changed (added, removed, reordered).
+    fn forget_state(&self) {
+        *self.inner.state.lock() = None;
     }
 
     /// Raw RPC on the supervisor's connection, with its identity and event receiver.
@@ -333,6 +353,7 @@ impl Shrew {
             let pos = s.iter().position(|e| e.id() == server_id);
             pos.map(|i| s.remove(i))
         };
+        self.forget_state();
         if let Some(e) = removed {
             let _ = e.stop.send(true);
         }
@@ -374,17 +395,23 @@ impl Shrew {
     }
 
     pub fn move_server(&self, from: usize, to: usize) {
-        let mut s = self.inner.servers.write();
-        if from < s.len() && to < s.len() {
+        let order: Vec<String> = {
+            let mut s = self.inner.servers.write();
+            if from >= s.len() || to >= s.len() {
+                return;
+            }
             let e = s.remove(from);
             s.insert(to, e);
-            let order: Vec<String> = s.iter().map(|e| e.id()).collect();
-            drop(s);
+            s.iter().map(|e| e.id()).collect()
+        };
+        {
             let mut st = self.inner.store.lock();
             let mut all = st.profiles().to_vec();
             all.sort_by_key(|p| order.iter().position(|id| *id == p.id).unwrap_or(usize::MAX));
             st.set_profiles(all);
         }
+        // After the list lock is released: `state` takes its cache lock first.
+        self.forget_state();
         self.inner.changed();
     }
 
@@ -681,5 +708,33 @@ mod integration_tests {
         }));
         assert_eq!(shrew.block_on(shrew.call("saved", "client.keymap", json!({}))), Err(CoreError::NotConnected));
         assert_eq!(shrew.block_on(shrew.call("missing", "client.keymap", json!({}))), Err(CoreError::UnknownServer));
+    }
+
+    #[test]
+    fn state_is_reused_until_something_it_shows_changes() {
+        let shrew = Shrew::new(Config::default(), Arc::new(Quiet));
+        let entry = ServerEntry::new(Profile { id: "a".into(), name: "A".into(), address: "127.0.0.1:1".into() });
+        shrew.inner.servers.write().push(entry.clone());
+        shrew.forget_state();
+        let first = shrew.state();
+        assert!(Arc::ptr_eq(&first, &shrew.state()), "an unchanged model must not be copied again");
+
+        entry.model.lock().latency_ms = Some(7);
+        let second = shrew.state();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.servers[0].latency_ms, Some(7));
+        assert_eq!(first.servers[0].latency_ms, None, "a snapshot already handed out never changes");
+
+        shrew.update_server("a", "Renamed", "127.0.0.1:1").unwrap();
+        assert_eq!(shrew.state().servers[0].name, "Renamed");
+
+        // Out of range changes nothing, and must not hold the list lock into `state`.
+        shrew.move_server(0, 9);
+        assert_eq!(shrew.state().servers[0].name, "Renamed");
+
+        shrew.remove_server("a");
+        assert!(shrew.state().servers.is_empty());
+        let id = shrew.add_server("B", "127.0.0.1:2").unwrap();
+        assert_eq!(shrew.state().servers[0].id, id);
     }
 }

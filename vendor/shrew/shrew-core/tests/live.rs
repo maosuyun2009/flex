@@ -111,3 +111,53 @@ fn full_round_trip() {
     drop(_cleanup);
     assert!(wait(5, || !shrew.state().server(&id).unwrap().sessions.iter().any(|s| s.id == sid)));
 }
+
+/// Keys, text and pastes leave without waiting for each other's replies, and a
+/// paste larger than one control message is split. Both must still arrive in
+/// the order they were typed.
+#[test]
+fn pipelined_input_keeps_its_order_and_large_pastes_arrive_whole() {
+    let Ok(addr) = std::env::var("SHREW_TEST_SERVER") else {
+        eprintln!("SHREW_TEST_SERVER not set; skipping");
+        return;
+    };
+    let shrew = Shrew::new(Config::default(), Arc::new(L));
+    let id = shrew.add_server("", &addr).unwrap();
+    assert!(wait(10, || matches!(shrew.state().server(&id).unwrap().connectivity, Connectivity::Online)));
+    let label = format!("shrew-order-{}", std::process::id());
+    let (sid, bid) = shrew.block_on(shrew.create_session(&id, Some(&label), None)).unwrap();
+    let bid = bid.unwrap();
+    struct Cleanup<'a>(&'a Shrew, String, String);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.block_on(self.0.destroy_session(&self.1, &self.2));
+        }
+    }
+    let _cleanup = Cleanup(&shrew, id.clone(), sid.clone());
+    let term = shrew.open_terminal(&id, &sid, &bid, Arc::new(T::default())).unwrap();
+    assert!(wait(10, || term.status() == TerminalStatus::Live), "never went live");
+    let flat = |t: &TerminalSession| screen(t).replace('\n', "");
+
+    // A key, typed text and a paste, fifty times over, as fast as they queue.
+    term.send_text("cat\r");
+    for _ in 0..50 {
+        term.send_key(Key::Char('a'), false, false, false, false);
+        term.send_text("b");
+        term.paste("c");
+    }
+    term.send_key(Key::Enter, false, false, false, false);
+    let expected = "abc".repeat(50);
+    assert!(wait(10, || flat(&term).matches(&expected).count() >= 2), "input reordered:\n{}", screen(&term));
+    term.send_key(Key::Char('c'), true, false, false, false);
+
+    // 1.5 MB is more than one control message (1 MiB) can carry.
+    let line = format!("{}\n", "x".repeat(99));
+    let big = line.repeat(15_000);
+    term.send_text("stty -echo; wc -c; stty echo\r");
+    assert!(wait(5, || flat(&term).contains("stty -echo")));
+    std::thread::sleep(Duration::from_millis(500));
+    term.paste(&big);
+    term.send_key(Key::Char('d'), true, false, false, false);
+    assert!(wait(30, || screen(&term).contains(&format!("{}\n", big.len()))), "paste lost bytes:\n{}", screen(&term));
+    term.close();
+}

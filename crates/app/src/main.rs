@@ -16,6 +16,7 @@ mod paint;
 mod settings;
 mod shortcuts;
 mod terminal;
+mod text_field;
 mod theme;
 mod win32;
 mod workspace;

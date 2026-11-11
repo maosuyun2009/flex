@@ -21,6 +21,9 @@ pub struct Settings {
     pub scrollback_lines: u64,
     /// Explicit consent before other clients may drive this window.
     pub allow_remote_actions: bool,
+    /// Programs on the server (OSC 52) and other clients may set the local
+    /// clipboard. Each write is announced; turning this off refuses them.
+    pub remote_clipboard: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +36,7 @@ impl Default for Settings {
             background_opacity: 0.35,
             scrollback_lines: 10_000,
             allow_remote_actions: false,
+            remote_clipboard: true,
         }
     }
 }
@@ -63,6 +67,7 @@ impl Settings {
             sidebar: flag("flex.sidebar").unwrap_or(default.sidebar),
             acrylic: flag("flex.acrylic").unwrap_or(default.acrylic),
             allow_remote_actions: flag("flex.allow_remote_actions").unwrap_or(false),
+            remote_clipboard: flag("flex.remote_clipboard").unwrap_or(default.remote_clipboard),
             background: setting("flex.background").and_then(|v| v.as_str().map(str::to_owned)),
             background_opacity: number("flex.background_opacity")
                 .unwrap_or(default.background_opacity)
@@ -83,6 +88,7 @@ impl Settings {
             "flex.allow_remote_actions",
             json!(self.allow_remote_actions),
         );
+        store.set_setting("flex.remote_clipboard", json!(self.remote_clipboard));
         store.set_setting(
             "flex.background",
             match &self.background {

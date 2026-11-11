@@ -63,6 +63,9 @@ struct Inner {
     timeout: Duration,
 }
 
+/// The reply to a request that [`Connection::start`] already queued.
+pub type Reply = std::pin::Pin<Box<dyn Future<Output = Result<(u64, Value), ClientError>> + Send>>;
+
 /// A live control connection. Cheap to clone; all clones share one socket.
 #[derive(Clone)]
 pub struct Connection {
@@ -213,6 +216,16 @@ impl Connection {
 
     /// Call a method; returns the response's `seq` and its payload.
     pub async fn call_seq(&self, method: &str, payload: Value) -> Result<(u64, Value), ClientError> {
+        self.start(method, payload)?.await
+    }
+
+    /// Queue a request on the socket now and return its reply to await later.
+    /// Requests reach the server in the order `start` was called, so several
+    /// can be in flight at once. Rex runs `client.key`, `client.action`,
+    /// `block.event` and the focus/layout methods in arrival order; other
+    /// methods (terminal `write` among them) run concurrently and must be
+    /// awaited one at a time when their order matters.
+    pub fn start(&self, method: &str, payload: Value) -> Result<Reply, ClientError> {
         if self.is_closed() {
             return Err(ClientError::Closed);
         }
@@ -233,18 +246,21 @@ impl Connection {
             self.inner.pending.lock().unwrap().remove(&id);
             return Err(ClientError::Closed);
         }
-        let resp = match tokio::time::timeout(self.inner.timeout * 3, rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => return Err(ClientError::Closed),
-            Err(_) => {
-                self.inner.pending.lock().unwrap().remove(&id);
-                return Err(ClientError::Timeout);
+        let inner = self.inner.clone();
+        Ok(Box::pin(async move {
+            let resp = match tokio::time::timeout(inner.timeout * 3, rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => return Err(ClientError::Closed),
+                Err(_) => {
+                    inner.pending.lock().unwrap().remove(&id);
+                    return Err(ClientError::Timeout);
+                }
+            };
+            if let Some(e) = resp.error {
+                return Err(ClientError::Api(e));
             }
-        };
-        if let Some(e) = resp.error {
-            return Err(ClientError::Api(e));
-        }
-        Ok((resp.seq, resp.payload.unwrap_or(Value::Null)))
+            Ok((resp.seq, resp.payload.unwrap_or(Value::Null)))
+        }))
     }
 
     pub async fn call(&self, method: &str, payload: Value) -> Result<Value, ClientError> {
@@ -379,19 +395,33 @@ impl Connection {
         self.call(&format!("{TERMINAL_CREATOR}.{method}"), p).await
     }
 
-    /// Type text as if the user typed it.
+    /// Type text as if the user typed it. Text larger than one message is sent
+    /// in order, one piece at a time: Rex runs a connection's requests
+    /// concurrently, so the next piece waits for the previous reply.
     pub async fn write(&self, session_id: &str, block_id: &str, text: &str) -> Result<(), ClientError> {
-        self.terminal(session_id, block_id, "write", json!({"data": text})).await.map(drop)
+        for piece in split_for_messages(text, self.text_budget()) {
+            self.terminal(session_id, block_id, "write", json!({"data": piece})).await?;
+        }
+        Ok(())
     }
 
-    /// Paste (respects bracketed paste mode).
+    /// Paste (respects bracketed paste mode). A paste larger than one message
+    /// arrives as consecutive pastes, in order.
     pub async fn paste(&self, session_id: &str, block_id: &str, text: &str) -> Result<(), ClientError> {
-        self.call(
-            "block.event",
-            json!({"session_id": session_id, "block_id": block_id, "event": {"type": "paste", "payload": {"text": text}}}),
-        )
-        .await
-        .map(drop)
+        for piece in split_for_messages(text, self.text_budget()) {
+            self.call(
+                "block.event",
+                json!({"session_id": session_id, "block_id": block_id, "event": {"type": "paste", "payload": {"text": piece}}}),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// How much escaped text one request can carry, leaving room for its envelope.
+    fn text_budget(&self) -> usize {
+        let max = usize::try_from(self.inner.welcome.limits.max_message_bytes).unwrap_or(usize::MAX);
+        max.saturating_sub(ENVELOPE_BYTES).max(MIN_TEXT_BUDGET)
     }
 
     /// Send a key press (and release), routed through the server's key bindings.
@@ -441,6 +471,40 @@ impl Connection {
     pub async fn server_status(&self) -> Result<Value, ClientError> {
         self.call("server.status", json!({})).await
     }
+}
+
+/// Room left in a request for everything but its text: id, method, ids, keys.
+const ENVELOPE_BYTES: usize = 4096;
+const MIN_TEXT_BUDGET: usize = 256;
+
+/// Bytes `c` takes inside a JSON string, as serde_json escapes it.
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Split `text` at character boundaries so each piece, JSON-escaped, fits in
+/// `budget` bytes. Empty text yields nothing.
+fn split_for_messages(text: &str, budget: usize) -> Vec<&str> {
+    // Room for any one character: the longest escape (`\u00XX`) is six bytes.
+    let budget = budget.max(6);
+    let mut pieces = Vec::new();
+    let (mut start, mut used) = (0, 0);
+    for (at, c) in text.char_indices() {
+        let len = json_escaped_len(c);
+        if used + len > budget {
+            pieces.push(&text[start..at]);
+            (start, used) = (at, 0);
+        }
+        used += len;
+    }
+    if start < text.len() {
+        pieces.push(&text[start..]);
+    }
+    pieces
 }
 
 pub fn platform_name() -> &'static str {
@@ -586,5 +650,101 @@ pub fn char_code(c: char) -> String {
         '.' | '>' => "period".into(),
         '/' | '?' => "slash".into(),
         _ => "unidentified".into(),
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn escaped(piece: &str) -> usize {
+        serde_json::to_string(piece).unwrap().len() - 2
+    }
+
+    #[test]
+    fn small_text_is_one_piece_and_empty_text_none() {
+        assert_eq!(split_for_messages("ls -la\r", 1024), vec!["ls -la\r"]);
+        assert!(split_for_messages("", 1024).is_empty());
+    }
+
+    #[test]
+    fn pieces_fit_the_budget_after_escaping_and_rejoin_exactly() {
+        let text = "a\"b\\c\n\u{1}中文😀\t".repeat(500);
+        for budget in [6, 7, 64, 1000] {
+            let pieces = split_for_messages(&text, budget);
+            assert_eq!(pieces.concat(), text);
+            for piece in &pieces {
+                assert!(!piece.is_empty());
+                assert!(escaped(piece) <= budget, "{} > {budget}", escaped(piece));
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_length_matches_serde_json() {
+        for c in ['a', '"', '\\', '\n', '\u{1f}', '\u{7f}', '中', '😀', '/'] {
+            assert_eq!(json_escaped_len(c), escaped(&c.to_string()), "{c:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response as Handshake};
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    /// One-client Rex stand-in that answers nothing until `hold` requests have
+    /// arrived, then answers them all. Resolves with the `n` of each request.
+    async fn holding_server(hold: usize) -> (Endpoint, tokio::task::JoinHandle<Vec<u64>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(tcp, |_: &Request, mut reply: Handshake| {
+                reply.headers_mut().insert("Sec-WebSocket-Protocol", HeaderValue::from_static(CONTROL_SUBPROTOCOL));
+                Ok(reply)
+            })
+            .await
+            .unwrap();
+            ws.next().await.unwrap().unwrap(); // hello
+            let welcome = json!({
+                "type": "welcome", "protocol": CONTROL_SUBPROTOCOL, "limits": {"max_message_bytes": 1 << 20},
+                "client": {"id": "client:x", "reconnect_token": "t"}, "api_revision": API_REVISION,
+            });
+            ws.send(Message::text(welcome.to_string())).await.unwrap();
+            let (mut ids, mut seen) = (Vec::new(), Vec::new());
+            while ids.len() < hold {
+                let Message::Text(text) = ws.next().await.unwrap().unwrap() else { continue };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                ids.push(request["id"].as_str().unwrap().to_owned());
+                seen.push(request["payload"]["n"].as_u64().unwrap());
+            }
+            for id in ids {
+                ws.send(Message::text(json!({"type": "response", "id": id, "seq": 0, "payload": {}}).to_string())).await.unwrap();
+            }
+            // Stay until the client closes: dropping the socket with one of its
+            // pings unread resets the connection and can take the replies with it.
+            while let Some(Ok(_)) = ws.next().await {}
+            seen
+        });
+        (Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap(), task)
+    }
+
+    #[tokio::test]
+    async fn started_requests_are_on_the_wire_in_order_before_any_reply() {
+        let (endpoint, server) = holding_server(3).await;
+        let (conn, _events) = Connection::connect(&endpoint, ConnectOptions::default()).await.unwrap();
+        // A caller that awaited each reply before sending the next would hang here.
+        let replies: Vec<Reply> = (0..3).map(|n| conn.start("client.key", json!({"n": n})).unwrap()).collect();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for reply in replies {
+                reply.await.unwrap();
+            }
+        })
+        .await
+        .expect("requests were not pipelined");
+        conn.close();
+        assert_eq!(server.await.unwrap(), [0, 1, 2]);
     }
 }

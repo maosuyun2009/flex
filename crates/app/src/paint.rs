@@ -17,6 +17,9 @@ pub struct Palette {
 #[allow(clippy::too_many_arguments)]
 pub fn paint(
     frame: &Frame,
+    // Whether this pane has the keyboard. Without it the cursor is drawn
+    // hollow, so only one solid cursor is on screen: where typing goes.
+    focused: bool,
     bounds: Bounds<Pixels>,
     metrics: Metrics,
     pad: Pixels,
@@ -78,7 +81,12 @@ pub fn paint(
             .map(color)
             .unwrap_or_else(|| color(frame.foreground));
         let box_ = Bounds::new(at, size(w, cell_h));
-        window.paint_quad(match cursor.style {
+        let style = if focused {
+            cursor.style
+        } else {
+            CursorStyle::HollowBlock
+        };
+        window.paint_quad(match style {
             CursorStyle::Bar => fill(Bounds::new(at, size(px(2.0), cell_h)), shade),
             CursorStyle::Underline => fill(
                 Bounds::new(point(at.x, at.y + cell_h - px(2.0)), size(w, px(2.0))),

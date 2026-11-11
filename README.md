@@ -172,7 +172,7 @@ no move when nothing lies that way) · `Ctrl-Shift-d` split right · `Ctrl-Shift
 · `Ctrl-Shift-u` float the pane or tile it again · `Ctrl-Shift-n` open a new
 floating terminal in this tab · `Ctrl-Shift-f` find in the terminal · `Ctrl-Shift-t` new tab ·
 `Alt-1`…`Alt-9` jump to that tab (past the last one, nothing moves) ·
-`Ctrl-Shift-Enter` zoom · `Ctrl-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
+`Ctrl-Shift-Enter` zoom · `Ctrl-Shift-b` sidebar · `Ctrl-,` settings. One table in `shortcuts.rs` feeds both the
 matcher and the settings page, so the list you read is the list that works.
 
 `Ctrl-Alt-k` clears the pane's screen and scrollback. Plain `Ctrl-h/j/k/l`

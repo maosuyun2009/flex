@@ -8,13 +8,13 @@ use flex_engine::keybindings::{KeyBindings, Resolution};
 use flex_engine::{fit_grid, Engine, Metrics, TerminalListener, TerminalSession};
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, px, App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
+    canvas, div, px, relative, App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Point, Render, SharedString,
     UTF16Selection, Window,
 };
 use shrew_core::{ColorTheme, Frame, Rgb, Row, TerminalStatus};
 
-use crate::{keymap, paint, shortcuts};
+use crate::{keymap, paint, shortcuts, theme};
 
 const PAD: f32 = 4.0;
 
@@ -55,6 +55,20 @@ pub enum TerminalEvent {
         name: String,
         args: serde_json::Value,
     },
+    /// Typing, a paste or a key did not reach the server.
+    InputFailed(String),
+    /// A program on the server (OSC 52) or another client wants to set the
+    /// local clipboard. The workspace decides whether it may.
+    RemoteClipboard(String),
+    /// Ctrl with the wheel: make the terminal's text this many steps bigger
+    /// (or, negative, smaller). The size is the workspace's setting.
+    Zoom(i8),
+    /// A right-click the program has no use for: the workspace shows the
+    /// pane's menu there.
+    ContextMenu {
+        at: Point<gpui::Pixels>,
+        has_selection: bool,
+    },
 }
 
 impl gpui::EventEmitter<TerminalEvent> for TerminalView {}
@@ -70,7 +84,13 @@ pub struct TerminalView {
     /// A selection being dragged. Nothing is selected until the pointer moves:
     /// a click that only switches panes must not select or copy anything.
     selecting: Option<Selecting>,
+    /// A selection the pointer made is still on screen. It stays after the
+    /// release, so it can be seen and copied again, until a click or a key.
+    selected: bool,
     mouse_buttons: Vec<MouseButton>,
+    /// The cell and held button of the last motion report. The pointer moves
+    /// in pixels and a terminal reports cells, so a move inside one is not news.
+    last_motion: Option<((u16, u16), Option<MouseButton>)>,
     control_released: bool,
     focused: bool,
     forwarded: ForwardedKeys,
@@ -105,7 +125,7 @@ pub struct TerminalView {
     ime_answer: Option<Pending>,
     session: Option<Arc<TerminalSession>>,
     error: Option<String>,
-    frame: Frame,
+    frame: Arc<Frame>,
     /// Last cell the terminal reported, used when a TUI hides its cursor.
     last_cursor: (u16, u16),
     focus: FocusHandle,
@@ -115,6 +135,8 @@ pub struct TerminalView {
 enum Wake {
     Changed,
     Actions(Vec<(String, serde_json::Value)>),
+    InputFailed(String),
+    Clipboard(String),
 }
 
 struct Notifier(Sender<Wake>);
@@ -126,17 +148,19 @@ impl TerminalListener for Notifier {
     fn status_changed(&self, _: TerminalStatus) {
         let _ = self.0.try_send(Wake::Changed);
     }
-    /// A program copied text with OSC 52, or another client selected some. The
-    /// text never passes through a GPUI action, so it goes to the clipboard the
-    /// direct way.
+    /// A program copied text with OSC 52, or another client selected some.
+    /// Not written here: the UI thread checks consent first.
     fn clipboard(&self, text: String) {
-        crate::win32::set_clipboard_text(&text);
+        let _ = self.0.try_send(Wake::Clipboard(text));
     }
     fn size_changed(&self, _cols: u16, _rows: u16) {}
     fn client_actions(&self, actions: Vec<(String, serde_json::Value)>) {
         if !actions.is_empty() {
             let _ = self.0.try_send(Wake::Actions(actions));
         }
+    }
+    fn input_failed(&self, message: String) {
+        let _ = self.0.try_send(Wake::InputFailed(message));
     }
 }
 
@@ -452,6 +476,49 @@ struct Selecting {
     dragging: bool,
 }
 
+/// How far a scroll of `rows` may actually go: not past the newest line, and
+/// not further back than `cap` lines of scrollback.
+fn clamp_scroll(bar: shrew_core::Scrollbar, cap: u64, rows: i64) -> i64 {
+    let latest = bar.total.saturating_sub(bar.len) as i64;
+    let earliest = (latest as u64).saturating_sub(cap) as i64;
+    (bar.offset as i64 + rows).clamp(earliest, latest) - bar.offset as i64
+}
+
+/// Where the scrollbar thumb sits, as (top, height) fractions of the pane, and
+/// how many lines lie below the view. `None` at the bottom: a terminal that
+/// follows its output needs no scrollbar.
+fn scroll_thumb(bar: shrew_core::Scrollbar, cap: u64) -> Option<(f32, f32, u64)> {
+    if bar.at_bottom() || bar.len == 0 {
+        return None;
+    }
+    let latest = bar.total.saturating_sub(bar.len);
+    let earliest = latest.saturating_sub(cap);
+    // The reachable buffer: what the cap allows above, plus the screen.
+    let reach = (latest - earliest + bar.len) as f32;
+    let top = bar.offset.saturating_sub(earliest) as f32 / reach;
+    // Tall enough to see, however long the history.
+    let height = (bar.len as f32 / reach).max(0.04);
+    Some((top.min(1.0 - height), height, latest.saturating_sub(bar.offset)))
+}
+
+/// What one press selects, by how many times it was clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Unit {
+    Cell,
+    Word,
+    Line,
+}
+
+/// One click anchors a drag, two take the word, three the line; a fourth
+/// starts over, as terminals do.
+fn selection_unit(click_count: usize) -> Unit {
+    match click_count.saturating_sub(1) % 3 {
+        0 => Unit::Cell,
+        1 => Unit::Word,
+        _ => Unit::Line,
+    }
+}
+
 /// Whether the pointer has moved far enough for this to be a drag rather than a
 /// click: switching panes jitters a pixel or two, and that must select nothing.
 fn is_drag(pressed: gpui::Point<gpui::Pixels>, at: gpui::Point<gpui::Pixels>) -> bool {
@@ -586,11 +653,20 @@ impl TerminalView {
                 while let Ok(wake) = rx.recv().await {
                     if this
                         .update(cx, |_, cx| {
-                            if let Wake::Actions(actions) = wake {
-                                for (name, args) in actions {
-                                    if shortcuts::configured_action(&name, &args).is_some() {
-                                        cx.emit(TerminalEvent::ConfiguredAction { name, args });
+                            match wake {
+                                Wake::Changed => {}
+                                Wake::Actions(actions) => {
+                                    for (name, args) in actions {
+                                        if shortcuts::configured_action(&name, &args).is_some() {
+                                            cx.emit(TerminalEvent::ConfiguredAction { name, args });
+                                        }
                                     }
+                                }
+                                Wake::InputFailed(message) => {
+                                    cx.emit(TerminalEvent::InputFailed(message))
+                                }
+                                Wake::Clipboard(text) => {
+                                    cx.emit(TerminalEvent::RemoteClipboard(text))
                                 }
                             }
                             cx.notify();
@@ -607,7 +683,9 @@ impl TerminalView {
             composition: Composition::default(),
             prefix,
             selecting: None,
+            selected: false,
             mouse_buttons: Vec::new(),
+            last_motion: None,
             control_released: false,
             focused: false,
             forwarded: ForwardedKeys::default(),
@@ -628,7 +706,7 @@ impl TerminalView {
             ime_answer: None,
             session,
             error,
-            frame: empty_frame(),
+            frame: Arc::new(empty_frame()),
             last_cursor: (0, 0),
             focus: cx.focus_handle(),
             palette: paint::Palette {
@@ -725,6 +803,7 @@ impl TerminalView {
             self.refind(cx);
             return;
         }
+        self.drop_selection();
         let Some(session) = &self.session else { return };
         // `paste`, not `send_text`: a program that turned on bracketed paste
         // (mode 2004 — vim, agents, readline) needs the text wrapped, or it
@@ -779,6 +858,7 @@ impl TerminalView {
 
     fn close_find(&mut self, cx: &mut Context<Self>) {
         self.find = None;
+        self.selected = false;
         self.composition.close_search();
         self.leaked.clear();
         self.last_punct = None;
@@ -1036,7 +1116,7 @@ impl TerminalView {
             cx.notify();
             return;
         }
-        if self.find.is_some() {
+        if self.find.is_some() && event.button == MouseButton::Left {
             self.close_find(cx);
         }
         let cell = self.mouse_cell(event.position);
@@ -1056,13 +1136,49 @@ impl TerminalView {
             if !self.mouse_buttons.contains(&event.button) {
                 self.mouse_buttons.push(event.button);
             }
+            self.last_motion = None;
             self.forward_mouse("press", Some(event.button), cell, event.modifiers);
             cx.notify();
+        } else if event.button == MouseButton::Right {
+            // The selection stays: Copy in the menu is for it.
+            cx.emit(TerminalEvent::ContextMenu {
+                at: event.position,
+                has_selection: self.selected,
+            });
+            cx.stop_propagation();
         } else if event.button == MouseButton::Left {
             if std::env::var_os("FLEX_DEBUG").is_some() {
                 eprintln!("[mouse] down cell={cell:?} at={:?}", event.position);
             }
-            self.begin_selection(cell, event.position, cx);
+            match selection_unit(event.click_count) {
+                Unit::Cell => self.begin_selection(cell, event.position, cx),
+                unit => self.select_unit(unit, cell, cx),
+            }
+        }
+    }
+
+    /// Double-click a word, triple-click a line: selected and copied at once.
+    fn select_unit(&mut self, unit: Unit, (col, row): (u16, u16), cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        self.selecting = None;
+        let found = match unit {
+            Unit::Word => session.select_word(col, row),
+            Unit::Line => session.select_line(row),
+            Unit::Cell => false,
+        };
+        self.selected = found;
+        if found {
+            self.copy(cx);
+        }
+        cx.notify();
+    }
+
+    /// Typing or pasting ends a pointer selection, as a click does.
+    fn drop_selection(&mut self) {
+        if std::mem::take(&mut self.selected) {
+            if let Some(session) = &self.session {
+                session.clear_selection();
+            }
         }
     }
 
@@ -1100,12 +1216,15 @@ impl TerminalView {
         } else if !event.modifiers.shift
             && self.session.as_ref().is_some_and(|s| s.mouse_tracking())
         {
-            self.forward_mouse(
-                "move",
-                self.mouse_buttons.last().copied(),
+            let report = (
                 self.mouse_cell(event.position),
-                event.modifiers,
+                self.mouse_buttons.last().copied(),
             );
+            if self.last_motion != Some(report) {
+                self.last_motion = Some(report);
+                // Rex's name for a move or a drag; it knows no "move".
+                self.forward_mouse("motion", report.1, report.0, event.modifiers);
+            }
         }
     }
 
@@ -1141,6 +1260,7 @@ impl TerminalView {
             if !is_drag(selecting.pressed, at) {
                 return;
             }
+            self.selected = false;
             if std::env::var_os("FLEX_DEBUG").is_some() {
                 eprintln!("[mouse] drag starts from={from:?} at={at:?}");
             }
@@ -1160,6 +1280,7 @@ impl TerminalView {
     /// Drop a selection that nothing is holding down any more.
     fn cancel_selection(&mut self, cx: &mut Context<Self>) {
         self.selecting = None;
+        self.selected = false;
         if let Some(session) = &self.session {
             session.clear_selection();
         }
@@ -1179,21 +1300,25 @@ impl TerminalView {
                 text.chars().take(40).collect::<String>()
             );
         }
-        if !selecting.dragging {
-            // A click, not a drag: it switched panes and nothing is selected.
-            session.clear_selection();
-            cx.notify();
-            return;
+        let text = selecting
+            .dragging
+            .then(|| session.selection_text())
+            .flatten()
+            .filter(|text| !text.is_empty());
+        match text {
+            // The highlight stays: it shows what was copied, and Copy can take
+            // it again. The next click or key clears it.
+            Some(text) => {
+                self.selected = true;
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
+            // A click, not a drag: nothing is selected, and an earlier
+            // selection ends here.
+            None => {
+                self.selected = false;
+                session.clear_selection();
+            }
         }
-        let Some(text) = session.selection_text() else {
-            session.clear_selection();
-            cx.notify();
-            return;
-        };
-        if !text.is_empty() {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        }
-        session.clear_selection();
         cx.notify();
     }
 
@@ -1206,17 +1331,47 @@ impl TerminalView {
             session.wheel(at.0, at.1, -notches * 3.0);
             return;
         }
-        let bar = self.frame.scrollbar;
         // One notch is three lines, the usual terminal step.
-        let delta = -(notches * 3.0) as i64;
-        let latest = bar.total.saturating_sub(bar.len) as i64;
-        let earliest = (latest as u64).saturating_sub(self.scrollback_lines) as i64;
-        let want = (bar.offset as i64 + delta).clamp(earliest, latest);
-        let actual = want - bar.offset as i64;
+        self.scroll_rows(-(notches * 3.0) as i64, cx);
+    }
+
+    /// Scroll the scrollback by `rows` (negative is back), never further than
+    /// the configured cap.
+    fn scroll_rows(&mut self, rows: i64, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        let actual = clamp_scroll(self.frame.scrollbar, self.scrollback_lines, rows);
         if actual != 0 {
             session.scroll(actual as i32);
             cx.notify();
         }
+    }
+
+    fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    /// Shift-PageUp and Shift-PageDown page through the scrollback, and
+    /// Shift-End returns to the prompt. A full-screen program has no
+    /// scrollback, so there the keys are its own.
+    fn scroll_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        let modifiers = &keystroke.modifiers;
+        if !modifiers.shift || modifiers.control || modifiers.alt || modifiers.platform {
+            return false;
+        }
+        if self.frame.alternate_screen {
+            return false;
+        }
+        let page = i64::from(self.frame.rows.saturating_sub(1).max(1));
+        match keystroke.key.as_str() {
+            "pageup" => self.scroll_rows(-page, cx),
+            "pagedown" => self.scroll_rows(page, cx),
+            "end" if !self.frame.scrollbar.at_bottom() => self.scroll_to_bottom(cx),
+            _ => return false,
+        }
+        true
     }
 
     /// The pane's whole screen and scrollback, as text.
@@ -1260,6 +1415,10 @@ impl TerminalView {
         }
         // An armed shell prefix belongs to the workspace, even with a loaded map.
         if self.prefix.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if self.scroll_key(&event.keystroke, cx) {
+            cx.stop_propagation();
             return;
         }
         // The commit beat the keystroke here: that key belongs to the input
@@ -1373,8 +1532,12 @@ impl TerminalView {
                 return;
             }
         }
+        let translated = keymap::translate(&event.keystroke);
+        if translated.is_some() {
+            self.drop_selection();
+        }
         let Some(session) = &self.session else { return };
-        match keymap::translate(&event.keystroke) {
+        match translated {
             Some(p) => {
                 let plain_letter = !p.ctrl
                     && !p.alt
@@ -1493,7 +1656,7 @@ impl Render for TerminalView {
                 format!("{} / {}", find.current + 1, find.matches.len())
             };
             let query = if placeholder {
-                "查找文本".to_owned()
+                "Find".to_owned()
             } else {
                 find.query.clone()
             };
@@ -1502,12 +1665,12 @@ impl Render for TerminalView {
                 .truncate()
                 .text_sm()
                 .text_color(if placeholder {
-                    gpui::rgb(0x78808f)
+                    theme::muted()
                 } else {
-                    gpui::rgb(0xe4e9f2)
+                    theme::text()
                 })
                 .child(query);
-            let counter = div().text_xs().text_color(gpui::rgb(0xa9b1c1)).child(count);
+            let counter = div().text_xs().text_color(theme::muted()).child(count);
             let button = |id: &'static str,
                           label: String,
                           active: bool,
@@ -1523,9 +1686,9 @@ impl Render for TerminalView {
                     .justify_center()
                     .rounded_sm()
                     .text_xs()
-                    .when(active, |el| el.text_color(gpui::rgb(0xf0b429)))
-                    .when(!active, |el| el.text_color(gpui::rgb(0x9aa3b2)))
-                    .hover(|el| el.bg(gpui::rgb(0x353a47)).text_color(gpui::rgb(0xe4e9f2)))
+                    .when(active, |el| el.text_color(theme::accent()))
+                    .when(!active, |el| el.text_color(theme::muted()))
+                    .hover(|el| el.bg(theme::hover()).text_color(theme::text()))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| f(this, cx)))
                     .into_any_element()
@@ -1558,9 +1721,9 @@ impl Render for TerminalView {
                 .px_2()
                 .h(px(30.0))
                 .rounded_md()
-                .bg(gpui::rgb(0x21242e))
+                .bg(theme::color(theme::SURFACE))
                 .border_1()
-                .border_color(gpui::rgb(0x3a3f52))
+                .border_color(theme::border())
                 .shadow_lg()
                 .child(field)
                 .child(counter)
@@ -1595,10 +1758,53 @@ impl Render for TerminalView {
                 .px_2()
                 .py_1()
                 .rounded_sm()
-                .bg(gpui::rgb(0x21242e))
+                .bg(theme::color(theme::SURFACE))
                 .text_xs()
-                .text_color(gpui::rgb(0xf0b429))
+                .text_color(theme::accent())
                 .child(text)
+        });
+        let scrolled = scroll_thumb(self.frame.scrollbar, self.scrollback_lines);
+        let thumb = scrolled.map(|(top, height, _)| {
+            let mut colour = theme::muted();
+            colour.a = 0.55;
+            div()
+                .absolute()
+                .right(px(2.0))
+                .top(relative(top))
+                .h(relative(height))
+                .w(px(4.0))
+                .rounded_full()
+                .bg(colour)
+        });
+        let to_bottom = scrolled.map(|(_, _, below)| {
+            div()
+                .id("scroll-to-bottom")
+                .absolute()
+                .right(px(12.0))
+                .bottom(px(8.0))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme::color(theme::SURFACE))
+                .border_1()
+                .border_color(theme::border())
+                .shadow_lg()
+                .text_xs()
+                .text_color(theme::text())
+                .hover(|el| el.bg(theme::hover()))
+                .child(format!(
+                    "↓ {below} line{} below",
+                    if below == 1 { "" } else { "s" }
+                ))
+                // On press, and stopped: the pane under it must not start a
+                // selection or send the click to a program.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.scroll_to_bottom(cx);
+                        cx.stop_propagation();
+                    }),
+                )
         });
         let view = cx.entity();
         let focus = self.focus.clone();
@@ -1645,6 +1851,12 @@ impl Render for TerminalView {
                     gpui::ScrollDelta::Lines(lines) => lines.y,
                     gpui::ScrollDelta::Pixels(pixels) => f32::from(pixels.y) / 44.0,
                 };
+                // Ctrl-wheel is the text size everywhere else on Windows; one
+                // step per event, whatever the wheel's resolution.
+                if event.modifiers.control && notches != 0.0 {
+                    cx.emit(TerminalEvent::Zoom(if notches > 0.0 { 1 } else { -1 }));
+                    return;
+                }
                 let (origin, metrics) = *this.geometry.lock().unwrap();
                 let at = TerminalView::cell_at(origin, metrics, event.position);
                 this.wheel(notches, at, event.modifiers.shift, cx);
@@ -1714,6 +1926,7 @@ impl Render for TerminalView {
                         );
                         paint::paint(
                             &frame,
+                            focused,
                             bounds,
                             metrics,
                             px(PAD),
@@ -1728,6 +1941,8 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .children(thumb)
+            .children(to_bottom)
             .children(find_bar)
             .children(status_bar)
             .into_any_element()
@@ -1860,6 +2075,7 @@ impl EntityInputHandler for TerminalView {
             return;
         }
         self.leaked.clear();
+        self.drop_selection();
         if let Some(session) = &self.session {
             for _ in 0..retract {
                 session.send_text("\u{7f}");
@@ -1958,6 +2174,49 @@ mod tests {
 
     fn line(text: &str) -> Vec<char> {
         text.chars().collect()
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_newest_line_and_at_the_scrollback_cap() {
+        use super::clamp_scroll;
+        let bar = |offset| shrew_core::Scrollbar { total: 1000, offset, len: 40 };
+        // At the bottom (offset 960): forward goes nowhere, back goes back.
+        assert_eq!(clamp_scroll(bar(960), 10_000, 5), 0);
+        assert_eq!(clamp_scroll(bar(960), 10_000, -39), -39);
+        assert_eq!(clamp_scroll(bar(10), 10_000, -39), -10);
+        // A cap of 100 lines: the view never goes above row 860.
+        assert_eq!(clamp_scroll(bar(960), 100, -500), -100);
+        assert_eq!(clamp_scroll(bar(860), 100, -1), 0);
+    }
+
+    #[test]
+    fn the_scrollbar_shows_only_while_scrolled_back() {
+        use super::scroll_thumb;
+        let bar = |offset| shrew_core::Scrollbar { total: 1000, offset, len: 40 };
+        assert_eq!(scroll_thumb(bar(960), 10_000), None);
+        assert_eq!(scroll_thumb(shrew_core::Scrollbar::default(), 10_000), None);
+        // Halfway back through everything: the thumb's top is at the middle.
+        let (top, height, below) = scroll_thumb(bar(480), 10_000).unwrap();
+        assert!((top - 0.48).abs() < 0.001, "{top}");
+        assert!((height - 0.04).abs() < 0.001, "{height}");
+        assert_eq!(below, 480);
+        // At the cap the thumb is at the top, and never runs off the bottom.
+        let (top, _, below) = scroll_thumb(bar(860), 100).unwrap();
+        assert_eq!((top, below), (0.0, 100));
+        let (top, height, below) = scroll_thumb(bar(959), 10_000).unwrap();
+        assert!(top + height <= 1.0);
+        assert_eq!(below, 1);
+    }
+
+    #[test]
+    fn clicks_select_a_cell_then_a_word_then_a_line() {
+        use super::{selection_unit, Unit};
+        assert_eq!(selection_unit(0), Unit::Cell);
+        assert_eq!(selection_unit(1), Unit::Cell);
+        assert_eq!(selection_unit(2), Unit::Word);
+        assert_eq!(selection_unit(3), Unit::Line);
+        assert_eq!(selection_unit(4), Unit::Cell);
+        assert_eq!(selection_unit(5), Unit::Word);
     }
 
     #[test]

@@ -171,7 +171,11 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
         Action::Paste,
         "Paste the clipboard into the terminal",
     ),
-    ("ctrl-b", Action::ToggleSidebar, "Show or hide the sidebar"),
+    (
+        "ctrl-shift-b",
+        Action::ToggleSidebar,
+        "Show or hide the sidebar",
+    ),
     ("ctrl-,", Action::Settings, "Settings"),
     (
         "ctrl-shift-space",
@@ -438,6 +442,18 @@ mod tests {
             .iter()
             .any(|b| b["keys"] == serde_json::json!(["ctrl+alt+k"])
                 && b["action"] == "flex.clear_pane"));
+    }
+
+    /// Bare Ctrl-letters belong to the programs in the terminal: Ctrl-B is
+    /// tmux's prefix and readline's cursor-left. The shell's own keys add
+    /// Shift or Alt.
+    #[test]
+    fn bare_control_letters_are_left_to_terminal_programs() {
+        for key in 'a'..='z' {
+            let key = key.to_string();
+            assert_eq!(lookup(&stroke(&key, true, false)), None, "ctrl-{key}");
+        }
+        assert_eq!(lookup(&stroke("b", true, true)), Some(Action::ToggleSidebar));
     }
 
     #[test]

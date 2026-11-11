@@ -6,7 +6,7 @@ mod endpoint;
 mod error;
 
 pub use connection::{
-    AttachedSession, Bootstrap, ConnEvent, ConnectOptions, Connection, DataTicket, KeyPress, Mods, char_code, platform_name,
+    AttachedSession, Bootstrap, ConnEvent, ConnectOptions, Connection, DataTicket, KeyPress, Mods, Reply, char_code, platform_name,
 };
 pub use data::{DataEvent, DataStream};
 pub use endpoint::Endpoint;

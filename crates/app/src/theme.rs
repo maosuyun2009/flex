@@ -14,7 +14,10 @@ pub const HOVER: u32 = 0x24272e;
 pub const ACTIVE: u32 = 0x2b2f37; // selected tab chip
 pub const BORDER: u32 = 0x24262c;
 pub const TEXT: u32 = 0xc9ced8;
-pub const MUTED: u32 = 0x78808f;
+// Secondary text. Light enough to read at `text_xs` on every surface it
+// lands on (4.5:1 or better on BG, SURFACE and HOVER), still clearly
+// quieter than TEXT.
+pub const MUTED: u32 = 0x8a92a0;
 pub const ACCENT: u32 = 0xf0b429; // the mark in the title bar
 pub const DANGER: u32 = 0xc4564f; // close button hover
 
@@ -95,6 +98,33 @@ pub fn tab_appearance(chrome: Chrome, active: bool, bell: bool) -> TabAppearance
 mod tab_tests {
     use super::*;
 
+    /// WCAG contrast ratio between two opaque colours.
+    fn contrast(a: u32, b: u32) -> f32 {
+        let luminance = |v: u32| {
+            let channel = |shift: u32| {
+                let c = ((v >> shift) & 0xff) as f32 / 255.0;
+                if c <= 0.03928 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn secondary_text_is_readable_on_the_surfaces_it_sits_on() {
+        for (name, surface) in [("bg", BG), ("surface", SURFACE), ("hover", HOVER)] {
+            let ratio = contrast(MUTED, surface);
+            assert!(ratio >= 4.5, "muted on {name}: {ratio:.2}");
+        }
+        // And still plainly secondary next to the primary text.
+        assert!(contrast(TEXT, SURFACE) > contrast(MUTED, SURFACE) * 1.5);
+    }
+
     #[test]
     fn background_bell_cannot_look_like_the_selected_tab() {
         for glass in [false, true] {
@@ -145,6 +175,12 @@ pub fn agent(state: shrew_core::AgentState) -> Hsla {
 }
 
 pub struct Hint(pub &'static str);
+
+/// What a control does, shown when the pointer rests on it: an icon alone
+/// does not say, and the key that does the same is worth learning.
+pub fn hint<E: gpui::StatefulInteractiveElement>(element: E, text: &'static str) -> E {
+    element.tooltip(move |_, cx| cx.new(|_| Hint(text)).into())
+}
 
 impl gpui::Render for Hint {
     fn render(

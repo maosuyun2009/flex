@@ -26,8 +26,9 @@ mod imp {
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, IsZoomed, SendMessageW,
-        ShowWindowAsync, HTCAPTION, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_NCLBUTTONDOWN,
+        EnumWindows, FlashWindowEx, GetForegroundWindow, GetWindowThreadProcessId,
+        IsWindowVisible, IsZoomed, SendMessageW, ShowWindowAsync, FLASHWINFO, FLASHW_TIMERNOFG,
+        FLASHW_TRAY, HTCAPTION, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_NCLBUTTONDOWN,
     };
 
     static FOUND: AtomicIsize = AtomicIsize::new(0);
@@ -83,6 +84,23 @@ mod imp {
         if let Some(hwnd) = hwnd() {
             unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) };
         }
+    }
+
+    /// Flash the taskbar button until the window comes to the front. Does
+    /// nothing while it already is: the notification is on screen there.
+    pub fn flash_if_background() {
+        let Some(hwnd) = hwnd() else { return };
+        if unsafe { GetForegroundWindow() } == hwnd {
+            return;
+        }
+        let info = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        unsafe { FlashWindowEx(&info) };
     }
 
     /// Windows 11 rounds a decorated window's corners; ours has no decorations,
@@ -305,6 +323,7 @@ mod imp {
     }
     pub fn toggle_maximize() {}
     pub fn minimize() {}
+    pub fn flash_if_background() {}
     pub fn round_corners() {}
 }
 
@@ -316,9 +335,8 @@ pub struct Pasted {
 }
 
 pub use imp::{
-    clipboard_paste, clipboard_text, drag, is_maximized, minimize, open_url, round_corners,
-    set_clipboard_text,
-    toggle_maximize,
+    clipboard_paste, clipboard_text, drag, flash_if_background, is_maximized, minimize, open_url,
+    round_corners, set_clipboard_text, toggle_maximize,
 };
 
 #[cfg(all(test, windows))]

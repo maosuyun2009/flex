@@ -21,8 +21,9 @@ use flex_engine::{AppState, BlockState, Connectivity, Engine, SessionState, Wind
 use gpui::prelude::*;
 use gpui::{
     canvas, div, hsla, linear_color_stop, linear_gradient, point, px, relative, size, AnyElement,
-    App, Bounds, Context, Entity, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Size, Task, Window,
+    App, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    SharedString, Size, Task, UTF16Selection, Window,
 };
 use serde_json::json;
 
@@ -30,6 +31,7 @@ use crate::icons::{self, Icon};
 use crate::settings::{Settings, FONT_MAX, FONT_MIN};
 use crate::shortcuts::{self, Action};
 use crate::terminal::{TerminalEvent, TerminalView};
+use crate::text_field::{self, TextField};
 use crate::theme;
 use flex_engine::keybindings::KeyBindings;
 use flex_engine::Notification;
@@ -115,6 +117,40 @@ struct Divider {
     /// The left/top pane and the right/bottom pane, as drawn.
     before_rect: [f64; 4],
     after_rect: [f64; 4],
+    /// Where the pointer has dragged it to, as the share the first pane
+    /// would get. `None` until the pointer moves.
+    ratio: Option<f64>,
+}
+
+impl Divider {
+    /// The share of the two panes the first one gets with the pointer at
+    /// (`fx`, `fy`), fractions of the pane area. Neither pane goes under 8%.
+    fn ratio_at(&self, fx: f64, fy: f64) -> f64 {
+        let [bx, by, bw, bh] = self.before_rect;
+        let [_, _, aw, ah] = self.after_rect;
+        match self.direction {
+            "horizontal" => (fx - bx) / (bw + aw),
+            _ => (fy - by) / (bh + ah),
+        }
+        .clamp(0.08, 0.92)
+    }
+
+    /// The line to draw for a ratio, as `[x, y, w, h]` fractions of the pane
+    /// area with zero thickness: it spans both panes, where the divider would be.
+    fn guide(&self, ratio: f64) -> [f64; 4] {
+        let [bx, by, bw, bh] = self.before_rect;
+        let [ax, ay, aw, ah] = self.after_rect;
+        match self.direction {
+            "horizontal" => {
+                let top = by.min(ay);
+                [bx + (bw + aw) * ratio, top, 0.0, (by + bh).max(ay + ah) - top]
+            }
+            _ => {
+                let left = bx.min(ax);
+                [left, by + (bh + ah) * ratio, (bx + bw).max(ax + aw) - left, 0.0]
+            }
+        }
+    }
 }
 
 /// What a one-line prompt is renaming.
@@ -124,6 +160,8 @@ enum Ask {
     RenamePane,
     RenameSession(String, String, String),
     CloseLayer(String, String, String),
+    /// A tab with several panes: window id.
+    CloseTab(String),
     RenameTailscale,
     EditServer(String, String, String),
     /// The address of the machine the session is created on.
@@ -176,6 +214,7 @@ impl Ask {
     fn hint(&self) -> &'static str {
         match self {
             Ask::DeleteSession(..) | Ask::CloseLayer(..) => "Enter to delete · Esc to cancel",
+            Ask::CloseTab(..) => "Enter to close · Esc to cancel",
             Ask::DeleteHost(..) | Ask::DeleteServer(..) => "Enter to remove · Esc to cancel",
             Ask::NewHost | Ask::AddServer => "Enter to add · Esc to cancel",
             Ask::StartWsl(..) => "Enter to connect · Esc to cancel",
@@ -187,12 +226,11 @@ impl Ask {
     }
 }
 
-/// A one-line text prompt: Rex names windows, blocks, sessions and hosts, and
-/// the shell has no text field, so this is the smallest thing that can type one.
+/// A prompt for one value: Rex names windows, blocks, sessions and hosts.
 struct Prompt {
     what: Ask,
     label: String,
-    value: String,
+    field: TextField,
     scope: Option<menu::Target>,
 }
 
@@ -228,6 +266,8 @@ enum Jump {
         window: String,
     },
     File(String),
+    /// One of the shell's own actions, with the key that runs it.
+    Shell(Action),
     Action {
         server: String,
         session: String,
@@ -239,7 +279,7 @@ enum Jump {
 
 /// The jump list: tabs, panes and the files beside the pane, filtered as you type.
 struct Palette {
-    query: String,
+    query: TextField,
     cursor: usize,
     /// Files from `list_dir`, for the pane the palette was opened on.
     files: Vec<String>,
@@ -269,7 +309,7 @@ enum Page {
 
 pub struct Workspace {
     engine: Arc<Engine>,
-    state: AppState,
+    state: Arc<AppState>,
     settings: Settings,
     /// The terminal font, resolved once at startup from what is installed.
     font: SharedString,
@@ -339,6 +379,9 @@ pub struct Workspace {
     keymap: ServerCache<serde_json::Value>,
     keybindings: ServerCache<Arc<std::sync::Mutex<KeyBindings>>>,
     configured_actions: Vec<(String, serde_json::Value)>,
+    /// A right-click in a pane, waiting for a frame to open its menu: the
+    /// block, where the pointer was, and whether text is selected.
+    context_menu: Option<(String, Point<Pixels>, bool)>,
     keymap_dirty: HashSet<String>,
     keymap_pending: HashSet<String>,
     creators: ServerCache<serde_json::Value>,
@@ -372,19 +415,16 @@ impl Workspace {
     ) -> Self {
         let settings = Settings::load(&engine);
         let font = crate::fonts::resolve(cx);
-        let picture = settings.background.as_deref().and_then(|path| {
-            let image = crate::background::load(path);
-            if image.is_none() {
-                eprintln!("flex: could not load background {path}");
-            }
-            image
-        });
+        let picture = settings
+            .background
+            .as_deref()
+            .and_then(crate::background::load);
         if std::env::var_os("FLEX_DEBUG").is_some() {
             eprintln!("[font] using {font}");
         }
         let mut this = Self {
             engine,
-            state: AppState::default(),
+            state: Arc::default(),
             settings,
             font,
             picture,
@@ -420,6 +460,7 @@ impl Workspace {
             keymap: ServerCache::default(),
             keybindings: ServerCache::default(),
             configured_actions: Vec::new(),
+            context_menu: None,
             keymap_dirty: HashSet::new(),
             keymap_pending: HashSet::new(),
             creators: ServerCache::default(),
@@ -436,6 +477,10 @@ impl Workspace {
             _wake: None,
         };
         this.reload(cx);
+        if let (Some(path), None) = (&this.settings.background, &this.picture) {
+            let problem = format!("Could not load {path}");
+            this.rpc_error("Background picture", problem, cx);
+        }
         this._wake = Some(cx.spawn(async move |this, cx| {
             while wake.recv().await.is_ok() {
                 if this.update(cx, |me, cx| me.reload(cx)).is_err() {
@@ -455,6 +500,11 @@ impl Workspace {
             .unwrap_or_default();
         if queued.is_empty() {
             return;
+        }
+        // In the background nobody sees a card that is gone in seven seconds:
+        // the taskbar button flashes until the window is looked at again.
+        if queued.iter().any(|notice| wants_attention(&notice.kind)) {
+            crate::win32::flash_if_background();
         }
         let until = std::time::Instant::now() + std::time::Duration::from_secs(7);
         for notice in queued {
@@ -587,23 +637,66 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         eprintln!("flex: {operation}: {error}");
+        self.toast(
+            shrew_core::NotificationKind::AgentError,
+            operation,
+            error.to_string(),
+            std::time::Duration::from_secs(10),
+            cx,
+        );
+    }
+
+    /// A program on the server or another client set the clipboard. Never
+    /// silent: the write is announced, or refused when the setting is off.
+    fn remote_clipboard(&mut self, text: &str, cx: &mut Context<Self>) {
+        let chars = text.chars().count();
+        let (title, body) = if self.settings.remote_clipboard {
+            crate::win32::set_clipboard_text(text);
+            (
+                "Clipboard set remotely",
+                format!("{chars} characters copied by the server"),
+            )
+        } else {
+            (
+                "Clipboard write refused",
+                format!("The server tried to copy {chars} characters"),
+            )
+        };
+        self.toast(
+            shrew_core::NotificationKind::Program,
+            title,
+            body,
+            std::time::Duration::from_secs(4),
+            cx,
+        );
+    }
+
+    fn toast(
+        &mut self,
+        kind: shrew_core::NotificationKind,
+        title: &str,
+        body: String,
+        lasts: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        // The same message repeating (every keystroke while offline) is one toast.
+        self.toasts
+            .retain(|toast| toast.title != title || toast.body != body);
         self.toasts.push_back(Toast {
-            kind: shrew_core::NotificationKind::AgentError,
-            title: operation.to_owned(),
-            body: error.to_string(),
+            kind,
+            title: title.to_owned(),
+            body,
             server_id: String::new(),
             session_id: String::new(),
             block_id: String::new(),
-            until: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            until: std::time::Instant::now() + lasts,
         });
         while self.toasts.len() > 3 {
             self.toasts.pop_front();
         }
         cx.notify();
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(10))
-                .await;
+            cx.background_executor().timer(lasts).await;
             this.update(cx, |me, cx| {
                 me.toasts
                     .retain(|toast| toast.until > std::time::Instant::now());
@@ -886,18 +979,31 @@ impl Workspace {
         }
         let source_server = server_id.to_owned();
         let source_session = session_id.to_owned();
+        let source_block = block_id.to_owned();
         cx.subscribe(&view, move |this, _, event: &TerminalEvent, cx| {
-            if this.server_id.as_ref() != Some(&source_server)
-                || this.session_id.as_ref() != Some(&source_session)
-            {
-                return;
-            }
+            // Lost input and clipboard writes matter wherever the terminal is;
+            // actions only for the shown session.
             match event {
+                TerminalEvent::InputFailed(message) => {
+                    this.rpc_error("Input not delivered", message, cx)
+                }
+                TerminalEvent::RemoteClipboard(text) => this.remote_clipboard(text, cx),
+                TerminalEvent::Zoom(steps) => {
+                    this.set_font_size(this.settings.font_size + f32::from(*steps), cx)
+                }
+                TerminalEvent::ContextMenu { at, has_selection } => {
+                    this.context_menu = Some((source_block.clone(), *at, *has_selection));
+                    cx.notify();
+                }
                 TerminalEvent::ConfiguredAction { name, args } => {
-                    this.configured_actions.push((name.clone(), args.clone()))
+                    if this.server_id.as_ref() == Some(&source_server)
+                        && this.session_id.as_ref() == Some(&source_session)
+                    {
+                        this.configured_actions.push((name.clone(), args.clone()));
+                        cx.notify();
+                    }
                 }
             }
-            cx.notify();
         })
         .detach();
         self.terminals.insert(block_id.to_owned(), view.clone());
@@ -1091,7 +1197,9 @@ impl Workspace {
                     .ok();
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("flex: split: {e}"),
+                Err(e) => {
+                    this.update(cx, |me, cx| me.rpc_error("Split", e, cx)).ok();
+                }
             }
         })
         .detach();
@@ -1107,13 +1215,13 @@ impl Workspace {
         };
         let engine = self.engine.clone();
         let block_id = block.id;
-        cx.spawn(async move |_, _| {
+        cx.spawn(async move |this, cx| {
             if let Err(e) = engine
                 .shrew()
                 .close_block(&server_id, &session_id, &block_id)
                 .await
             {
-                eprintln!("flex: close: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Close pane", e, cx)).ok();
             }
         })
         .detach();
@@ -1126,13 +1234,13 @@ impl Workspace {
             return;
         };
         let engine = self.engine.clone();
-        cx.spawn(async move |_, _| {
+        cx.spawn(async move |this, cx| {
             if let Err(e) = engine
                 .shrew()
                 .close_window(&server_id, &session_id, &window)
                 .await
             {
-                eprintln!("flex: close window: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Close tab", e, cx)).ok();
             }
         })
         .detach();
@@ -1149,13 +1257,13 @@ impl Workspace {
             return;
         };
         let engine = self.engine.clone();
-        cx.spawn(async move |_, _| {
+        cx.spawn(async move |this, cx| {
             if let Err(e) = engine
                 .shrew()
                 .zoom_block(&server, &session, &block.id)
                 .await
             {
-                eprintln!("flex: zoom: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Zoom", e, cx)).ok();
             }
         })
         .detach();
@@ -1182,7 +1290,7 @@ impl Workspace {
                 .call(&address, "session.focus_direction", payload)
                 .await
             {
-                eprintln!("flex: focus_direction: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Move focus", e, cx)).ok();
                 return;
             }
             // The method answers with a revision; the new focus is in the view.
@@ -1260,7 +1368,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let payload = json!({"session_id": session, "wrap": true});
             if let Err(e) = engine.call(&address, method, payload).await {
-                eprintln!("flex: {method}: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Move focus", e, cx)).ok();
                 return;
             }
             let Ok(view) = engine
@@ -1309,7 +1417,7 @@ impl Workspace {
                 "other_block_id": other,
             });
             if let Err(e) = engine.call(&address, "session.swap_blocks", payload).await {
-                eprintln!("flex: swap: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Swap panes", e, cx)).ok();
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -1332,7 +1440,7 @@ impl Workspace {
                 .call(&address, "com.superlogical.terminal.clear", payload)
                 .await
             {
-                eprintln!("flex: clear: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Clear pane", e, cx)).ok();
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -1340,10 +1448,23 @@ impl Workspace {
     }
 
     fn open_prompt(&mut self, what: Ask, label: &str, window: &mut Window) {
+        // What is being renamed starts in the field, selected: typing
+        // replaces it, an arrow key keeps it to edit.
+        let current = match &what {
+            Ask::RenameTab => self
+                .windows()
+                .into_iter()
+                .find(|window| Some(&window.id) == self.window_id.as_ref())
+                .map(|window| window.label),
+            Ask::RenamePane => self.active().map(|block| block.label),
+            Ask::RenameSession(_, _, label) => Some(label.clone()),
+            Ask::EditServer(_, name, address) => Some(format!("{name} {address}")),
+            _ => None,
+        };
         self.prompt = Some(Prompt {
             what,
             label: label.to_owned(),
-            value: String::new(),
+            field: TextField::selected(current.unwrap_or_default().trim()),
             scope: None,
         });
         // The pane under the overlay would keep the keyboard otherwise, and
@@ -1352,68 +1473,92 @@ impl Workspace {
         window.refresh();
     }
 
-    /// Type into the prompt. Returns true when the key belonged to it.
-    fn prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    /// A key while the prompt is open. Every key is the prompt's; `Typing`
+    /// ones are left for the platform to turn into text for its field.
+    fn prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> Taken {
         let Some(prompt) = &mut self.prompt else {
-            return false;
+            return Taken::No;
         };
-        let modifiers = &event.keystroke.modifiers;
-        if (modifiers.control || modifiers.platform)
-            && event.keystroke.key.eq_ignore_ascii_case("v")
-        {
-            if let Some(text) = crate::win32::clipboard_text() {
-                prompt.paste(&text);
-            }
-            cx.notify();
-            return true;
-        }
-        if modifiers.control || modifiers.platform || modifiers.alt {
-            return true;
-        }
+        cx.notify();
         match event.keystroke.key.as_str() {
-            // Space is a named key, so it never comes with a key_char.
-            "space" if prompt.what.wants_text() => {
-                prompt.value.push(' ');
-                cx.notify();
-                true
-            }
             "escape" => {
                 self.prompt = None;
-                cx.notify();
-                true
+                return Taken::Yes;
             }
             "enter" => {
                 let prompt = self.prompt.take().unwrap();
                 self.commit_prompt(prompt, cx);
-                true
+                return Taken::Yes;
             }
-            "backspace" => {
-                prompt.value.pop();
-                cx.notify();
-                true
-            }
-            _ => {
-                let typed = event
-                    .keystroke
-                    .key_char
-                    .clone()
-                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
-                match typed {
-                    Some(text) if prompt.what.wants_text() => {
-                        prompt.value.push_str(&text);
-                        cx.notify();
-                        true
-                    }
-                    Some(_) => true,
-                    // Chords with a modifier are the shell's, not the prompt's.
-                    None => {
-                        !event.keystroke.modifiers.control
-                            && !event.keystroke.modifiers.alt
-                            && !event.keystroke.modifiers.platform
-                    }
-                }
-            }
+            _ => {}
         }
+        if !prompt.what.wants_text() {
+            return Taken::Yes;
+        }
+        match field_key(&mut prompt.field, &event.keystroke) {
+            FieldKey::Paste => {
+                if let Some(text) = crate::win32::clipboard_text() {
+                    prompt.paste(&text);
+                }
+                Taken::Yes
+            }
+            FieldKey::Typing => Taken::Typing,
+            // A shortcut of the shell's would act on panes the prompt covers.
+            FieldKey::Edited | FieldKey::Other => Taken::Yes,
+        }
+    }
+
+    /// The text field that has the keyboard, when an overlay with one is open.
+    fn field_mut(&mut self) -> Option<&mut TextField> {
+        if self.menu.is_some() {
+            return None;
+        }
+        if let Some(palette) = &mut self.palette {
+            return Some(&mut palette.query);
+        }
+        self.prompt
+            .as_mut()
+            .filter(|prompt| prompt.what.wants_text())
+            .map(|prompt| &mut prompt.field)
+    }
+
+    /// The open field's text changed: the jump list starts from the top again.
+    fn field_edited(&mut self, cx: &mut Context<Self>) {
+        if let Some(palette) = &mut self.palette {
+            palette.cursor = 0;
+        }
+        cx.notify();
+    }
+
+    /// A text field as drawn: its text and caret, and the registration that
+    /// brings the platform's text input — typing, an input method — to it.
+    fn field_box(&self, field: &TextField, cx: &mut Context<Self>) -> gpui::Div {
+        let focus = self.focus.clone();
+        let view = cx.entity();
+        div()
+            .relative()
+            .px(FIELD_PAD_X)
+            .py(FIELD_PAD_Y)
+            .rounded_md()
+            .bg(self.chrome().active())
+            .text_color(theme::text())
+            .child(field.styled(theme::accent(), theme::bg()))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, view.clone()),
+                            cx,
+                        );
+                    },
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full(),
+            )
     }
 
     fn refresh_creators(&mut self, cx: &mut Context<Self>) {
@@ -1588,7 +1733,7 @@ impl Workspace {
             );
             return;
         }
-        let value = prompt.value.trim().to_owned();
+        let value = prompt.field.text().trim().to_owned();
         if matches!(
             &prompt.what,
             Ask::CreateBlock { .. } | Ask::RunAction { .. }
@@ -1700,6 +1845,10 @@ impl Workspace {
                 Some(args),
                 cx,
             );
+            return;
+        }
+        if let Ask::CloseTab(window) = &prompt.what {
+            self.close_window(window.clone(), cx);
             return;
         }
         if let Ask::CloseLayer(server, session, layer) = &prompt.what {
@@ -1863,6 +2012,7 @@ impl Workspace {
             Ask::DeleteHost(id, _) => (address.clone(), "hosts.remove", json!({"id": id})),
             Ask::AddServer
             | Ask::DeleteServer(..)
+            | Ask::CloseTab(..)
             | Ask::CloseLayer(..)
             | Ask::CreateBlock { .. }
             | Ask::RunAction { .. } => return,
@@ -1973,7 +2123,7 @@ impl Workspace {
                 "before_window_id": before,
             });
             if let Err(e) = engine.call(&address, "session.move_window", payload).await {
-                eprintln!("flex: move_window: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Move tab", e, cx)).ok();
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -2292,7 +2442,7 @@ impl Workspace {
     /// Open the jump list and ask the pane for the files next to it.
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = Some(Palette {
-            query: String::new(),
+            query: TextField::default(),
             cursor: 0,
             files: Vec::new(),
             actions: Vec::new(),
@@ -2382,8 +2532,9 @@ impl Workspace {
         let Some(palette) = &self.palette else {
             return Vec::new();
         };
-        let actions_only = palette.query.starts_with('>');
-        let needle = palette.query.trim_start_matches('>').trim().to_lowercase();
+        let query = palette.query.text();
+        let actions_only = query.starts_with('>');
+        let needle = query.trim_start_matches('>').trim().to_lowercase();
         let keep = |text: &str| needle.is_empty() || text.to_lowercase().contains(&needle);
         let mut items: Vec<(String, Jump)> = Vec::new();
         for server in self.state.servers.iter().filter(|_| !actions_only) {
@@ -2422,6 +2573,16 @@ impl Workspace {
                 items.push((file.clone(), Jump::File(file.clone())));
             }
         }
+        for (keys, action, title) in shortcuts::BINDINGS {
+            // Opening the palette from the palette, or arming a prefix nobody
+            // can see armed, are not things to pick from a list.
+            if matches!(action, Action::Palette | Action::Prefix) {
+                continue;
+            }
+            if keep(title) || keep(keys) {
+                items.push((format!("{title} · {keys}"), Jump::Shell(*action)));
+            }
+        }
         for action in &palette.actions {
             if keep(&action.title) || keep(&action.name) || keep(&action.description) {
                 items.push((
@@ -2439,86 +2600,55 @@ impl Workspace {
         items
     }
 
-    /// Type into the palette. Returns true when the key belonged to it.
+    /// A key while the jump list is open. Chords the list has no use for
+    /// stay the shell's.
     fn palette_key(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
-        if self.palette.is_none() {
-            return false;
-        }
+    ) -> Taken {
+        let count = self.palette_items().len();
+        let Some(palette) = &mut self.palette else {
+            return Taken::No;
+        };
+        cx.notify();
         match event.keystroke.key.as_str() {
-            "space" => {
-                if let Some(palette) = &mut self.palette {
-                    palette.query.push(' ');
-                    palette.cursor = 0;
-                }
-                cx.notify();
-                true
-            }
-            "escape" => {
-                self.palette = None;
-                cx.notify();
-                true
-            }
-            "up" => {
-                if let Some(palette) = &mut self.palette {
-                    palette.cursor = palette.cursor.saturating_sub(1);
-                }
-                cx.notify();
-                true
-            }
-            "down" => {
-                let count = self.palette_items().len();
-                if let Some(palette) = &mut self.palette {
-                    palette.cursor = (palette.cursor + 1).min(count.saturating_sub(1));
-                }
-                cx.notify();
-                true
-            }
-            "backspace" => {
-                if let Some(palette) = &mut self.palette {
-                    palette.query.pop();
-                    palette.cursor = 0;
-                }
-                cx.notify();
-                true
-            }
+            "escape" => self.palette = None,
+            "up" => palette.cursor = palette.cursor.saturating_sub(1),
+            "down" => palette.cursor = (palette.cursor + 1).min(count.saturating_sub(1)),
             "enter" => {
+                let cursor = palette.cursor;
                 let items = self.palette_items();
-                let cursor = self.palette.as_ref().map(|p| p.cursor).unwrap_or(0);
                 self.palette = None;
                 if let Some((_, jump)) = items.into_iter().nth(cursor) {
                     self.take_jump(jump, window, cx);
                 }
-                cx.notify();
-                true
             }
             _ => {
-                let typed = event
-                    .keystroke
-                    .key_char
-                    .clone()
-                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control));
-                match typed {
-                    Some(text) => {
-                        if let Some(palette) = &mut self.palette {
-                            palette.query.push_str(&text);
-                            palette.cursor = 0;
+                return match field_key(&mut palette.query, &event.keystroke) {
+                    FieldKey::Paste => {
+                        if let Some(text) = crate::win32::clipboard_text() {
+                            // One line: a query has no use for a line break.
+                            let line: String = text
+                                .chars()
+                                .map(|c| if c.is_control() { ' ' } else { c })
+                                .collect();
+                            palette.query.insert(line.trim());
                         }
-                        cx.notify();
-                        true
+                        self.field_edited(cx);
+                        Taken::Yes
                     }
-                    None => {
-                        !event.keystroke.modifiers.control
-                            && !event.keystroke.modifiers.alt
-                            && !event.keystroke.modifiers.platform
+                    FieldKey::Edited => {
+                        self.field_edited(cx);
+                        Taken::Yes
                     }
-                }
+                    FieldKey::Typing => Taken::Typing,
+                    FieldKey::Other => Taken::No,
+                };
             }
         }
+        Taken::Yes
     }
 
     fn take_jump(&mut self, jump: Jump, window: &mut Window, cx: &mut Context<Self>) {
@@ -2565,6 +2695,7 @@ impl Workspace {
                     self.run_client_action(server, session, block, name, None, cx);
                 }
             }
+            Jump::Shell(action) => self.run(action, window, cx),
             Jump::File(path) => {
                 // Type it into the pane, the way the fzf picker does.
                 let (Some(address), Some(session), Some(block)) = (
@@ -2608,7 +2739,7 @@ impl Workspace {
             return;
         }
         let engine = self.engine.clone();
-        cx.spawn(async move |_, _| {
+        cx.spawn(async move |this, cx| {
             let Ok(view) = engine
                 .call(&address, "session.view", json!({"session_id": session}))
                 .await
@@ -2625,7 +2756,7 @@ impl Workspace {
             };
             let payload = json!({"session_id": session, "layer_id": layer});
             if let Err(e) = engine.call(&address, method, payload).await {
-                eprintln!("flex: {method}: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Reorder floating pane", e, cx)).ok();
             }
         })
         .detach();
@@ -2814,7 +2945,9 @@ impl Workspace {
                         crate::win32::set_clipboard_text(text);
                     }
                 }
-                Err(e) => eprintln!("flex: format: {e}"),
+                Err(e) => {
+                    this.update(cx, |me, cx| me.rpc_error("Copy transcript", e, cx)).ok();
+                }
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -2898,6 +3031,7 @@ impl Workspace {
                             after: after_id.clone(),
                             before_rect,
                             after_rect,
+                            ratio: None,
                         });
                         // The pane underneath must not take the press as a click.
                         cx.stop_propagation();
@@ -2908,6 +3042,20 @@ impl Workspace {
             );
         }
         zones
+    }
+
+    /// The pointer moved with a divider held: show where it would land.
+    fn drag_divider(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let geometry = *self.area_geometry.lock().unwrap();
+        let (Some(divider), Some((origin, size))) = (&mut self.divider, geometry) else {
+            return;
+        };
+        let (fx, fy) = area_fraction(at, origin, size);
+        let ratio = divider.ratio_at(fx, fy);
+        if divider.ratio != Some(ratio) {
+            divider.ratio = Some(ratio);
+            cx.notify();
+        }
     }
 
     /// The pointer let go: turn where it is into the ratio Rex wants.
@@ -2925,17 +3073,8 @@ impl Workspace {
         let Some((origin, size)) = geometry else {
             return;
         };
-        let width = f32::from(size.width).max(1.0);
-        let height = f32::from(size.height).max(1.0);
-        let fx = (f32::from(at.x) - f32::from(origin.x)) / width;
-        let fy = (f32::from(at.y) - f32::from(origin.y)) / height;
-        let [bx, by, bw, bh] = divider.before_rect;
-        let [ax, ay, aw, ah] = divider.after_rect;
-        let _ = (ax, ay);
-        let ratio = match divider.direction {
-            "horizontal" => ((fx as f64 - bx) / (bw + aw)).clamp(0.08, 0.92),
-            _ => ((fy as f64 - by) / (bh + ah)).clamp(0.08, 0.92),
-        };
+        let (fx, fy) = area_fraction(at, origin, size);
+        let ratio = divider.ratio_at(fx, fy);
         let (before, after) = (divider.before, divider.after);
         let direction = divider.direction;
         let engine = self.engine.clone();
@@ -2948,7 +3087,7 @@ impl Workspace {
                 "ratio": ratio,
             });
             if let Err(e) = engine.call(&address, "session.resize_pane", payload).await {
-                eprintln!("flex: resize_pane: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Resize pane", e, cx)).ok();
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -2994,7 +3133,7 @@ impl Workspace {
                 "ratio": ratio,
             });
             if let Err(e) = engine.call(&address, "session.resize_pane", payload).await {
-                eprintln!("flex: resize_pane: {e}");
+                this.update(cx, |me, cx| me.rpc_error("Resize pane", e, cx)).ok();
             }
             this.update(cx, |_, cx| cx.notify()).ok();
         })
@@ -3094,13 +3233,13 @@ impl Workspace {
             return;
         };
         let engine = self.engine.clone();
-        cx.spawn(async move |_, _| {
+        cx.spawn(async move |this, cx| {
             if let Err(e) = engine
                 .shrew()
                 .new_window(&server_id, &session_id, None)
                 .await
             {
-                eprintln!("flex: new tab: {e}");
+                this.update(cx, |me, cx| me.rpc_error("New tab", e, cx)).ok();
             }
         })
         .detach();
@@ -3662,7 +3801,9 @@ impl Workspace {
             let text = path.display().to_string();
             let picture = crate::background::load(&text);
             if picture.is_none() {
-                eprintln!("flex: could not read {text} as an image");
+                let problem = format!("Could not read {text} as an image");
+                this.update(cx, |me, cx| me.rpc_error("Background picture", problem, cx))
+                    .ok();
                 return;
             }
             this.update(cx, |me, cx| {
@@ -3828,10 +3969,9 @@ impl Workspace {
             {
                 Ok(view) => view,
                 Err(e) => {
-                    eprintln!("flex: session.view: {e}");
                     this.update(cx, |me, cx| {
                         me.settled = None;
-                        cx.notify();
+                        me.rpc_error("Move floating pane", e, cx);
                     })
                     .ok();
                     return;
@@ -3851,10 +3991,9 @@ impl Workspace {
                 "bounds": bounds,
             });
             if let Err(e) = engine.call(&address, "session.resize_layer", payload).await {
-                eprintln!("flex: session.resize_layer: {e}");
                 this.update(cx, |me, cx| {
                     me.settled = None;
-                    cx.notify();
+                    me.rpc_error("Move floating pane", e, cx);
                 })
                 .ok();
             }
@@ -3898,11 +4037,12 @@ impl Workspace {
             .bg(chrome.surface())
             .border_b_1()
             .border_color(theme::border())
-            .child(
+            .child(theme::hint(
                 icons::button("toggle-sidebar", Icon::Sidebar, self.settings.sidebar).on_click(
                     cx.listener(|this, _, window, cx| this.run(Action::ToggleSidebar, window, cx)),
                 ),
-            )
+                "Sidebar · Ctrl-Shift-B",
+            ))
             .child(
                 div()
                     .flex()
@@ -3917,11 +4057,12 @@ impl Workspace {
             )
             .child(div().w(px(1.0)).h(px(16.0)).mx_2().bg(theme::border()))
             .children(chips)
-            .child(
+            .child(theme::hint(
                 icons::button("new-tab", Icon::Plus, false).on_click(
                     cx.listener(|this, _, window, cx| this.run(Action::NewTab, window, cx)),
                 ),
-            )
+                "New tab · Ctrl-Shift-T",
+            ))
             .child(div().w(px(6.0)))
             .child(
                 div()
@@ -3929,11 +4070,12 @@ impl Workspace {
                     .h_full()
                     .on_mouse_down(MouseButton::Left, cx.listener(title_press)),
             )
-            .child(
+            .child(theme::hint(
                 icons::button("settings", Icon::Sliders, self.show_settings).on_click(
                     cx.listener(|this, _, window, cx| this.run(Action::Settings, window, cx)),
                 ),
-            )
+                "Settings · Ctrl-,",
+            ))
             .child(control("min", Shape::Minimize, false, |_, _| {
                 crate::win32::minimize()
             }))
@@ -3955,11 +4097,10 @@ impl Workspace {
     }
 
     /// A one-line prompt for a name, over everything else.
-    fn prompt_overlay(&self) -> AnyElement {
+    fn prompt_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(prompt) = &self.prompt else {
             return div().into_any_element();
         };
-        let chrome = self.chrome();
         div()
             .absolute()
             .top(px(0.0))
@@ -4012,15 +4153,9 @@ impl Workspace {
                     )
                     .when(prompt.what.wants_text(), |el| {
                         el.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
+                            self.field_box(&prompt.field, cx)
                                 .max_h(px(240.0))
-                                .overflow_hidden()
-                                .bg(chrome.active())
-                                .text_color(theme::text())
-                                .child(format!("{}▌", prompt.value)),
+                                .overflow_hidden(),
                         )
                     })
                     .child(
@@ -4033,6 +4168,53 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The armed prefix, spelled out: what the next key picks. Without it the
+    /// prefix is invisible, and a wrong key cancels it with no sign of either.
+    fn prefix_hint(&self) -> AnyElement {
+        if !self.prefix.load(std::sync::atomic::Ordering::Relaxed) {
+            return div().into_any_element();
+        }
+        let key = |key: &'static str, what: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme::color(theme::ACTIVE))
+                        .text_color(theme::accent())
+                        .child(key),
+                )
+                .child(div().text_color(theme::text()).child(what))
+        };
+        div()
+            .absolute()
+            .bottom(px(14.0))
+            .left(px(0.0))
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme::color(theme::SURFACE))
+                    .border_1()
+                    .border_color(theme::accent())
+                    .shadow_lg()
+                    .text_xs()
+                    .children(PREFIX_KEYS.iter().map(|(k, _, what)| key(k, what)))
+                    .child(div().text_color(theme::muted()).child("Esc cancels")),
+            )
+            .into_any_element()
+    }
+
     /// The jump list, over everything else.
     fn palette_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(palette) = &self.palette else {
@@ -4040,10 +4222,13 @@ impl Workspace {
         };
         let chrome = self.chrome();
         let items = self.palette_items();
+        let shown = palette_window(palette.cursor, items.len(), PALETTE_ROWS);
+        let (above, below) = (shown.start, items.len() - shown.end);
         let rows: Vec<AnyElement> = items
             .iter()
-            .take(12)
             .enumerate()
+            .skip(shown.start)
+            .take(shown.len())
             .map(|(index, (label, jump))| {
                 let selected = index == palette.cursor;
                 let jump = jump.clone();
@@ -4071,7 +4256,6 @@ impl Workspace {
                     .into_any_element()
             })
             .collect();
-        let more = items.len().saturating_sub(12);
         div()
             .absolute()
             .top(px(0.0))
@@ -4102,24 +4286,33 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(chrome.active())
-                            .text_color(theme::text())
-                            .child(format!("{}▌", palette.query)),
-                    )
-                    .children(rows)
-                    .when(more > 0, |el| {
+                    .child(self.field_box(&palette.query, cx))
+                    .when(above > 0, |el| {
                         el.child(
                             div()
                                 .px_3()
-                                .pt_1()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(format!("{more} more — keep typing")),
+                                .child(format!("↑ {above} more")),
+                        )
+                    })
+                    .children(rows)
+                    .when(items.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_color(theme::muted())
+                                .child("Nothing matches"),
+                        )
+                    })
+                    .when(below > 0, |el| {
+                        el.child(
+                            div()
+                                .px_3()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(format!("↓ {below} more")),
                         )
                     })
                     .child(
@@ -4269,6 +4462,7 @@ impl Workspace {
                         .rounded_sm()
                         .hover(|el| el.bg(chrome.hover()))
                         .child("+")
+                        .tooltip(|_, cx| cx.new(|_| theme::Hint("Add a server")).into())
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                             this.open_add_menu(window, cx);
@@ -4294,6 +4488,13 @@ impl Workspace {
                 Connectivity::Offline { .. } => theme::danger(),
                 Connectivity::Idle => theme::border(),
             };
+            // Why a server is not there, under its name: a red dot alone does
+            // not say whether to wait, fix the address or start the server.
+            let trouble = match &server.connectivity {
+                Connectivity::Connecting => Some("Connecting…".to_owned()),
+                Connectivity::Offline { error, .. } => Some(error.clone()),
+                Connectivity::Online | Connectivity::Idle => None,
+            };
             let id = server.id.clone();
             rows.push(
                 div()
@@ -4313,8 +4514,16 @@ impl Workspace {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .truncate()
-                            .child(server.name.clone()),
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().child(server.name.clone()))
+                            .children(trouble.map(|trouble| {
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(trouble)
+                            })),
                     )
                     .child(self.menu_button(format!("server-menu:{id}"), target, cx))
                     .on_mouse_down(
@@ -4679,6 +4888,9 @@ impl Workspace {
                                 .child(format!("· {process}")),
                         )
                     })
+                    .when(window.zoomed_block_id.is_some(), |el| {
+                        el.child(div().text_color(theme::accent()).child("· zoomed"))
+                    })
                     .when(appearance.bell, |el| {
                         el.child(
                             div()
@@ -4726,14 +4938,25 @@ impl Workspace {
                             .text_color(theme::muted())
                             .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
                             .child("×")
+                            .tooltip(|_, cx| cx.new(|_| theme::Hint("Close tab")).into())
                             // On press, not on click: choosing a tab rebuilds the
                             // strip, and a click that spans the rebuild is lost.
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener({
                                     let id = id.clone();
-                                    move |this, _, _, cx| {
-                                        this.close_window(id.clone(), cx);
+                                    let panes = window.blocks.len();
+                                    move |this, _, window, cx| {
+                                        // One pane is what the × says it closes.
+                                        // More than that is asked about first.
+                                        match close_tab_question(panes) {
+                                            Some(question) => this.open_prompt(
+                                                Ask::CloseTab(id.clone()),
+                                                &question,
+                                                window,
+                                            ),
+                                            None => this.close_window(id.clone(), cx),
+                                        }
                                         cx.notify();
                                         cx.stop_propagation();
                                     }
@@ -4790,14 +5013,7 @@ impl Workspace {
 
     fn panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(session_id) = self.session_id.clone() else {
-            return div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme::muted())
-                .child("Waiting for a session")
-                .into_any_element();
+            return self.empty_area(cx);
         };
         let Some(server_id) = self.server_id.clone() else {
             return div().flex_1().into_any_element();
@@ -4823,6 +5039,11 @@ impl Workspace {
             .filter(|b| pane_visible(b, zoomed.as_deref()))
             .cloned()
             .collect();
+        let hidden_by_zoom = all_blocks
+            .iter()
+            .filter(|b| b.layer_state != "minimized")
+            .count()
+            .saturating_sub(blocks.len());
         let visible = visible_focus(&blocks, self.active_block.as_deref(), None);
         if !tool_waiting && !self.arriving(&blocks) && self.active_block != visible {
             self.active_block = visible.clone();
@@ -4969,6 +5190,21 @@ impl Workspace {
                         .child(div().text_xs().text_color(theme::muted()).child(details))
                 };
 
+                // A zoomed pane hides the others; say so, and how to get them back.
+                let mut zoom_badge = (zoomed.as_deref() == Some(block.id.as_str())).then(|| {
+                    div()
+                        .id(SharedString::from(format!("unzoom:{}", block.id)))
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(theme::accent())
+                        .hover(|el| el.bg(chrome.hover()))
+                        .child(zoom_label(hidden_by_zoom))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_pane(cx)))
+                        .into_any_element()
+                });
                 let body = if floating {
                     // A floating pane carries its own little title bar: that is
                     // where it is grabbed, and the corner is where it resizes.
@@ -5002,6 +5238,7 @@ impl Workspace {
                                             block.display_name()
                                         }),
                                 )
+                                .children(zoom_badge.take())
                                 .when(is_active, |el| {
                                     el.child(self.menu_button(
                                         format!("pane-menu:{}", block.id),
@@ -5051,7 +5288,10 @@ impl Workspace {
                                     }),
                                 ),
                         )
-                } else if is_active {
+                } else {
+                    // Every tiled pane carries the strip, focused or not. Were it
+                    // only on the focused one, moving focus would change two
+                    // panes' heights and resize both remote terminals.
                     div()
                         .size_full()
                         .flex()
@@ -5063,32 +5303,38 @@ impl Workspace {
                                 .px_2()
                                 .flex()
                                 .items_center()
-                                .justify_between()
+                                .gap_2()
                                 .bg(chrome.surface())
                                 .border_b_1()
                                 .border_color(theme::border())
                                 .child(
                                     div()
                                         .flex_1()
+                                        .min_w(px(0.0))
                                         .truncate()
                                         .text_xs()
-                                        .text_color(theme::muted())
+                                        .text_color(if is_active {
+                                            theme::text()
+                                        } else {
+                                            theme::muted()
+                                        })
                                         .child(block.display_name()),
                                 )
-                                .child(self.menu_button(
-                                    format!("pane-menu:{}", block.id),
-                                    menu::Target {
-                                        server: server_id.clone(),
-                                        address: self.address().unwrap_or_default(),
-                                        session: Some(session_id.clone()),
-                                        block: Some(block.id.clone()),
-                                    },
-                                    cx,
-                                )),
+                                .children(zoom_badge)
+                                .when(is_active, |el| {
+                                    el.child(self.menu_button(
+                                        format!("pane-menu:{}", block.id),
+                                        menu::Target {
+                                            server: server_id.clone(),
+                                            address: self.address().unwrap_or_default(),
+                                            session: Some(session_id.clone()),
+                                            block: Some(block.id.clone()),
+                                        },
+                                        cx,
+                                    ))
+                                }),
                         )
                         .child(div().flex_1().min_h(px(0.0)).child(content))
-                } else {
-                    content
                 };
 
                 let pane = div()
@@ -5217,6 +5463,15 @@ impl Workspace {
                                 .update(cx, |me, cx| me.commit_divider(at, cx))
                                 .ok();
                         });
+                        let workspace = this.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseMoveEvent, _phase, _window, cx| {
+                                let at = event.position;
+                                workspace
+                                    .update(cx, |me, cx| me.drag_divider(at, cx))
+                                    .ok();
+                            },
+                        );
                     },
                 )
                 .absolute()
@@ -5271,6 +5526,22 @@ impl Workspace {
         for zone in self.divider_zones(cx) {
             area = area.child(zone);
         }
+        // The divider being dragged, drawn where releasing would put it: the
+        // panes themselves only move once the server has resized them.
+        if let Some(divider) = &self.divider {
+            if let Some([x, y, w, h]) = divider.ratio.map(|ratio| divider.guide(ratio)) {
+                let line = div()
+                    .absolute()
+                    .left(relative(x as f32))
+                    .top(relative(y as f32))
+                    .bg(theme::accent());
+                area = area.child(if divider.direction == "horizontal" {
+                    line.w(px(2.0)).ml(px(-1.0)).h(relative(h as f32))
+                } else {
+                    line.h(px(2.0)).mt(px(-1.0)).w(relative(w as f32))
+                });
+            }
+        }
 
         // While a pane is being pulled, the window reports pointer movement: a
         // drag that leaves the pane still has to track, and the listeners only
@@ -5304,6 +5575,70 @@ impl Workspace {
         }
 
         area.into_any_element()
+    }
+
+    /// What the pane area says when there is no session to show: which of
+    /// "no server", "connecting", "offline" and "no sessions" it is, and the
+    /// one thing to do about it.
+    fn empty_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let server = self
+            .server_id
+            .as_ref()
+            .and_then(|id| self.state.server(id));
+        let empty = empty_state(server.map(|s| (&s.connectivity, s.name.as_str())));
+        let chrome = self.chrome();
+        let target = server.map(|s| (s.id.clone(), s.address.clone()));
+        let button = empty.action.map(|action| {
+            div()
+                .id("empty-action")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(theme::border())
+                .bg(chrome.surface())
+                .text_color(theme::text())
+                .hover(|el| el.bg(chrome.hover()))
+                .child(action.label())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    match (action, &target) {
+                        (EmptyAction::AddServer, _) => {
+                            this.open_prompt(Ask::AddServer, "Add server — name and address", window)
+                        }
+                        (EmptyAction::Retry, Some((id, _))) => {
+                            this.engine.reconnect(id);
+                            // A WSL entry may need its server started first.
+                            this.revive_wsl(id, window);
+                        }
+                        (EmptyAction::NewSession, Some((_, address))) => this.open_prompt(
+                            Ask::NewSession(address.clone()),
+                            "New session — name it",
+                            window,
+                        ),
+                        _ => {}
+                    }
+                    cx.notify();
+                }))
+        });
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(div().text_color(theme::text()).child(empty.title))
+            .when(!empty.detail.is_empty(), |el| {
+                el.child(
+                    div()
+                        .max_w(px(460.0))
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(empty.detail),
+                )
+            })
+            .children(button)
+            .into_any_element()
     }
 
     /// The Settings tab: a page of the workspace rather than a dialog, so the
@@ -5870,6 +6205,17 @@ impl Workspace {
                         |s| &mut s.allow_remote_actions,
                     ),
                 ));
+                rows.push(row(
+                    "Let the server set the clipboard",
+                    "Programs using OSC 52 and other clients may copy here. Each write is announced."
+                        .into(),
+                    toggle(
+                        "remote-clipboard",
+                        self.settings.remote_clipboard,
+                        cx,
+                        |s| &mut s.remote_clipboard,
+                    ),
+                ));
                 rows.push(theme::section("SERVER DIRECTORY").into_any_element());
                 if let Some(server) = self.server_id.as_ref().and_then(|id| self.state.server(id)) {
                     let target = menu::Target {
@@ -6320,6 +6666,9 @@ impl Render for Workspace {
         for (name, args) in std::mem::take(&mut self.configured_actions) {
             self.run_configured_action(&name, args, window, cx);
         }
+        if let Some((block, at, has_selection)) = self.context_menu.take() {
+            self.open_pane_menu(&block, at, has_selection, window, cx);
+        }
         if !self.styled {
             self.styled = true;
             crate::win32::round_corners();
@@ -6349,8 +6698,9 @@ impl Render for Workspace {
         }
         let title_bar = self.title_bar(cx);
         let toasts = self.toast_strip(cx);
-        let prompt = self.prompt_overlay();
+        let prompt = self.prompt_overlay(cx);
         let palette = self.palette_overlay(cx);
+        let prefix_hint = self.prefix_hint();
         let menu = self.menu_overlay(window, cx);
         let body = if self.show_settings {
             self.settings_page(cx)
@@ -6398,12 +6748,22 @@ impl Render for Workspace {
                     cx.stop_propagation();
                     return;
                 }
-                if this.palette.is_some() && this.palette_key(event, window, cx) {
-                    cx.stop_propagation();
-                    return;
+                if this.palette.is_some() {
+                    match this.palette_key(event, window, cx) {
+                        Taken::Yes => {
+                            cx.stop_propagation();
+                            return;
+                        }
+                        // Not stopped: an unhandled key is what Windows turns
+                        // into text, and that text comes to the open field.
+                        Taken::Typing => return,
+                        Taken::No => {}
+                    }
                 }
-                if this.prompt.is_some() && this.prompt_key(event, cx) {
-                    cx.stop_propagation();
+                if this.prompt.is_some() {
+                    if this.prompt_key(event, cx) != Taken::Typing {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
                 if this.show_settings && event.keystroke.key == "escape" {
@@ -6432,12 +6792,11 @@ impl Render for Workspace {
                     let modifiers = &event.keystroke.modifiers;
                     let bare = !modifiers.control && !modifiers.alt && !modifiers.platform;
                     if bare {
-                        match event.keystroke.key.to_ascii_lowercase().as_str() {
-                            "g" => this.run_tool(Tool::Lazygit, cx),
-                            "f" => this.run_tool(Tool::Files, cx),
-                            "d" => this.run_tool(Tool::Dirs, cx),
-                            "z" => this.run_tool(Tool::Anything, cx),
-                            _ => {}
+                        let pressed = event.keystroke.key.to_ascii_lowercase();
+                        if let Some((_, tool, _)) =
+                            PREFIX_KEYS.iter().find(|(key, _, _)| *key == pressed)
+                        {
+                            this.run_tool(*tool, cx);
                         }
                     }
                     if this
@@ -6453,6 +6812,7 @@ impl Render for Workspace {
             }))
             .child(title_bar)
             .child(body)
+            .child(prefix_hint)
             .child(prompt)
             .child(palette)
             .child(toasts)
@@ -6690,6 +7050,95 @@ mod float_tests {
     use super::{float_bounds, FLOAT_BOUNDS};
 
     #[test]
+    fn only_things_that_wait_for_a_person_flash_the_taskbar() {
+        use super::wants_attention;
+        use shrew_core::NotificationKind as Kind;
+        for kind in [Kind::AgentBlocked, Kind::AgentDone, Kind::AgentError, Kind::Program] {
+            assert!(wants_attention(&kind), "{kind:?}");
+        }
+        for kind in [Kind::Bell, Kind::ProcessExited] {
+            assert!(!wants_attention(&kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_dragged_divider_is_drawn_where_releasing_would_put_it() {
+        use super::Divider;
+        let divider = |direction, before_rect, after_rect| Divider {
+            direction,
+            before: "a".into(),
+            after: "b".into(),
+            before_rect,
+            after_rect,
+            ratio: None,
+        };
+        // Side by side in the right half of the window: 0.5–0.75 and 0.75–1.0.
+        let side = divider("horizontal", [0.5, 0.0, 0.25, 1.0], [0.75, 0.0, 0.25, 1.0]);
+        assert_eq!(side.ratio_at(0.75, 0.3), 0.5);
+        assert_eq!(side.guide(0.5), [0.75, 0.0, 0.0, 1.0]);
+        // Dragged off the left edge: the first pane keeps 8%.
+        assert_eq!(side.ratio_at(0.0, 0.3), 0.08);
+        assert_eq!(side.guide(0.08), [0.54, 0.0, 0.0, 1.0]);
+        // Stacked, with a shorter pane below: the line spans the wider one.
+        let stacked = divider("vertical", [0.0, 0.0, 1.0, 0.5], [0.0, 0.5, 0.5, 0.5]);
+        assert_eq!(stacked.ratio_at(0.9, 0.25), 0.25);
+        assert_eq!(stacked.guide(0.25), [0.0, 0.25, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn closing_a_tab_asks_only_when_it_ends_more_than_one_pane() {
+        use super::close_tab_question;
+        assert_eq!(close_tab_question(0), None);
+        assert_eq!(close_tab_question(1), None);
+        assert_eq!(
+            close_tab_question(3).as_deref(),
+            Some("Close this tab and the 3 panes in it?")
+        );
+    }
+
+    #[test]
+    fn an_empty_pane_area_says_why_and_offers_the_fix() {
+        use super::{empty_state, EmptyAction};
+        use flex_engine::Connectivity;
+        let none = empty_state(None);
+        assert_eq!(none.title, "No servers yet");
+        assert_eq!(none.action, Some(EmptyAction::AddServer));
+
+        let connecting = empty_state(Some((&Connectivity::Connecting, "box")));
+        assert_eq!(connecting.title, "Connecting to box…");
+        assert_eq!(connecting.action, None);
+
+        let offline = Connectivity::Offline {
+            error: "Server isn't running there".into(),
+            retry_in_ms: 3500,
+        };
+        let offline = empty_state(Some((&offline, "box")));
+        assert_eq!(offline.title, "Can't reach box");
+        assert_eq!(offline.detail, "Server isn't running there · retrying within 4s");
+        assert_eq!(offline.action, Some(EmptyAction::Retry));
+        let lost = Connectivity::Offline { error: "connection lost".into(), retry_in_ms: 0 };
+        assert_eq!(empty_state(Some((&lost, "box"))).detail, "connection lost");
+
+        let online = empty_state(Some((&Connectivity::Online, "box")));
+        assert_eq!(online.title, "box has no sessions");
+        assert_eq!(online.action, Some(EmptyAction::NewSession));
+    }
+
+    #[test]
+    fn the_jump_list_scrolls_to_keep_its_cursor_in_view() {
+        use super::palette_window;
+        assert_eq!(palette_window(0, 40, 12), 0..12);
+        assert_eq!(palette_window(11, 40, 12), 0..12);
+        // One past the last drawn row scrolls by one, not by a page.
+        assert_eq!(palette_window(12, 40, 12), 1..13);
+        assert_eq!(palette_window(39, 40, 12), 28..40);
+        // A short list, an empty one, and a cursor left beyond a filtered list.
+        assert_eq!(palette_window(2, 5, 12), 0..5);
+        assert_eq!(palette_window(0, 0, 12), 0..0);
+        assert_eq!(palette_window(99, 5, 12), 0..5);
+    }
+
+    #[test]
     fn a_second_float_lands_a_step_away_from_the_first() {
         assert_eq!(float_bounds(0), FLOAT_BOUNDS);
         let [x, y, w, h] = float_bounds(1);
@@ -6862,18 +7311,48 @@ mod management_tests {
                 schema: json!({}),
             },
             label: "Options".into(),
-            value: String::new(),
+            field: TextField::default(),
             scope: None,
         };
         prompt.paste("{\n\"path\":\"C:/a folder\"\n}");
         assert_eq!(
-            json_object(&prompt.value).unwrap(),
+            json_object(prompt.field.text()).unwrap(),
             json!({"path":"C:/a folder"})
         );
         prompt.what = Ask::CloseLayer("server".into(), "session".into(), "layer".into());
-        let value = prompt.value.clone();
+        let value = prompt.field.clone();
         prompt.paste("do not append");
-        assert_eq!(prompt.value, value);
+        assert_eq!(prompt.field, value);
+    }
+
+    #[test]
+    fn keys_edit_a_field_but_never_type_into_it() {
+        use super::{field_key, FieldKey};
+        use gpui::{Keystroke, Modifiers};
+        let key = |key: &str, modifiers: Modifiers| Keystroke {
+            key: key.into(),
+            key_char: Some(key.into()),
+            modifiers,
+        };
+        let plain = Modifiers::default();
+        let ctrl = Modifiers { control: true, ..plain };
+        let mut field = TextField::default();
+        field.insert("ab");
+        // A letter is left for the platform, even though the key carries it:
+        // with an input method on, the same letter comes back composed.
+        assert_eq!(field_key(&mut field, &key("n", plain)), FieldKey::Typing);
+        assert_eq!(field_key(&mut field, &key("space", plain)), FieldKey::Typing);
+        assert_eq!(field.text(), "ab");
+        assert_eq!(field_key(&mut field, &key("backspace", plain)), FieldKey::Edited);
+        assert_eq!(field.text(), "a");
+        assert_eq!(field_key(&mut field, &key("v", ctrl)), FieldKey::Paste);
+        assert_eq!(field_key(&mut field, &key("a", ctrl)), FieldKey::Edited);
+        assert_eq!(field_key(&mut field, &key("d", ctrl)), FieldKey::Other);
+        let alt = Modifiers { alt: true, ..plain };
+        assert_eq!(field_key(&mut field, &key("1", alt)), FieldKey::Other);
+        let alt_gr = Modifiers { control: true, alt: true, ..plain };
+        assert_eq!(field_key(&mut field, &key("q", alt_gr)), FieldKey::Typing);
+        assert_eq!(field.text(), "a");
     }
 
     #[test]
@@ -7015,8 +7494,176 @@ fn script_request(script: Option<&ScriptDraft>) -> serde_json::Value {
 impl Prompt {
     fn paste(&mut self, text: &str) {
         if self.what.wants_text() {
-            self.value.push_str(text);
+            self.field.insert(text);
         }
+    }
+}
+
+/// Text input for the open prompt or jump list. Typed characters, pasted
+/// ones and an input method's composition all arrive here from the platform;
+/// keys only edit (see [`field_key`]).
+impl EntityInputHandler for Workspace {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _adjusted: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let caret = self.field_mut()?.caret_utf16();
+        Some(UTF16Selection {
+            range: caret..caret,
+            reversed: false,
+        })
+    }
+
+    /// While this is `Some`, GPUI hands keys to the input method instead of
+    /// the shell: Backspace and Enter then edit the composition, not the field.
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        if self.menu.is_some() {
+            return None;
+        }
+        match (&self.palette, &self.prompt) {
+            (Some(palette), _) => palette.query.marked_utf16(),
+            (None, Some(prompt)) if prompt.what.wants_text() => prompt.field.marked_utf16(),
+            _ => None,
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = self.field_mut() {
+            field.unmark();
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(field) = self.field_mut() {
+            field.insert(text);
+            self.field_edited(cx);
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _selected: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(field) = self.field_mut() {
+            field.mark(text);
+            self.field_edited(cx);
+        }
+    }
+
+    /// Where the caret is, so the candidate window opens beside it.
+    fn bounds_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        element: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (line, before) = self.field_mut()?.caret_line();
+        let before = before.to_owned();
+        // The chrome's text: the window's font at `text_sm`.
+        let style = window.text_style();
+        let font_size = gpui::rems(0.875).to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let run = style.to_run(before.len());
+        let width = window
+            .text_system()
+            .shape_line(before.into(), font_size, &[run], None)
+            .width;
+        Some(Bounds::new(
+            point(
+                element.origin.x + FIELD_PAD_X + width,
+                element.origin.y + FIELD_PAD_Y + line_height * line as f32,
+            ),
+            size(px(1.0), line_height),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+/// The padding inside a text field's box, which the caret's position adds back.
+const FIELD_PAD_X: Pixels = px(8.0);
+const FIELD_PAD_Y: Pixels = px(4.0);
+
+/// Whose a key is while an overlay is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+    /// The overlay's; nothing else sees it.
+    Yes,
+    /// Left unhandled so the platform turns it into text for the open field.
+    Typing,
+    /// Not the overlay's.
+    No,
+}
+
+/// What a key means to a text field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldKey {
+    /// It moved the caret or removed text.
+    Edited,
+    /// Ctrl-V: the caller has the clipboard.
+    Paste,
+    /// It may type something. The text is not taken from the key: it arrives
+    /// through the input handler, which is also where an input method's does,
+    /// so a letter the method is about to compose is never typed twice.
+    Typing,
+    /// A chord the field has no use for.
+    Other,
+}
+
+fn field_key(field: &mut TextField, keystroke: &gpui::Keystroke) -> FieldKey {
+    let modifiers = &keystroke.modifiers;
+    let command = modifiers.control || modifiers.platform;
+    match (command, modifiers.alt) {
+        (true, false) => match keystroke.key.to_ascii_lowercase().as_str() {
+            "v" => FieldKey::Paste,
+            "a" => {
+                field.select_all();
+                FieldKey::Edited
+            }
+            _ => FieldKey::Other,
+        },
+        (false, true) => FieldKey::Other,
+        // Ctrl with Alt is AltGr, which types on many layouts.
+        (true, true) => FieldKey::Typing,
+        (false, false) => match text_field::edit(field, &keystroke.key, modifiers.shift) {
+            Some(()) => FieldKey::Edited,
+            None => FieldKey::Typing,
+        },
     }
 }
 
@@ -7113,6 +7760,122 @@ fn paints_later(block: &BlockState, active: Option<&str>) -> (bool, bool) {
         block.floating,
         block.floating && active == Some(block.id.as_str()),
     )
+}
+
+/// What the pane area shows instead of panes.
+#[derive(Debug, PartialEq)]
+struct EmptyState {
+    title: String,
+    detail: String,
+    action: Option<EmptyAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmptyAction {
+    AddServer,
+    Retry,
+    NewSession,
+}
+
+impl EmptyAction {
+    fn label(self) -> &'static str {
+        match self {
+            EmptyAction::AddServer => "Add a server…",
+            EmptyAction::Retry => "Retry now",
+            EmptyAction::NewSession => "New session…",
+        }
+    }
+}
+
+/// Why there are no panes, from the selected server's connection and name.
+fn empty_state(server: Option<(&Connectivity, &str)>) -> EmptyState {
+    let Some((connectivity, name)) = server else {
+        return EmptyState {
+            title: "No servers yet".into(),
+            detail: "Add a Rex server by address, e.g. my-box:7297.".into(),
+            action: Some(EmptyAction::AddServer),
+        };
+    };
+    match connectivity {
+        Connectivity::Idle | Connectivity::Connecting => EmptyState {
+            title: format!("Connecting to {name}…"),
+            detail: String::new(),
+            action: None,
+        },
+        Connectivity::Offline {
+            error,
+            retry_in_ms,
+        } => EmptyState {
+            title: format!("Can't reach {name}"),
+            detail: match retry_in_ms.div_ceil(1000) {
+                0 => error.clone(),
+                secs => format!("{error} · retrying within {secs}s"),
+            },
+            action: Some(EmptyAction::Retry),
+        },
+        Connectivity::Online => EmptyState {
+            title: format!("{name} has no sessions"),
+            detail: String::new(),
+            action: Some(EmptyAction::NewSession),
+        },
+    }
+}
+
+/// What the armed prefix offers: the key, the tool, and its name in the hint.
+const PREFIX_KEYS: &[(&str, Tool, &str)] = &[
+    ("g", Tool::Lazygit, "lazygit"),
+    ("f", Tool::Files, "file"),
+    ("d", Tool::Dirs, "directory"),
+    ("z", Tool::Anything, "file or directory"),
+];
+
+/// How many jump list rows are drawn at once.
+const PALETTE_ROWS: usize = 12;
+
+/// The rows to draw so the one under the cursor is among them: the list
+/// scrolls only when the cursor would leave it.
+fn palette_window(cursor: usize, count: usize, rows: usize) -> std::ops::Range<usize> {
+    if count == 0 {
+        return 0..0;
+    }
+    let rows = rows.min(count);
+    let start = (cursor.min(count - 1) + 1).saturating_sub(rows);
+    start..start + rows
+}
+
+/// Whether a notification is worth the taskbar's attention when the window
+/// is not in front: something stopped and waits for a person. A bell or an
+/// exit is not; programs ring too freely for that.
+fn wants_attention(kind: &shrew_core::NotificationKind) -> bool {
+    use shrew_core::NotificationKind as Kind;
+    match kind {
+        Kind::AgentBlocked | Kind::AgentDone | Kind::AgentError | Kind::Program => true,
+        Kind::Bell | Kind::ProcessExited => false,
+    }
+}
+
+/// A point in the window as fractions of the pane area.
+fn area_fraction(at: Point<Pixels>, origin: Point<Pixels>, size: Size<Pixels>) -> (f64, f64) {
+    let width = f32::from(size.width).max(1.0);
+    let height = f32::from(size.height).max(1.0);
+    (
+        f64::from((f32::from(at.x) - f32::from(origin.x)) / width),
+        f64::from((f32::from(at.y) - f32::from(origin.y)) / height),
+    )
+}
+
+/// What to ask before closing a tab, when it holds more than the one pane
+/// its × obviously closes.
+fn close_tab_question(panes: usize) -> Option<String> {
+    (panes > 1).then(|| format!("Close this tab and the {panes} panes in it?"))
+}
+
+/// What a zoomed pane's header says about the panes it covers.
+fn zoom_label(hidden: usize) -> String {
+    match hidden {
+        0 => "zoomed".to_owned(),
+        n => format!("zoomed · {n} hidden"),
+    }
 }
 
 fn pane_visible(block: &BlockState, zoomed: Option<&str>) -> bool {

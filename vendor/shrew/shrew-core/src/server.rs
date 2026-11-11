@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -62,12 +63,54 @@ pub(crate) struct ServerModel {
     pub account: Option<String>,
 }
 
+/// A lock that remembers whether its value may have changed: every mutable
+/// access marks it, so no call site can forget to. A snapshot is rebuilt only
+/// when something it shows was touched.
+pub(crate) struct Tracked<T> {
+    value: Mutex<T>,
+    changed: AtomicBool,
+}
+
+pub(crate) struct TrackedGuard<'a, T> {
+    guard: parking_lot::MutexGuard<'a, T>,
+    changed: &'a AtomicBool,
+}
+
+impl<T> Tracked<T> {
+    fn new(value: T) -> Self {
+        Self { value: Mutex::new(value), changed: AtomicBool::new(true) }
+    }
+
+    pub fn lock(&self) -> TrackedGuard<'_, T> {
+        TrackedGuard { guard: self.value.lock(), changed: &self.changed }
+    }
+
+    /// Whether the value was mutably accessed since the last call.
+    fn take_changed(&self) -> bool {
+        self.changed.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl<T> std::ops::Deref for TrackedGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for TrackedGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.changed.store(true, Ordering::Release);
+        &mut self.guard
+    }
+}
+
 pub(crate) struct ServerEntry {
-    pub profile: Mutex<Profile>,
+    pub profile: Tracked<Profile>,
     pub conn: Mutex<Option<Connection>>,
     /// Fires whenever a new connection is ready (terminals wait on it).
     pub conn_tx: watch::Sender<u64>,
-    pub model: Mutex<ServerModel>,
+    pub model: Tracked<ServerModel>,
     setup: Mutex<BTreeMap<String, Value>>,
     pub wake: Notify,
     pub stop: watch::Sender<bool>,
@@ -87,10 +130,10 @@ pub(crate) trait Sink: Send + Sync {
 impl ServerEntry {
     pub fn new(profile: Profile) -> Arc<Self> {
         Arc::new(Self {
-            profile: Mutex::new(profile),
+            profile: Tracked::new(profile),
             conn: Mutex::new(None),
             conn_tx: watch::channel(0).0,
-            model: Mutex::new(ServerModel::default()),
+            model: Tracked::new(ServerModel::default()),
             setup: Mutex::new(BTreeMap::new()),
             wake: Notify::new(),
             stop: watch::channel(false).0,
@@ -154,6 +197,12 @@ impl ServerEntry {
                 _ = &mut deadline => return None,
             }
         }
+    }
+
+    /// Whether [`Self::snapshot`] may differ from the last time this was asked.
+    pub fn take_changed(&self) -> bool {
+        // Not `||`: both marks have to be cleared.
+        self.profile.take_changed() | self.model.take_changed()
     }
 
     pub fn snapshot(&self) -> ServerState {
@@ -277,7 +326,7 @@ impl ServerEntry {
         let mut stop = self.stop.subscribe();
         let mut fg = sink.foreground();
         let mut token: Option<String> = None;
-        let mut backoff = Duration::from_millis(500);
+        let mut backoff = Backoff::default();
         loop {
             if *stop.borrow() {
                 return;
@@ -307,31 +356,52 @@ impl ServerEntry {
             let started = Instant::now();
             match Connection::connect(&endpoint, opts).await {
                 Ok((conn, events)) => {
-                    backoff = Duration::from_millis(500);
                     token = conn.reconnect_token().map(str::to_owned);
                     let rtt = started.elapsed().as_millis().min(60_000) as u32;
                     match self.clone().serve(conn, events, &sink, rtt, &mut stop, &mut token).await {
                         Served::Stopped => return,
-                        Served::Lost(reason) => {
+                        Served::Lost { reason, online_for } => {
                             tracing::info!("connection to {address} lost: {reason}");
-                            self.set_connectivity(Connectivity::Offline { error: reason, retry_in_ms: 0 }, &*sink);
-                            // Reconnect right away once; the server keeps us for 60s.
-                            continue;
+                            // A connection that stayed up reconnects at once (the server keeps
+                            // us for 60s); one that failed setup or dropped quickly backs off,
+                            // or a server that accepts sockets but fails bootstrap is hammered.
+                            let Some(retry) = backoff.lost(online_for) else {
+                                self.set_connectivity(Connectivity::Offline { error: reason, retry_in_ms: 0 }, &*sink);
+                                continue;
+                            };
+                            if self.wait_retry(retry, reason, &*sink, &mut backoff, &mut fg, &mut stop).await {
+                                return;
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    let retry = backoff;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                    self.set_connectivity(Connectivity::Offline { error: friendly(&e), retry_in_ms: retry.as_millis() as u64 }, &*sink);
-                    tokio::select! {
-                        _ = tokio::time::sleep(retry) => {}
-                        _ = self.wake.notified() => { backoff = Duration::from_millis(500); }
-                        _ = fg.changed() => {}
-                        _ = stop.changed() => return,
+                    let retry = backoff.failed();
+                    if self.wait_retry(retry, friendly(&e), &*sink, &mut backoff, &mut fg, &mut stop).await {
+                        return;
                     }
                 }
             }
+        }
+    }
+
+    /// Show the retry and wait it out. A manual reconnect cuts the wait and the
+    /// backoff short. Returns true when the supervisor was stopped.
+    async fn wait_retry(
+        &self,
+        retry: Duration,
+        error: String,
+        sink: &dyn Sink,
+        backoff: &mut Backoff,
+        fg: &mut watch::Receiver<bool>,
+        stop: &mut watch::Receiver<bool>,
+    ) -> bool {
+        self.set_connectivity(Connectivity::Offline { error, retry_in_ms: retry.as_millis() as u64 }, sink);
+        tokio::select! {
+            _ = tokio::time::sleep(retry) => false,
+            _ = self.wake.notified() => { backoff.reset(); false }
+            _ = fg.changed() => false,
+            _ = stop.changed() => true,
         }
     }
 
@@ -364,7 +434,7 @@ impl ServerEntry {
             Ok(b) => b,
             Err(e) => {
                 conn.close();
-                return Served::Lost(friendly(&e));
+                return Served::Lost { reason: friendly(&e), online_for: None };
             }
         };
         // Time a tiny call for a true round-trip figure (connect time includes TLS etc.).
@@ -415,6 +485,7 @@ impl ServerEntry {
             self.clone().attach(conn.clone(), s.session_id.clone(), sink.clone());
         }
         self.set_connectivity(Connectivity::Online, &**sink);
+        let online_at = Instant::now();
 
         loop {
             tokio::select! {
@@ -423,12 +494,12 @@ impl ServerEntry {
                     Some(ConnEvent::Closed { reason }) => {
                         *self.conn.lock() = None;
                         *token = conn.reconnect_token().map(str::to_owned);
-                        return Served::Lost(reason);
+                        return Served::Lost { reason, online_for: Some(online_at.elapsed()) };
                     }
                     None => {
                         *self.conn.lock() = None;
                         *token = conn.reconnect_token().map(str::to_owned);
-                        return Served::Lost("connection lost".into());
+                        return Served::Lost { reason: "connection lost".into(), online_for: Some(online_at.elapsed()) };
                     }
                 },
                 _ = stop.changed() => {
@@ -757,7 +828,12 @@ impl ServerEntry {
     }
 
     pub fn clear_bell(&self, block_id: &str) {
-        if let Some(m) = self.model.lock().meta.get_mut(block_id) {
+        let mut model = self.model.lock();
+        // Look before writing: this runs on every focus, and a mutable access
+        // alone marks the model changed.
+        if model.meta.get(block_id).is_some_and(|m| m.bell)
+            && let Some(m) = model.meta.get_mut(block_id)
+        {
             m.bell = false;
         }
     }
@@ -765,7 +841,49 @@ impl ServerEntry {
 
 pub(crate) enum Served {
     Stopped,
-    Lost(String),
+    /// `online_for` is `None` when the connection never finished setup.
+    Lost { reason: String, online_for: Option<Duration> },
+}
+
+const BACKOFF_MIN: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A connection that lasted this long was healthy; losing it is not a failure.
+const STABLE_AFTER: Duration = Duration::from_secs(10);
+
+/// Delay before the next connection attempt, doubling on each failure.
+#[derive(Debug)]
+pub(crate) struct Backoff {
+    next: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self { next: BACKOFF_MIN }
+    }
+}
+
+impl Backoff {
+    /// A failed attempt: wait the current delay, and double it for next time.
+    pub fn failed(&mut self) -> Duration {
+        let wait = self.next;
+        self.next = (self.next * 2).min(BACKOFF_MAX);
+        wait
+    }
+
+    pub fn reset(&mut self) {
+        self.next = BACKOFF_MIN;
+    }
+
+    /// A served connection ended. `None` means reconnect at once.
+    pub fn lost(&mut self, online_for: Option<Duration>) -> Option<Duration> {
+        match online_for {
+            Some(up) if up >= STABLE_AFTER => {
+                self.reset();
+                None
+            }
+            _ => Some(self.failed()),
+        }
+    }
 }
 
 fn describe_client(c: &Value) -> String {
@@ -881,6 +999,28 @@ mod integration_tests {
     }
 
     #[test]
+    fn a_connection_that_fails_setup_backs_off_instead_of_spinning() {
+        let mut backoff = Backoff::default();
+        // Bootstrap failed every time: each retry waits longer, up to the cap.
+        let waits: Vec<_> = (0..8).map(|_| backoff.lost(None).expect("must wait")).collect();
+        assert_eq!(waits[0], Duration::from_millis(500));
+        assert_eq!(waits[1], Duration::from_secs(1));
+        assert!(waits.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(*waits.last().unwrap(), BACKOFF_MAX);
+        // Dropped right after going online: still a failure.
+        assert_eq!(backoff.lost(Some(Duration::from_secs(1))), Some(BACKOFF_MAX));
+    }
+
+    #[test]
+    fn losing_a_stable_connection_reconnects_at_once_and_resets() {
+        let mut backoff = Backoff::default();
+        backoff.failed();
+        backoff.failed();
+        assert_eq!(backoff.lost(Some(STABLE_AFTER)), None);
+        assert_eq!(backoff.failed(), BACKOFF_MIN);
+    }
+
+    #[test]
     fn setup_queries_do_not_replace_registered_actions() {
         let entry = entry_with_view();
         entry.remember_setup("client.keymap", &json!({"actions": [{"name": "pane.split"}], "defaults": [{"name": "default"}]}));
@@ -891,6 +1031,25 @@ mod integration_tests {
             setup["client.keymap"],
             json!({"actions": [{"name": "pane.split"}], "defaults": [{"name": "default"}], "overrides": []})
         );
+    }
+
+    #[test]
+    fn only_mutable_access_marks_an_entry_changed() {
+        let entry = entry_with_view();
+        assert!(entry.take_changed(), "a new entry has never been shown");
+        assert!(!entry.take_changed());
+        // Reading (a snapshot, an ownership check) leaves it clean.
+        let _ = entry.snapshot();
+        let _ = entry.model.lock().sessions.get("s").is_some();
+        let _ = entry.id();
+        assert!(!entry.take_changed());
+        entry.clear_bell("b");
+        assert!(!entry.take_changed(), "no such block meta: nothing was written");
+        entry.model.lock().latency_ms = Some(3);
+        assert!(entry.take_changed());
+        entry.profile.lock().name = "B".into();
+        assert!(entry.take_changed());
+        assert!(!entry.take_changed());
     }
 
     #[test]

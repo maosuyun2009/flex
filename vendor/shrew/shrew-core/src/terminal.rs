@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures_util::future::{BoxFuture, FutureExt};
+use futures_util::stream::{FuturesOrdered, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
 use shrew_client::{DataEvent, DataStream, KeyPress, Mods};
@@ -37,6 +39,9 @@ pub trait TerminalListener: Send + Sync {
     fn size_changed(&self, cols: u16, rows: u16);
     /// Client-side effects requested by an ordered configured server action.
     fn client_actions(&self, _actions: Vec<(String, serde_json::Value)>) {}
+    /// Typed input, a paste, or another queued request did not reach the
+    /// server. At most once per batch of queued input.
+    fn input_failed(&self, _message: String) {}
 }
 
 /// Named keys a touch UI or hardware keyboard can send.
@@ -130,11 +135,71 @@ enum Input {
     Paste(String),
 }
 
+/// The emulator and the last frame built from it, behind one lock. Every
+/// mutable access to the emulator drops the frame, so no call site can leave
+/// a stale one behind.
+struct Screen(Mutex<(Terminal, Option<Arc<Frame>>)>);
+
+struct ScreenGuard<'a>(parking_lot::MutexGuard<'a, (Terminal, Option<Arc<Frame>>)>);
+
+impl Screen {
+    fn new(term: Terminal) -> Self {
+        Self(Mutex::new((term, None)))
+    }
+
+    fn lock(&self) -> ScreenGuard<'_> {
+        ScreenGuard(self.0.lock())
+    }
+}
+
+impl ScreenGuard<'_> {
+    fn frame(&mut self) -> Arc<Frame> {
+        let (term, frame) = &mut *self.0;
+        frame.get_or_insert_with(|| Arc::new(term.frame())).clone()
+    }
+}
+
+impl std::ops::Deref for ScreenGuard<'_> {
+    type Target = Terminal;
+    fn deref(&self) -> &Terminal {
+        &self.0.0
+    }
+}
+
+impl std::ops::DerefMut for ScreenGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Terminal {
+        self.0.1 = None;
+        &mut self.0.0
+    }
+}
+
+/// What a pipelined request carried, which decides what its reply is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Key,
+    /// A configured action: its reply may ask for client-side effects.
+    Action,
+    /// Mouse, wheel or focus. A failure is logged, not reported: nothing the
+    /// user typed was lost, and a pointer crossing a pane is not worth a notice.
+    Event,
+}
+
+/// The reply to a request, with what the request was.
+type Answer = (Sent, Result<serde_json::Value, shrew_client::ClientError>);
+
+/// Requests sent and not yet answered, oldest first.
+type InFlight = FuturesOrdered<BoxFuture<'static, Answer>>;
+
+/// How many unanswered requests may be out before the next one waits. Enough
+/// that typing and dragging never wait; a bound so a stalled link cannot queue
+/// without limit.
+const MAX_IN_FLIGHT: usize = 32;
+
 pub struct TerminalSession {
     server: Arc<ServerEntry>,
     pub session_id: String,
     pub block_id: String,
-    term: Mutex<Terminal>,
+    term: Screen,
     status: Mutex<TerminalStatus>,
     pending: AtomicBool,
     listener: Arc<dyn TerminalListener>,
@@ -170,7 +235,7 @@ impl TerminalSession {
             server,
             session_id,
             block_id,
-            term: Mutex::new(term),
+            term: Screen::new(term),
             status: Mutex::new(TerminalStatus::Connecting),
             pending: AtomicBool::new(false),
             listener,
@@ -208,8 +273,11 @@ impl TerminalSession {
         }
     }
 
-    /// Build the frame to draw. Clears the "frame ready" latch.
-    pub fn frame(&self) -> Frame {
+    /// The frame to draw. Clears the "frame ready" latch. Built once per
+    /// change: a view that redraws for any other reason (focus, a neighbour's
+    /// output, the chrome) gets the same frame back instead of a new walk over
+    /// every cell.
+    pub fn frame(&self) -> Arc<Frame> {
         self.pending.store(false, Ordering::Release);
         self.term.lock().frame()
     }
@@ -375,7 +443,28 @@ impl TerminalSession {
     }
 
     async fn run_input(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Input>) {
-        while let Some(first) = rx.recv().await {
+        let mut in_flight = InFlight::new();
+        loop {
+            // Wait for input, taking replies as they come.
+            let first = loop {
+                tokio::select! {
+                    biased;
+                    item = rx.recv() => match item {
+                        Some(item) => break item,
+                        None => return,
+                    },
+                    Some(reply) = in_flight.next(), if !in_flight.is_empty() => {
+                        // A dead connection fails everything in flight at once: one report.
+                        let mut failure = self.settle(reply);
+                        while let Some(Some(reply)) = in_flight.next().now_or_never() {
+                            failure = failure.or(self.settle(reply));
+                        }
+                        if let Some(message) = failure {
+                            self.listener.input_failed(message);
+                        }
+                    }
+                }
+            };
             // Merge queued text so fast typing over slow links costs one round trip.
             let mut batch = vec![first];
             while let Ok(more) = rx.try_recv() {
@@ -385,80 +474,153 @@ impl TerminalSession {
                 }
             }
             let Some(conn) = self.server.wait_connection(Duration::from_secs(10)).await else {
+                // Whatever queued up while waiting is just as undeliverable. Drop it
+                // all and say so: replaying stale keystrokes into a shell after a
+                // reconnect is worse than losing them visibly.
+                let mut dropped = batch.len();
+                while rx.try_recv().is_ok() {
+                    dropped += 1;
+                }
                 self.control_pending.store(false, Ordering::Release);
+                self.listener.input_failed(format!(
+                    "Not connected: {dropped} queued input{} not sent",
+                    if dropped == 1 { " was" } else { "s were" }
+                ));
                 continue;
             };
+            let mut failure: Option<String> = None;
             for item in batch {
-                let r = match &item {
-                    Input::Text(t) => conn.write(&self.session_id, &self.block_id, t).await,
-                    Input::Key(k) => conn.key(&self.session_id, &self.block_id, k).await,
-                    Input::KeySequence(key, prefix) => {
-                        let mut result = Ok(());
-                        for action in ["press", "release"] {
-                            result = conn.call("client.key", sequence_payload(&self.session_id,
-                                &self.block_id, key, prefix, action)).await.map(|_| ());
-                            if result.is_err() { break; }
-                        }
-                        result
-                    }
-                    Input::KeyEvent(key, action, prefix) => conn.call("client.key", sequence_payload(
-                        &self.session_id, &self.block_id, key, prefix, action)).await.map(|_| ()),
-                    Input::Action(name, args) => conn.call("client.action", json!({
-                        "session_id": self.session_id, "block_id": self.block_id,
-                        "action": name, "args": args, "origin": "key",
-                    })).await.map(|reply| {
-                        let actions = reply["client_actions"].as_array().into_iter().flatten()
-                            .filter_map(|a| Some((a["action"].as_str()?.to_owned(), a["args"].clone())))
-                            .collect();
-                        self.listener.client_actions(actions);
-                    }),
-                    Input::Event(event) => conn.call("block.event", json!({
-                        "session_id": self.session_id, "block_id": self.block_id, "event": event,
-                    })).await.map(|_| ()),
-                    Input::Control(take, control_conn) => {
-                        // A delayed request must never acquire ownership on a replacement connection.
-                        let result = match take {
-                            Some(take) => control_conn.own_block(&self.session_id, &self.block_id, *take).await,
-                            None => control_conn.disown_block(&self.session_id, &self.block_id).await,
+                match item {
+                    // Rex runs keys, actions and block events in arrival order, so
+                    // they go out without waiting for each other's replies: a held
+                    // arrow key or a mouse drag is not paced by the round trip.
+                    Input::Key(..) | Input::KeySequence(..) | Input::KeyEvent(..) | Input::Action(..) | Input::Event(_) => {
+                        let sent = match item {
+                            Input::Action(..) => Sent::Action,
+                            Input::Event(_) => Sent::Event,
+                            _ => Sent::Key,
                         };
-                        self.control_pending.store(false, Ordering::Release);
-                        if let Ok(reply) = &result {
-                            self.claimed.store(take.is_some(), Ordering::Release);
-                            let mut model = self.server.model.lock();
-                            if let Some(owner) = reply_owner(reply, &self.block_id) {
-                                self.control.store(model.client_id.as_deref() == owner
-                                    && owner.is_some(), Ordering::Release);
-                                if let Some(view) = model.sessions.get_mut(&self.session_id).and_then(|s| s.view.as_mut()) {
-                                    for block in view.windows.iter_mut().flat_map(|w| &mut w.layers).flat_map(|l| &mut l.blocks) {
-                                        if block.block_id.as_deref() == Some(self.block_id.as_str()) {
-                                            block.owner = owner.map(str::to_owned);
-                                        }
-                                    }
-                                }
+                        for (method, payload) in self.requests(&item) {
+                            if in_flight.len() >= MAX_IN_FLIGHT
+                                && let Some(reply) = in_flight.next().await
+                            {
+                                failure = failure.or(self.settle(reply));
                             }
-                            drop(model);
-                            self.resize_gen.fetch_add(1, Ordering::AcqRel);
-                            self.listener.frame_ready();
-                        }
-                        if result.is_ok() && take.is_some() {
-                            let device = *self.device.lock();
-                            if let Some((cols, rows, cw, ch)) = device {
-                                let px = (cw > 0 && ch > 0).then_some((cw, ch));
-                                if let Err(e) = control_conn.resize(&self.session_id, &self.block_id,
-                                    cols as u32, rows as u32, px).await {
-                                    tracing::warn!("requested resize: {e}");
-                                }
+                            match conn.start(method, payload) {
+                                Ok(reply) => in_flight.push_back(Box::pin(async move { (sent, reply.await.map(|(_, value)| value)) })),
+                                Err(e) => failure = failure.or(report(sent, &e)),
                             }
                         }
-                        result.map(|_| ())
                     }
-                    Input::Paste(p) => conn.paste(&self.session_id, &self.block_id, p).await,
-                };
-                if let Err(e) = r {
-                    tracing::warn!("input: {e}");
+                    // A paste is a block event too, so it keeps its place behind
+                    // the keys in flight; a large one is several, in order.
+                    Input::Paste(text) => {
+                        if let Err(e) = conn.paste(&self.session_id, &self.block_id, &text).await {
+                            failure = failure.or(report(Sent::Key, &e));
+                        }
+                    }
+                    // Rex runs `write` concurrently with everything else, so text
+                    // keeps its place only if all before it has been answered.
+                    Input::Text(text) => {
+                        failure = failure.or(self.settle_all(&mut in_flight).await);
+                        if let Err(e) = conn.write(&self.session_id, &self.block_id, &text).await {
+                            failure = failure.or(report(Sent::Key, &e));
+                        }
+                    }
+                    Input::Control(take, control_conn) => {
+                        failure = failure.or(self.settle_all(&mut in_flight).await);
+                        // Ownership is the terminal's size, not input: logged only.
+                        if let Err(e) = self.change_control(take, &control_conn).await {
+                            tracing::warn!("control: {e}");
+                        }
+                    }
+                }
+            }
+            if let Some(message) = failure {
+                self.listener.input_failed(message);
+            }
+        }
+    }
+
+    /// The ordered requests that deliver a key, action or block event.
+    fn requests(&self, item: &Input) -> Vec<(&'static str, serde_json::Value)> {
+        let (sid, bid) = (&self.session_id, &self.block_id);
+        let key = |key: &KeyPress, prefix: &[String], action: &str| ("client.key", sequence_payload(sid, bid, key, prefix, action));
+        match item {
+            Input::Key(k) => vec![key(k, &[], "press"), key(k, &[], "release")],
+            Input::KeySequence(k, prefix) => vec![key(k, prefix, "press"), key(k, prefix, "release")],
+            Input::KeyEvent(k, action, prefix) => vec![key(k, prefix, action)],
+            Input::Action(name, args) => vec![(
+                "client.action",
+                json!({"session_id": sid, "block_id": bid, "action": name, "args": args, "origin": "key"}),
+            )],
+            Input::Event(event) => vec![("block.event", json!({"session_id": sid, "block_id": bid, "event": event}))],
+            // Not pipelined: `run_input` sends these itself.
+            Input::Text(_) | Input::Paste(_) | Input::Control(..) => Vec::new(),
+        }
+    }
+
+    /// Take one reply. Returns what to tell the user if the request failed.
+    fn settle(&self, (sent, result): Answer) -> Option<String> {
+        match result {
+            Ok(reply) => {
+                if sent == Sent::Action {
+                    let actions = reply["client_actions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| Some((a["action"].as_str()?.to_owned(), a["args"].clone())))
+                        .collect();
+                    self.listener.client_actions(actions);
+                }
+                None
+            }
+            Err(e) => report(sent, &e),
+        }
+    }
+
+    /// Wait until everything in flight is answered. Returns the first failure.
+    async fn settle_all(&self, in_flight: &mut InFlight) -> Option<String> {
+        let mut failure = None;
+        while let Some(reply) = in_flight.next().await {
+            failure = failure.or(self.settle(reply));
+        }
+        failure
+    }
+
+    /// Take, request or release ownership on `conn`, the connection the user
+    /// asked on: a delayed request must never acquire ownership on a replacement.
+    async fn change_control(&self, take: Option<bool>, conn: &shrew_client::Connection) -> Result<(), shrew_client::ClientError> {
+        let result = match take {
+            Some(take) => conn.own_block(&self.session_id, &self.block_id, take).await,
+            None => conn.disown_block(&self.session_id, &self.block_id).await,
+        };
+        self.control_pending.store(false, Ordering::Release);
+        let reply = result?;
+        self.claimed.store(take.is_some(), Ordering::Release);
+        if let Some(owner) = reply_owner(&reply, &self.block_id) {
+            let mut model = self.server.model.lock();
+            self.control.store(model.client_id.as_deref() == owner && owner.is_some(), Ordering::Release);
+            if let Some(view) = model.sessions.get_mut(&self.session_id).and_then(|s| s.view.as_mut()) {
+                for block in view.windows.iter_mut().flat_map(|w| &mut w.layers).flat_map(|l| &mut l.blocks) {
+                    if block.block_id.as_deref() == Some(self.block_id.as_str()) {
+                        block.owner = owner.map(str::to_owned);
+                    }
                 }
             }
         }
+        self.resize_gen.fetch_add(1, Ordering::AcqRel);
+        self.listener.frame_ready();
+        if take.is_some() {
+            let device = *self.device.lock();
+            if let Some((cols, rows, cw, ch)) = device {
+                let px = (cw > 0 && ch > 0).then_some((cw, ch));
+                if let Err(e) = conn.resize(&self.session_id, &self.block_id, cols as u32, rows as u32, px).await {
+                    tracing::warn!("requested resize: {e}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Type text (soft keyboard, IME commit, dictation).
@@ -709,6 +871,7 @@ impl TerminalSession {
     }
 
     /// Mouse coordinates are zero-based cells; buttons are left/middle/right.
+    /// `action` is Rex's: `press`, `release`, or `motion` for a move or drag.
     pub fn mouse_event(
         &self,
         action: &str,
@@ -775,6 +938,26 @@ impl TerminalSession {
 
     pub(crate) fn on_clipboard(&self, text: String) {
         self.listener.clipboard(text);
+    }
+}
+
+/// Log a failed input request, and word it for the user when it is worth
+/// telling them: something they typed did not arrive, and the pane it was
+/// for is still there.
+fn report(sent: Sent, e: &shrew_client::ClientError) -> Option<String> {
+    tracing::warn!("input: {e}");
+    (sent != Sent::Event && !target_gone(e)).then(|| crate::server::friendly(e))
+}
+
+/// The block or session the input was for no longer exists. A key released
+/// just after the one that closed its pane ends up here; that is not a loss.
+fn target_gone(e: &shrew_client::ClientError) -> bool {
+    match e {
+        shrew_client::ClientError::Api(api) => {
+            matches!(api.code.as_str(), "not_found" | "session_not_found")
+                || api.message.contains("is not in the session")
+        }
+        _ => false,
     }
 }
 
@@ -911,10 +1094,64 @@ mod tests {
         .expect("connection wait ignored close");
     }
 
+    #[derive(Default)]
+    struct Failures(Mutex<Vec<String>>);
+    impl TerminalListener for Failures {
+        fn frame_ready(&self) {}
+        fn status_changed(&self, _: TerminalStatus) {}
+        fn clipboard(&self, _: String) {}
+        fn size_changed(&self, _: u16, _: u16) {}
+        fn input_failed(&self, message: String) {
+            self.0.lock().push(message);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_that_cannot_be_delivered_is_reported_once_not_dropped_silently() {
+        let server = ServerEntry::new(crate::store::Profile {
+            id: "test".into(),
+            name: "test".into(),
+            address: "localhost:9999".into(),
+        });
+        let failures = Arc::new(Failures::default());
+        let session = TerminalSession::open(server, "s".into(), "b".into(), failures.clone());
+        session.send_text("ls");
+        tokio::task::yield_now().await;
+        // Queued behind the batch that is waiting for a connection.
+        session.send_key(Key::Enter, false, false, false, false);
+        session.paste("more");
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert_eq!(*failures.0.lock(), vec!["Not connected: 3 queued inputs were not sent".to_owned()]);
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn a_frame_is_rebuilt_only_after_the_terminal_changed() {
+        let (session, _queue) = queued_session();
+        let first = session.frame();
+        // Reading, and typing while already at the bottom, change nothing.
+        let _ = (session.size(), session.title(), session.mouse_tracking(), session.selection_text());
+        session.send_text("x");
+        assert!(Arc::ptr_eq(&first, &session.frame()), "an unchanged terminal was walked again");
+
+        session.term.lock().write_vt(b"hello");
+        let second = session.frame();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.lines[0].runs[0].text.trim_end(), "hello");
+        assert!(Arc::ptr_eq(&second, &session.frame()));
+
+        // Scrolling and selecting are changes too.
+        session.select_range((0, 0), (4, 0));
+        let third = session.frame();
+        assert!(!Arc::ptr_eq(&second, &third));
+        session.clear_selection();
+        assert!(!Arc::ptr_eq(&third, &session.frame()));
+    }
+
     #[test]
     fn mouse_payload_preserves_buttons_and_modifiers() {
         let event = mouse_payload(
-            "move",
+            "motion",
             Some("right"),
             &["right", "middle"],
             8,
@@ -925,7 +1162,7 @@ mod tests {
             false,
         );
         assert_eq!(event["type"], "mouse");
-        assert_eq!(event["payload"]["action"], "move");
+        assert_eq!(event["payload"]["action"], "motion");
         assert_eq!(event["payload"]["buttons"]["right"], true);
         assert_eq!(event["payload"]["buttons"]["middle"], true);
         assert_eq!(event["payload"]["mods"], "shift+ctrl");
@@ -940,6 +1177,21 @@ mod tests {
         assert_eq!(payload["key"]["text"], "x");
         let released = sequence_payload("s", "b", &key, &["ctrl+b".into()], "release");
         assert_eq!(released["key"]["text"], "");
+    }
+
+    #[test]
+    fn only_lost_typing_for_a_pane_that_still_exists_is_reported() {
+        use shrew_client::ClientError;
+        let api = |code: &str, message: &str| {
+            ClientError::Api(shrew_client::proto::ApiError { code: code.into(), message: message.into(), status: 400 })
+        };
+        assert!(report(Sent::Key, &ClientError::Timeout).is_some());
+        assert!(report(Sent::Action, &api("bad_request", "unknown action")).is_some());
+        // A pointer event the server refused is not typing.
+        assert_eq!(report(Sent::Event, &api("bad_request", "unknown mouse action")), None);
+        // The pane closed under the key: nothing to tell.
+        assert_eq!(report(Sent::Key, &api("not_found", "block not found")), None);
+        assert_eq!(report(Sent::Key, &api("bad_request", "block block:1 is not in the session")), None);
     }
 
     #[test]
@@ -964,7 +1216,7 @@ mod tests {
                 server,
                 session_id: "s".into(),
                 block_id: "b".into(),
-                term: Mutex::new(Terminal::new(80, 24)),
+                term: Screen::new(Terminal::new(80, 24)),
                 status: Mutex::new(TerminalStatus::Connecting),
                 pending: AtomicBool::new(false),
                 listener: Arc::new(Listener),
