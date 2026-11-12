@@ -155,6 +155,9 @@ impl Screen {
 impl ScreenGuard<'_> {
     fn frame(&mut self) -> Arc<Frame> {
         let (term, frame) = &mut *self.0;
+        if term.expire_render_hold() {
+            *frame = None;
+        }
         frame.get_or_insert_with(|| Arc::new(term.frame())).clone()
     }
 }
@@ -259,6 +262,12 @@ impl TerminalSession {
     }
 
     fn set_status(&self, s: TerminalStatus) {
+        if matches!(&s, TerminalStatus::Reconnecting | TerminalStatus::Ended { .. } | TerminalStatus::Exited { .. }) {
+            let released = self.term.lock().cancel_render_hold();
+            if released {
+                self.dirty();
+            }
+        }
         let mut cur = self.status.lock();
         if *cur != s {
             *cur = s.clone();
@@ -358,8 +367,19 @@ impl TerminalSession {
         };
         let (ds, mut rx) = DataStream::open(endpoint, ticket);
         loop {
+            let hold_deadline = self.term.lock().render_hold_deadline();
             tokio::select! {
                 _ = stop.changed() => { drop(ds); return; }
+                _ = async {
+                    match hold_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Wake the GUI even when a program forgets to finish its frame.
+                    self.term.lock().expire_render_hold();
+                    self.dirty();
+                }
                 ev = rx.recv() => {
                     let Some(ev) = ev else { return self.set_status(TerminalStatus::Ended { reason: "Terminal stream closed".into() }); };
                     match ev {
@@ -1146,6 +1166,29 @@ mod tests {
         assert!(!Arc::ptr_eq(&second, &third));
         session.clear_selection();
         assert!(!Arc::ptr_eq(&third, &session.frame()));
+    }
+
+    #[tokio::test]
+    async fn frame_cache_releases_an_abandoned_sync_hold_without_new_output() {
+        let (session, _) = queued_session();
+        session.term.lock().write_vt(b"OLD\x1b[?2026h\r\x1b[2KNEW");
+        let held = session.frame();
+        assert_eq!(held.lines[0].runs[0].text.trim_end(), "OLD");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let current = session.frame();
+        assert_eq!(current.lines[0].runs[0].text.trim_end(), "NEW", "cached hold never expired");
+        assert!(!Arc::ptr_eq(&held, &current));
+    }
+
+    #[tokio::test]
+    async fn reconnect_or_end_releases_a_hold_before_leaving_the_receive_loop() {
+        for status in [TerminalStatus::Reconnecting, TerminalStatus::Ended { reason: "closed".into() }, TerminalStatus::Exited { code: 0 }] {
+            let (session, _) = queued_session();
+            session.term.lock().write_vt(b"OLD\x1b[?2026h\r\x1b[2KNEW");
+            assert_eq!(session.frame().lines[0].runs[0].text.trim_end(), "OLD");
+            session.set_status(status);
+            assert_eq!(session.frame().lines[0].runs[0].text.trim_end(), "NEW");
+        }
     }
 
     #[test]

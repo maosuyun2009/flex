@@ -25,6 +25,11 @@ Local changes:
   input and stream tasks rather than leaving an Arc/task retention cycle.
 - `shrew-term` keeps the caret cell in `Frame::cursor_position` even when a
   program hides the cursor, so an IME can place its preedit and candidates.
+- Synchronized output (DEC 2026) captures the last complete screen through
+  Ghostty's render-hold callback. Partial redraw packets are not presented.
+  A one-second deadline wakes the renderer even if output stops; reconnect,
+  stream termination, resize and snapshot restoration release the old hold.
+  Synthetic pi scrolling traces are replayed in `shrew-term/tests/pi_scroll.rs`.
 - Ownership claims are not treated as successful before the server replies.
 
 The control handshake advertises revision 10 with minimum revision 8. An

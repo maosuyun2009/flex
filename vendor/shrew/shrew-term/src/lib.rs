@@ -11,7 +11,12 @@ use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIte
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::selection::{FormatOptions, Selection, SelectLineOptions, SelectWordOptions};
 use libghostty_vt::style::{Palette, RgbColor, StyleColor};
-use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
+use libghostty_vt::terminal::{Mode, Point, PointCoordinate, ScrollViewport};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+const RENDER_HOLD_LIMIT: Duration = Duration::from_secs(1);
 
 pub use shrew_proto::snapshot::{Framed, SnapshotFramer};
 
@@ -182,12 +187,17 @@ impl From<vt::Error> for TermError {
 /// One terminal emulator instance.
 pub struct Terminal {
     raw: vt::Terminal<'static, 'static>,
-    render: RenderState<'static>,
-    rows_it: RowIterator<'static>,
-    cells_it: CellIterator<'static>,
+    presentation: Rc<RefCell<Presentation>>,
     framer: Option<SnapshotFramer>,
     scrollback_bytes: usize,
     cell_px: (u32, u32),
+}
+
+struct Presentation {
+    render: RenderState<'static>,
+    rows_it: RowIterator<'static>,
+    cells_it: CellIterator<'static>,
+    held: Option<(Instant, Frame)>,
 }
 
 // libghostty-vt handles aren't thread-safe for concurrent use, but every
@@ -200,15 +210,66 @@ impl Terminal {
         let raw = vt::Terminal::new(cols.max(1), rows.max(1)).expect("ghostty terminal");
         let mut t = Self {
             raw,
-            render: RenderState::new().expect("render state"),
-            rows_it: RowIterator::new().expect("row iterator"),
-            cells_it: CellIterator::new().expect("cell iterator"),
+            presentation: Rc::new(RefCell::new(Presentation {
+                render: RenderState::new().expect("render state"),
+                rows_it: RowIterator::new().expect("row iterator"),
+                cells_it: CellIterator::new().expect("cell iterator"),
+                held: None,
+            })),
             framer: None,
             scrollback_bytes: 10 << 20,
             cell_px: (0, 0),
         };
         t.apply_options();
+        t.install_render_hold();
         t
+    }
+
+    fn install_render_hold(&mut self) {
+        let presentation = self.presentation.clone();
+        self.raw.on_render_hold(move |raw, held| {
+            // Runs inside Ghostty's C callback: never panic from a nested borrow.
+            if let Ok(mut state) = presentation.try_borrow_mut() {
+                if held {
+                    let frame = state.capture(raw);
+                    state.held = Some((Instant::now(), frame));
+                } else {
+                    state.held = None;
+                }
+            }
+        }).expect("render hold callback");
+    }
+
+    /// A deadline the engine must repaint at even if the program stops writing.
+    pub fn render_hold_deadline(&self) -> Option<Instant> {
+        self.presentation.borrow().held.as_ref().map(|(started, _)| *started + RENDER_HOLD_LIMIT)
+    }
+
+    pub fn expire_render_hold(&mut self) -> bool {
+        if self.render_hold_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+            self.cancel_render_hold()
+        } else {
+            false
+        }
+    }
+
+    /// A disconnected or exited producer can no longer complete its redraw.
+    pub fn cancel_render_hold(&mut self) -> bool {
+        let held = self.presentation.borrow_mut().held.take().is_some();
+        if held {
+            let _ = self.raw.set_mode(Mode::SYNC_OUTPUT, false);
+        }
+        held
+    }
+
+    /// Only present complete synchronized frames; parsing continues during the hold.
+    pub fn frame(&mut self) -> Frame {
+        self.expire_render_hold();
+        let mut presentation = self.presentation.borrow_mut();
+        if let Some((_, frame)) = &presentation.held {
+            return frame.clone();
+        }
+        presentation.capture(&self.raw)
     }
 
     fn apply_options(&mut self) {
@@ -263,6 +324,10 @@ impl Terminal {
     pub fn restore(&mut self, snapshot: &[u8]) -> Result<(), TermError> {
         let decoder = vt::snapshot::Decoder::new_buf(snapshot).map_err(|e| TermError::Snapshot(e.to_string()))?;
         self.raw = decoder.decode().map_err(|e| TermError::Snapshot(e.to_string()))?;
+        self.presentation.borrow_mut().held = None;
+        self.install_render_hold();
+        // A snapshot is a fresh baseline; don't inherit a hold begun before attach.
+        let _ = self.raw.set_mode(Mode::SYNC_OUTPUT, false);
         self.apply_options();
         if self.cell_px != (0, 0) {
             let (c, r) = self.size();
@@ -400,11 +465,13 @@ impl Terminal {
         text
     }
 
-    /// Build a drawable frame of the current viewport.
-    pub fn frame(&mut self) -> Frame {
-        let scrollbar = self.scrollbar();
-        let alternate_screen = self.alternate_screen();
-        let Ok(snapshot) = self.render.update(&self.raw) else {
+}
+
+impl Presentation {
+    fn capture(&mut self, raw: &vt::Terminal<'static, '_>) -> Frame {
+        let scrollbar = raw.scrollbar().map(|s| Scrollbar { total: s.total, offset: s.offset, len: s.len }).unwrap_or_default();
+        let alternate_screen = matches!(raw.active_screen(), Ok(vt::screen::Screen::Alternate));
+        let Ok(snapshot) = self.render.update(raw) else {
             return Frame {
                 cols: 0,
                 rows: 0,
@@ -547,6 +614,9 @@ impl Terminal {
         }
     }
 
+}
+
+impl Terminal {
     /// The visible screen as plain text lines (for tests and previews).
     pub fn screen_lines(&mut self) -> Vec<String> {
         self.frame()
@@ -578,6 +648,98 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_text(frame: &Frame, row: usize) -> String {
+        frame.lines[row].runs.iter().map(|run| run.text.as_str()).collect::<String>().trim_end().to_owned()
+    }
+
+    #[test]
+    fn synchronized_redraw_never_presents_half_old_half_new_rows() {
+        let mut t = Terminal::new(30, 4);
+        t.write_vt(b"\x1b[?1049h\x1b[1;1HOLD TOP\x1b[2;1HOLD BOTTOM");
+        let before = t.frame();
+        // pi clears and replaces rows inside mode 2026; the data stream may
+        // split this redraw across packets with a GUI paint between packets.
+        t.write_vt(b"\x1b[?2026h\x1b[1;1H\x1b[2KNEW TOP");
+        assert_eq!(t.frame(), before, "a partial redraw replaced only the top of the old screen");
+        t.write_vt(b"\x1b[2;1H\x1b[2KNEW BOTTOM\x1b[?2026l");
+        let after = t.frame();
+        assert_eq!(row_text(&after, 0), "NEW TOP");
+        assert_eq!(row_text(&after, 1), "NEW BOTTOM");
+    }
+
+    #[test]
+    fn consecutive_sync_frames_capture_the_latest_complete_frame_between_paints() {
+        let mut t = Terminal::new(20, 3);
+        t.write_vt(b"OLD");
+        let _ = t.frame();
+        // A completed scroll redraw and the beginning of the next update can
+        // arrive in one packet. The held image must be COMPLETE, not OLD/PARTIAL.
+        t.write_vt(b"\x1b[?2026h\r\x1b[2KCOMPLETE\x1b[?2026l\x1b[?2026h\r\x1b[2KPARTIAL");
+        assert_eq!(row_text(&t.frame(), 0), "COMPLETE");
+        t.write_vt(b"\x1b[?2026l");
+        assert_eq!(row_text(&t.frame(), 0), "PARTIAL");
+    }
+
+    #[test]
+    fn sync_start_before_first_paint_captures_content_before_the_hold() {
+        let mut t = Terminal::new(20, 3);
+        t.write_vt(b"COMPLETE\x1b[?2026h\r\x1b[2KPARTIAL");
+        assert_eq!(row_text(&t.frame(), 0), "COMPLETE");
+    }
+
+    #[test]
+    fn sync_sequences_split_at_every_byte_boundary_preserve_complete_screen() {
+        let mut t = Terminal::new(20, 3);
+        t.write_vt(b"\x1b[?1049hOLD");
+        let before = t.frame();
+        for byte in b"\x1b[?2026h\r\x1b[2KNEW" {
+            t.write_vt(&[*byte]);
+            assert_eq!(row_text(&t.frame(), 0), row_text(&before, 0));
+        }
+        for byte in b"\x1b[?2026" {
+            t.write_vt(&[*byte]);
+            assert_eq!(row_text(&t.frame(), 0), "OLD");
+        }
+        t.write_vt(b"l");
+        assert_eq!(row_text(&t.frame(), 0), "NEW");
+    }
+
+    #[test]
+    fn resize_reset_and_restored_snapshot_release_the_old_hold() {
+        let mut t = Terminal::new(20, 3);
+        t.write_vt(b"OLD\x1b[?2026h\r\x1b[2KNEW");
+        t.resize(25, 4, 0, 0);
+        let resized = t.frame();
+        assert_eq!((resized.cols, resized.rows), (25, 4));
+        assert_eq!(row_text(&resized, 0), "NEW");
+        t.write_vt(b"\x1b[?2026h\x1bcRESET");
+        assert_eq!(row_text(&t.frame(), 0), "RESET");
+        let mut source = Terminal::new(12, 2);
+        source.write_vt(b"RESTORED");
+        let snapshot = source.snapshot().unwrap();
+        t.write_vt(b"\x1b[?2026h\rPARTIAL");
+        t.restore(&snapshot).unwrap();
+        assert!(t.render_hold_deadline().is_none());
+        assert_eq!(row_text(&t.frame(), 0), "RESTORED");
+        t.write_vt(b"\x1b[?2026h\rPARTIAL");
+        assert_eq!(row_text(&t.frame(), 0), "RESTORED", "restored terminal lost its render-hold callback");
+    }
+
+    #[test]
+    fn abandoned_sync_hold_expires_and_cannot_extend_itself() {
+        let mut t = Terminal::new(20, 3);
+        t.write_vt(b"OLD\x1b[?2026h\r\x1b[2KNEW");
+        let deadline = t.render_hold_deadline().unwrap();
+        t.write_vt(b"\x1b[?2026h");
+        assert_eq!(t.render_hold_deadline(), Some(deadline));
+        t.presentation.borrow_mut().held.as_mut().unwrap().0 = Instant::now() - RENDER_HOLD_LIMIT;
+        assert!(t.expire_render_hold());
+        assert_eq!(row_text(&t.frame(), 0), "NEW");
+        assert!(t.render_hold_deadline().is_none());
+        t.write_vt(b"\x1b[?2026h\rBAD");
+        assert_eq!(row_text(&t.frame(), 0), "NEW", "a new hold must work after timeout");
+    }
 
     #[test]
     fn writes_and_frames() {
