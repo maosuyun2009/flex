@@ -229,7 +229,14 @@ the layout underneath is untouched and closing it leaves no hole. herdr-style:
 | `g` | `lazygit` in the pane's directory; quit it and the pane closes, focus returns |
 | `f` | `fzf` over `rg --files`, and the choice is typed into the pane it came from |
 | `d` | `fzf` over directories, typed in with a trailing `/` |
-| `z` | both files and directories |
+| `z` | `zoxide query --list` → `fzf`, selecting from this server account's previously visited directories |
+
+`z` uses **zoxide's directory history**, not a scan of the current directory.
+The list keeps zoxide's ordering, and selecting a directory types its path into
+the original pane without running `cd`. It requires `zoxide` and `fzf` on the
+server; missing tools or empty history show an explanatory message. Enable
+zoxide in the server account's shell to collect visited directories. `f` and `d`
+continue to search the current directory tree.
 
 Tools open in **the pane's directory**, not in `$HOME`. The block only carries
 the directory the shell *reported* with OSC 7 — sometimes a `file://host/path`

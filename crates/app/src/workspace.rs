@@ -45,9 +45,7 @@ const PICK_FILES: &str =
 [ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
 const PICK_DIRS: &str = "p=$(find . -mindepth 1 -type d -not -path './.git*' -not -path '*/node_modules*' 2>/dev/null \
 | sed 's|^\\./||' | fzf --height=100% --layout=reverse); [ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
-const PICK_ANY: &str = "p=$({ rg --files --hidden -g '!.git' 2>/dev/null; find . -mindepth 1 -type d -not -path './.git*' \
--not -path '*/node_modules*' 2>/dev/null | sed 's|^\\./||'; } | fzf --height=100% --layout=reverse); \
-[ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
+const PICK_HISTORY: &str = include_str!("pick_history.sh");
 
 /// What the prefix key can open.
 #[derive(Clone, Copy, PartialEq)]
@@ -56,8 +54,8 @@ enum Tool {
     Lazygit,
     Files,
     Dirs,
-    /// Files and directories in one list.
-    Anything,
+    /// Directories previously visited, from the server account's zoxide history.
+    History,
 }
 
 /// A detached block's identity stays tied to the server and session that own it.
@@ -3519,8 +3517,8 @@ impl Workspace {
                 vec!["sh".to_owned(), "-c".to_owned(), PICK_DIRS.to_owned()],
                 Some("/"),
             ),
-            Tool::Anything => (
-                vec!["sh".to_owned(), "-c".to_owned(), PICK_ANY.to_owned()],
+            Tool::History => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_HISTORY.to_owned()],
                 Some(" "),
             ),
         };
@@ -7838,7 +7836,7 @@ const PREFIX_KEYS: &[(&str, Tool, &str)] = &[
     ("g", Tool::Lazygit, "lazygit"),
     ("f", Tool::Files, "file"),
     ("d", Tool::Dirs, "directory"),
-    ("z", Tool::Anything, "file or directory"),
+    ("z", Tool::History, "directory history (zoxide)"),
 ];
 
 /// How many jump list rows are drawn at once.

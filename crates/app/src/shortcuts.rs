@@ -180,7 +180,7 @@ pub const BINDINGS: &[(&str, Action, &str)] = &[
     (
         "ctrl-shift-space",
         Action::Prefix,
-        "Prefix, then g lazygit · f file · d directory · z either",
+        "Prefix, then g lazygit · f file · d directory · z history (zoxide)",
     ),
 ];
 
