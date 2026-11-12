@@ -46,7 +46,7 @@ the window, so server-side splits, floats and zoom need no layout code here.
 
 ## Install
 
-Download [`flex-0.0.9-setup.exe`](https://github.com/maosuyun2009/flex/releases/download/v0.0.9/flex-0.0.9-setup.exe)
+Download [`flex-0.0.10-setup.exe`](https://github.com/maosuyun2009/flex/releases/download/v0.0.10/flex-0.0.10-setup.exe)
 and run it. Release builds are a Windows GUI binary: double-clicking opens the
 window and nothing else, with no console behind it. It installs
 for the current user only, adds **flex** to the Start menu and the desktop, and
@@ -74,7 +74,7 @@ The installer is NSIS, built from `installer/flex.nsi` after the release build:
 
 ```powershell
 mkdir dist
-makensis /DAPP_VERSION=0.0.9 installer\flex.nsi   # → dist\flex-0.0.9-setup.exe
+makensis /DAPP_VERSION=0.0.10 installer\flex.nsi   # → dist\flex-0.0.10-setup.exe
 ```
 
 On Linux, `cargo check` currently trips over `xattr v0.2.3` vs `libc v0.2.191`
