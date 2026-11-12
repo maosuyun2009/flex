@@ -11,10 +11,14 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tracing = { version = "0.1.44", default-features = false }
 url = "2.5.8"
 shrew-proto = { version = "0.1.0", path = "../shrew-proto" }
 http = "1.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

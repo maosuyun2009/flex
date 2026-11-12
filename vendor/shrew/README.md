@@ -32,12 +32,21 @@ Local changes:
   Synthetic pi scrolling traces are replayed in `shrew-term/tests/pi_scroll.rs`.
 - Ownership claims are not treated as successful before the server replies.
 
-The control handshake advertises revision 10 with minimum revision 8. An
+The control handshake advertises revision 13 with minimum revision 8. An
 isolated live-server test first reproduced `revision_too_low` for layer-state
 operations at revision 8, then passed after the revision upgrade. Live checks
 cover persistent labels, scripts, action registration/replies, session and
 block lifecycles, detached blocks and minimized layers. This does not certify
 every revision-10 feature; test against the intended server version.
+
+The bytes subprotocol uses the existing HELLO/WELCOME ticket handshake. Binary
+messages then contain raw file bytes; an empty binary message half-closes that
+direction. Uploads require the server's final normal WebSocket close (1000), and
+downloads require both empty half-close and normal close. Socket loss is never
+success. Streams are bounded in memory, cancellable, and have idle deadlines.
+Uploads pin regular source file handles before reservations; downloads use a
+same-directory temporary file and atomic persistence after success. RPC pending
+registrations are cleaned even when their reply futures are cancelled.
 
 ## Verification
 
@@ -52,6 +61,8 @@ The root engine has an opt-in real-server test:
 ```bat
 set FLEX_TEST_SERVER=http://127.0.0.1:17979
 build.bat test -p flex-engine --test rex_integration --test rex_layout --offline -- --ignored
+set FLEX_FILE_TEST_SERVER=http://127.0.0.1:17979
+build.bat test -p flex-engine --test rex_files --offline -- --ignored
 ```
 
 Use only a disposable server for integration tests. Ordinary unit tests do not

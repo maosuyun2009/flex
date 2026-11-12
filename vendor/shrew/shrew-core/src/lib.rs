@@ -227,6 +227,11 @@ impl Shrew {
         self.entry(server_id)?.connection().ok_or(CoreError::NotConnected)
     }
 
+    /// Clone the currently supervised connection without reconnecting.
+    pub fn persistent_connection(&self, server_id: &str) -> Result<Connection, CoreError> {
+        self.conn(server_id)
+    }
+
     /// Run a future on the engine's runtime and wait for it (for sync callers).
     pub fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
         self.rt.block_on(f)

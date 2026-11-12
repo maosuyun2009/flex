@@ -1692,6 +1692,8 @@ dependencies = [
  "serde_json",
  "shrew-client",
  "shrew-core",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4926,10 +4928,12 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "http",
+ "libc",
  "rustls",
  "serde",
  "serde_json",
  "shrew-proto",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
