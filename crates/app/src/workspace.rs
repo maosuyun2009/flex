@@ -4058,9 +4058,21 @@ impl Workspace {
             .child(div().w(px(1.0)).h(px(16.0)).mx_2().bg(theme::border()))
             .children(chips)
             .child(theme::hint(
-                icons::button("new-tab", Icon::Plus, false).on_click(
-                    cx.listener(|this, _, window, cx| this.run(Action::NewTab, window, cx)),
-                ),
+                div()
+                    .id("new-tab")
+                    .size(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .text_size(px(16.0))
+                    .text_color(theme::muted())
+                    .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                    .child("+")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.run(Action::NewTab, window, cx)),
+                    ),
                 "New tab · Ctrl-Shift-T",
             ))
             .child(div().w(px(6.0)))

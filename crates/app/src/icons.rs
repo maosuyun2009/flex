@@ -19,8 +19,6 @@ pub enum Icon {
     Sliders,
     /// Floating pane: two offset frames.
     Float,
-    /// New tab: a plus.
-    Plus,
 }
 
 pub fn icon(kind: Icon, size: Pixels, color: Hsla) -> AnyElement {
@@ -70,25 +68,7 @@ pub fn icon(kind: Icon, size: Pixels, color: Hsla) -> AnyElement {
                     .border_1()
                     .border_color(color),
             ),
-        Icon::Plus => div()
-            .relative()
-            .size(size)
-            .child(
-                div()
-                    .absolute()
-                    .top(size * 0.5)
-                    .w(size)
-                    .h(px(1.0))
-                    .bg(color),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(size * 0.5)
-                    .h(size)
-                    .w(px(1.0))
-                    .bg(color),
-            ),
+
     };
     body.into_any_element()
 }
