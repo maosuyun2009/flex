@@ -24,6 +24,8 @@ pub struct Settings {
     /// Programs on the server (OSC 52) and other clients may set the local
     /// clipboard. Each write is announced; turning this off refuses them.
     pub remote_clipboard: bool,
+    pub files_open: bool,
+    pub files_width: f32,
 }
 
 impl Default for Settings {
@@ -37,7 +39,34 @@ impl Default for Settings {
             scrollback_lines: 10_000,
             allow_remote_actions: false,
             remote_clipboard: true,
+            files_open: false,
+            files_width: 320.0,
         }
+    }
+}
+
+/// Keep at least 260 logical pixels for the terminal on a narrow window.
+pub fn file_panel_width(requested: f32, window_width: f32, sidebar_width: f32) -> f32 {
+    let requested = if requested.is_finite() {
+        requested
+    } else {
+        320.0
+    };
+    requested
+        .clamp(180.0, 520.0)
+        .min((window_width - sidebar_width - 260.0).max(0.0))
+}
+
+#[cfg(test)]
+mod file_panel_tests {
+    use super::*;
+    #[test]
+    fn panel_never_covers_the_terminal_in_a_narrow_window() {
+        assert_eq!(file_panel_width(320.0, 720.0, 208.0), 252.0);
+        assert_eq!(file_panel_width(400.0, 1200.0, 208.0), 400.0);
+        assert_eq!(file_panel_width(800.0, 1600.0, 0.0), 520.0);
+        assert_eq!(file_panel_width(320.0, 200.0, 208.0), 0.0);
+        assert_eq!(file_panel_width(f32::NAN, 1200.0, 208.0), 320.0);
     }
 }
 
@@ -68,6 +97,11 @@ impl Settings {
             acrylic: flag("flex.acrylic").unwrap_or(default.acrylic),
             allow_remote_actions: flag("flex.allow_remote_actions").unwrap_or(false),
             remote_clipboard: flag("flex.remote_clipboard").unwrap_or(default.remote_clipboard),
+            files_open: flag("flex.files_open").unwrap_or(false),
+            files_width: number("flex.files_width")
+                .filter(|w| w.is_finite())
+                .unwrap_or(320.0)
+                .clamp(180.0, 520.0),
             background: setting("flex.background").and_then(|v| v.as_str().map(str::to_owned)),
             background_opacity: number("flex.background_opacity")
                 .unwrap_or(default.background_opacity)
@@ -89,6 +123,8 @@ impl Settings {
             json!(self.allow_remote_actions),
         );
         store.set_setting("flex.remote_clipboard", json!(self.remote_clipboard));
+        store.set_setting("flex.files_open", json!(self.files_open));
+        store.set_setting("flex.files_width", json!(self.files_width));
         store.set_setting(
             "flex.background",
             match &self.background {

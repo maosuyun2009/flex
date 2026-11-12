@@ -4,12 +4,14 @@
 //! driven by a different UI toolkit, without a GPU or a display.
 
 mod grid;
+pub mod files;
 pub mod keybindings;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 pub use grid::{fit_grid, Metrics};
+pub use files::{FileTarget, TransferProgress};
 pub use shrew_core::{
     AppState, BlockState, CacheInvalidation, ClientReplyError, ClientRequest, Connectivity,
     CoreError, Notification, ServerState, SessionState, TerminalListener, TerminalSession,
@@ -73,6 +75,44 @@ impl Engine {
 
     pub fn add_server(&self, name: &str, address: &str) -> Result<String, CoreError> {
         self.shrew.add_server(name, address)
+    }
+
+    pub async fn file_capabilities(&self, target: FileTarget) -> Result<files::FileCapabilities, CoreError> {
+        let connection = files::connection_for_target(&self.shrew, &target)?;
+        self.shrew.runtime().spawn(files::capabilities(connection, target)).await
+            .map_err(|e| CoreError::Server(e.to_string()))?
+    }
+
+    pub async fn upload_files(
+        &self,
+        target: FileTarget,
+        paths: Vec<PathBuf>,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<dyn Fn(TransferProgress) + Send + Sync>,
+    ) -> Result<(), CoreError> {
+        let connection = files::connection_for_target(&self.shrew, &target)?;
+        self.shrew
+            .runtime()
+            .spawn(files::upload_with_connection(connection, target, paths, cancel, progress))
+            .await
+            .map_err(|e| CoreError::Server(e.to_string()))?
+    }
+
+    pub async fn download_file(
+        &self,
+        target: FileTarget,
+        remote_path: String,
+        destination: PathBuf,
+        overwrite: bool,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<dyn Fn(TransferProgress) + Send + Sync>,
+    ) -> Result<(), CoreError> {
+        let connection = files::connection_for_target(&self.shrew, &target)?;
+        self.shrew
+            .runtime()
+            .spawn(files::download_with_connection(connection, target, remote_path, destination, overwrite, cancel, progress))
+            .await
+            .map_err(|e| CoreError::Server(e.to_string()))?
     }
 
     pub fn reconnect(&self, server_id: &str) {

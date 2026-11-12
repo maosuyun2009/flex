@@ -9,6 +9,9 @@
 mod automation;
 #[path = "workspace_menu.rs"]
 mod menu;
+#[path = "workspace_files.rs"]
+mod files;
+
 #[path = "workspace_model.rs"]
 mod model;
 use model::{move_before, tool_layer_request, FloatHints, PendingTool, ServerCache, ToolProgress};
@@ -45,9 +48,7 @@ const PICK_FILES: &str =
 [ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
 const PICK_DIRS: &str = "p=$(find . -mindepth 1 -type d -not -path './.git*' -not -path '*/node_modules*' 2>/dev/null \
 | sed 's|^\\./||' | fzf --height=100% --layout=reverse); [ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
-const PICK_ANY: &str = "p=$({ rg --files --hidden -g '!.git' 2>/dev/null; find . -mindepth 1 -type d -not -path './.git*' \
--not -path '*/node_modules*' 2>/dev/null | sed 's|^\\./||'; } | fzf --height=100% --layout=reverse); \
-[ -n \"$p\" ] && printf '\\n@@pick@@%s\\n' \"$p\"; sleep 0.2";
+const PICK_HISTORY: &str = include_str!("pick_history.sh");
 
 /// What the prefix key can open.
 #[derive(Clone, Copy, PartialEq)]
@@ -56,8 +57,8 @@ enum Tool {
     Lazygit,
     Files,
     Dirs,
-    /// Files and directories in one list.
-    Anything,
+    /// Directories previously visited, from the server account's zoxide history.
+    History,
 }
 
 /// A detached block's identity stays tied to the server and session that own it.
@@ -311,6 +312,12 @@ pub struct Workspace {
     engine: Arc<Engine>,
     state: Arc<AppState>,
     settings: Settings,
+    file_browser: Entity<crate::file_browser::FileBrowser>,
+    _file_observer: gpui::Subscription,
+    _file_notices: gpui::Subscription,
+    file_resize: Option<(Pixels, f32)>,
+    confirm_file_exit: bool,
+    exit_after_files: bool,
     /// The terminal font, resolved once at startup from what is installed.
     font: SharedString,
     /// The picture behind the terminals, decoded once when the setting changes.
@@ -405,6 +412,7 @@ pub struct Workspace {
 impl Workspace {
     pub(super) fn input_overlay_open(&self) -> bool {
         self.prompt.is_some() || self.palette.is_some() || self.menu.is_some()
+            || self.confirm_file_exit || self.exit_after_files
     }
 
     pub fn new(
@@ -422,8 +430,20 @@ impl Workspace {
         if std::env::var_os("FLEX_DEBUG").is_some() {
             eprintln!("[font] using {font}");
         }
+        let file_browser = cx.new(|cx| crate::file_browser::FileBrowser::new(engine.clone(), cx));
+        let file_observer = cx.observe(&file_browser, |_, _, cx| cx.notify());
+        let file_notices = cx.subscribe(&file_browser, |me, _, event, cx| {
+            let crate::file_browser::FileBrowserEvent::Notice(message) = event;
+            me.toast(shrew_core::NotificationKind::Program, "Files", message.clone(), std::time::Duration::from_secs(7), cx);
+        });
         let mut this = Self {
             engine,
+            file_browser,
+            _file_observer: file_observer,
+            _file_notices: file_notices,
+            file_resize: None,
+            confirm_file_exit: false,
+            exit_after_files: false,
             state: Arc::default(),
             settings,
             font,
@@ -3519,8 +3539,8 @@ impl Workspace {
                 vec!["sh".to_owned(), "-c".to_owned(), PICK_DIRS.to_owned()],
                 Some("/"),
             ),
-            Tool::Anything => (
-                vec!["sh".to_owned(), "-c".to_owned(), PICK_ANY.to_owned()],
+            Tool::History => (
+                vec!["sh".to_owned(), "-c".to_owned(), PICK_HISTORY.to_owned()],
                 Some(" "),
             ),
         };
@@ -4028,6 +4048,7 @@ impl Workspace {
         // which maximizes or restores it — what people expect of a title bar.
         let chips = self.tab_chips(cx);
         let chrome = self.chrome();
+        let close_workspace = cx.entity().downgrade();
 
         div()
             .flex()
@@ -4058,9 +4079,21 @@ impl Workspace {
             .child(div().w(px(1.0)).h(px(16.0)).mx_2().bg(theme::border()))
             .children(chips)
             .child(theme::hint(
-                icons::button("new-tab", Icon::Plus, false).on_click(
-                    cx.listener(|this, _, window, cx| this.run(Action::NewTab, window, cx)),
-                ),
+                div()
+                    .id("new-tab")
+                    .size(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .text_size(px(16.0))
+                    .text_color(theme::muted())
+                    .hover(|el| el.bg(chrome.hover()).text_color(theme::text()))
+                    .child("+")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.run(Action::NewTab, window, cx)),
+                    ),
                 "New tab · Ctrl-Shift-T",
             ))
             .child(div().w(px(6.0)))
@@ -4070,6 +4103,15 @@ impl Workspace {
                     .h_full()
                     .on_mouse_down(MouseButton::Left, cx.listener(title_press)),
             )
+            .child(theme::hint(
+                div().id("toggle-files").mx_1().size(px(30.0)).flex().items_center().justify_center().rounded_lg()
+                    .when(self.settings.files_open, |el| el.bg(theme::color(0x34374b)))
+                    .hover(|el| el.bg(theme::color(0x34374b)))
+                    .child(icons::icon(Icon::RightSidebar, px(14.0), theme::color(0xc5cbe6)))
+                    .on_mouse_down(MouseButton::Left, |_,_,cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this,_,window,cx| this.toggle_files(window,cx))),
+                "文件浏览与传输",
+            ))
             .child(theme::hint(
                 icons::button("settings", Icon::Sliders, self.show_settings).on_click(
                     cx.listener(|this, _, window, cx| this.run(Action::Settings, window, cx)),
@@ -4089,8 +4131,8 @@ impl Workspace {
                 false,
                 |_, _| crate::win32::toggle_maximize(),
             ))
-            .child(control("close", Shape::Close, true, |window, _| {
-                window.remove_window()
+            .child(control("close", Shape::Close, true, move |window, cx| {
+                let _ = close_workspace.update(cx, |me,cx| me.request_app_close(window,cx));
             }))
             .child(div().w(px(4.0)).h_full())
             .into_any_element()
@@ -5080,7 +5122,7 @@ impl Workspace {
         if held || tool_waiting {
             window.focus(&self.focus);
         }
-        if !held && views.is_empty() {
+        if !held && views.is_empty() && !self.files_have_focus(window, cx) {
             window.focus(&self.focus);
         }
         let focused_somewhere = views.iter().any(|(_, view)| {
@@ -5090,7 +5132,7 @@ impl Workspace {
             && views
                 .iter()
                 .any(|(b, view)| view.is_none() && self.active_block.as_ref() == Some(&b.id)));
-        let wanted = if held || tool_waiting {
+        let wanted = if held || tool_waiting || self.files_have_focus(window, cx) {
             None
         } else {
             self.pending_focus.take().or_else(|| {
@@ -6669,7 +6711,20 @@ impl Render for Workspace {
         if let Some((block, at, has_selection)) = self.context_menu.take() {
             self.open_pane_menu(&block, at, has_selection, window, cx);
         }
+        if self.exit_after_files && !self.file_browser.read(cx).has_pending() {
+            window.defer(cx, |window,_| window.remove_window());
+        }
+        self.sync_file_target(cx);
         if !self.styled {
+            let workspace = cx.entity().downgrade();
+            window.on_window_should_close(cx, move |window,cx| {
+                workspace.update(cx, |me,cx| {
+                    if me.file_browser.read(cx).has_pending() {
+                        me.request_app_close(window,cx);
+                        false
+                    } else { true }
+                }).unwrap_or(true)
+            });
             self.styled = true;
             crate::win32::round_corners();
         }
@@ -6702,6 +6757,7 @@ impl Render for Workspace {
         let palette = self.palette_overlay(cx);
         let prefix_hint = self.prefix_hint();
         let menu = self.menu_overlay(window, cx);
+        let file_exit = self.file_exit_overlay(cx);
         let body = if self.show_settings {
             self.settings_page(cx)
         } else {
@@ -6711,12 +6767,14 @@ impl Render for Workspace {
                 None
             };
             let panes = self.panes(window, cx);
+            let files = self.settings.files_open.then(|| self.file_panel(window, cx));
             div()
                 .flex()
                 .flex_1()
                 .min_h(px(0.0))
                 .children(sidebar)
                 .child(div().flex().flex_col().flex_1().min_w(px(0.0)).child(panes))
+                .children(files)
                 .into_any_element()
         };
 
@@ -6743,6 +6801,12 @@ impl Render for Workspace {
             .text_sm()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.confirm_file_exit || this.exit_after_files {
+                    if event.keystroke.key == "escape" && !this.exit_after_files { this.confirm_file_exit = false; cx.notify(); }
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.files_have_focus(window, cx) { return; }
                 if this.menu.is_some() {
                     this.menu_key(event, window, cx);
                     cx.stop_propagation();
@@ -6817,6 +6881,7 @@ impl Render for Workspace {
             .child(palette)
             .child(toasts)
             .child(menu)
+            .child(file_exit)
     }
 }
 
@@ -7826,7 +7891,7 @@ const PREFIX_KEYS: &[(&str, Tool, &str)] = &[
     ("g", Tool::Lazygit, "lazygit"),
     ("f", Tool::Files, "file"),
     ("d", Tool::Dirs, "directory"),
-    ("z", Tool::Anything, "file or directory"),
+    ("z", Tool::History, "directory history (zoxide)"),
 ];
 
 /// How many jump list rows are drawn at once.

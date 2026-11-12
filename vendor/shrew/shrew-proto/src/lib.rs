@@ -1,4 +1,4 @@
-//! Wire types and codecs for the Rex server protocol (API revisions 8–10).
+//! Wire types and codecs for the Rex server protocol (API revisions 8–13).
 //!
 //! This crate is pure: no I/O, no async. It describes the control connection
 //! (`rex.control.v1`, JSON over WebSocket text frames), the data connection
@@ -14,11 +14,12 @@ pub mod snapshot;
 pub use control::*;
 pub use model::*;
 
-/// Revision 10 schemas are checked by flex's opt-in Rex integration tests.
-pub const API_REVISION: u32 = 10;
+/// Revision 13 schemas are checked by flex's opt-in Rex integration tests.
+pub const API_REVISION: u32 = 13;
 /// The oldest revision whose shapes we can still parse.
 pub const API_MIN_REVISION: u32 = 8;
 pub const CONTROL_SUBPROTOCOL: &str = "rex.control.v1";
 pub const TERMINAL_SUBPROTOCOL: &str = "rex.data.terminal.v1";
+pub const BYTES_SUBPROTOCOL: &str = "rex.data.bytes.v1";
 pub const TERMINAL_CREATOR: &str = "com.superlogical.terminal";
 pub const SHELL_FLAVOR: &str = "com.superlogical.terminal.shell";

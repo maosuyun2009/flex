@@ -15,6 +15,8 @@ pub enum ClientError {
     Timeout,
     #[error("connection closed")]
     Closed,
+    #[error("cancelled")]
+    Cancelled,
     #[error(transparent)]
     Api(#[from] ApiError),
     #[error(transparent)]

@@ -149,13 +149,26 @@ fn pipelined_input_keeps_its_order_and_large_pastes_arrive_whole() {
     let expected = "abc".repeat(50);
     assert!(wait(10, || flat(&term).matches(&expected).count() >= 2), "input reordered:\n{}", screen(&term));
     term.send_key(Key::Char('c'), true, false, false, false);
+    // A key reply means Ctrl-C reached the pty, not that cat has exited.
+    // Wait for the shell to own the foreground before sending its next command.
+    assert!(wait(5, || {
+        shrew.block_on(shrew.call(&id, "com.superlogical.terminal.process", serde_json::json!({"session_id":sid,"block_id":bid})))
+            .ok().is_some_and(|process| {
+                let child = process.pointer("/child/pid").and_then(serde_json::Value::as_u64);
+                child.is_some() && child == process.pointer("/foreground/pid").and_then(serde_json::Value::as_u64)
+            })
+    }), "shell did not regain the foreground");
 
     // 1.5 MB is more than one control message (1 MiB) can carry.
     let line = format!("{}\n", "x".repeat(99));
     let big = line.repeat(15_000);
     term.send_text("stty -echo; wc -c; stty echo\r");
-    assert!(wait(5, || flat(&term).contains("stty -echo")));
-    std::thread::sleep(Duration::from_millis(500));
+    // Seeing command echo is not a readiness signal; a busy login shell may
+    // still be editing it. Start the paste only once wc is actually reading.
+    assert!(wait(5, || {
+        shrew.block_on(shrew.call(&id, "com.superlogical.terminal.process", serde_json::json!({"session_id":sid,"block_id":bid})))
+            .ok().is_some_and(|process| process.pointer("/foreground/name").and_then(serde_json::Value::as_str) == Some("wc"))
+    }), "wc did not start reading input");
     term.paste(&big);
     term.send_key(Key::Char('d'), true, false, false, false);
     assert!(wait(30, || screen(&term).contains(&format!("{}\n", big.len()))), "paste lost bytes:\n{}", screen(&term));

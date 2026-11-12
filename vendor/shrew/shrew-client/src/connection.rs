@@ -247,7 +247,9 @@ impl Connection {
             return Err(ClientError::Closed);
         }
         let inner = self.inner.clone();
+        let pending = PendingRegistration { inner: Arc::downgrade(&inner), id: id.clone() };
         Ok(Box::pin(async move {
+            let _pending = pending;
             let resp = match tokio::time::timeout(inner.timeout * 3, rx).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => return Err(ClientError::Closed),
@@ -470,6 +472,21 @@ impl Connection {
 
     pub async fn server_status(&self) -> Result<Value, ClientError> {
         self.call("server.status", json!({})).await
+    }
+}
+
+/// Dropping even an unpolled request must not leak its response sender.
+struct PendingRegistration {
+    inner: std::sync::Weak<Inner>,
+    id: String,
+}
+impl Drop for PendingRegistration {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            if let Ok(mut pending) = inner.pending.lock() {
+                pending.remove(&self.id);
+            }
+        }
     }
 }
 
@@ -729,6 +746,17 @@ mod pipeline_tests {
             seen
         });
         (Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap(), task)
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unpolled_reply_releases_pending_registration() {
+        let (endpoint, server) = holding_server(2).await;
+        let (conn, _) = Connection::connect(&endpoint, ConnectOptions::default()).await.unwrap();
+        let reply = conn.start("session.describe_block", json!({"n":0})).unwrap();
+        assert_eq!(conn.inner.pending.lock().unwrap().len(), 1);
+        drop(reply);
+        assert!(conn.inner.pending.lock().unwrap().is_empty());
+        conn.close(); server.abort();
     }
 
     #[tokio::test]
