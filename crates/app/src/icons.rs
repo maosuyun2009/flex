@@ -15,6 +15,8 @@ use crate::theme;
 pub enum Icon {
     /// Sidebar: a frame with a divider.
     Sidebar,
+    /// Right-hand file browser.
+    RightSidebar,
     /// Settings: sliders.
     Sliders,
     /// Floating pane: two offset frames.
@@ -25,7 +27,7 @@ pub fn icon(kind: Icon, size: Pixels, color: Hsla) -> AnyElement {
     let inner = size - px(2.0);
     let line = |w: Pixels, h: Pixels| div().w(w).h(h).bg(color);
     let body = match kind {
-        Icon::Sidebar => div()
+        Icon::Sidebar | Icon::RightSidebar => div()
             .relative()
             .size(size)
             .border_1()
@@ -34,7 +36,7 @@ pub fn icon(kind: Icon, size: Pixels, color: Hsla) -> AnyElement {
             .child(
                 div()
                     .absolute()
-                    .left(size * 0.4)
+                    .left(size * if matches!(kind, Icon::RightSidebar) { 0.65 } else { 0.4 })
                     .top(px(1.0))
                     .w(px(1.0))
                     .h(inner)
@@ -68,7 +70,6 @@ pub fn icon(kind: Icon, size: Pixels, color: Hsla) -> AnyElement {
                     .border_1()
                     .border_color(color),
             ),
-
     };
     body.into_any_element()
 }

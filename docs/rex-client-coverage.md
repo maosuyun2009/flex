@@ -4,8 +4,9 @@
 
 - Client baseline: `d2e7ee9` (Flex 0.0.6).
 - Upstream shrew source: `9cfc45ff91ab1d2283f7514f8a5d0096a0d68690`.
-- Tested server: Rex `1b6654811346488b696ded8f3c7e6701c57242f1`, API revision 10.
-- Client now negotiates revision 8–10. Older servers can reject newer methods;
+- Original tests: Rex `1b6654811346488b696ded8f3c7e6701c57242f1`, API revision 10.
+- File-transfer tests: Rex `aa2db1b21261b479a550559fb70e2c3a66c07ba2`, API revision 13.
+- Client now negotiates revision 8–13. Older servers can reject newer methods;
   their errors must remain visible rather than silently using local-only state.
 - Local SDK patches and license: `vendor/shrew/`.
 
@@ -21,6 +22,7 @@
 | Session/server management | Session rename/order; saved server edit, reconnect/probe, configuration reload; host creation; Tailscale login/enable/disable/logout/rename |
 | Detached blocks | Enumerate server state, recover after application restart, retain server/session identity, create an anchor when the session has no placed panes |
 | Floating layers | Authoritative minimize/restore, close-layer confirmation, preserved layer IDs/state/bounds, shared ordering/zoom rules for unsupported creators |
+| Remote files | Right sidebar, pane-scoped manual navigation, prefix queries for truncated directories, native batch uploads and atomic regular-file downloads; sequential cancellable queue and exit confirmation |
 | Server action palette | Titled Lua/creator actions; raw argument schemas preserved; JSON-object prompt for parameterized actions, no args for fixed creator actions |
 | Lua scripts | File selection only stages UTF-8 content; explicit load/unload, diagnostics, persistent client identity, reconnect replay |
 | Block creators | Discover flavors, create with JSON options, server schema validation, selectable unsupported-renderer placeholders, block description |
@@ -49,7 +51,10 @@ isolated state directories and `--restore=false`:
    route and revision-9 layer-method availability.
 2. `rex_layout`: temporary session creation/rename/destruction, splits, floating
    layer minimize/restore, detach/list/reattach and creator discovery.
-3. Upstream `live`: terminal snapshot/output, input, splits, Ctrl-C, palette action,
+3. `rex_files`: two-file native batch (including an empty file), exact binary
+   download, overwrite refusal/consent, cancellation preserving the old file,
+   directory rejection and target-address mismatch refusal.
+4. Upstream `live`: terminal snapshot/output, input, splits, Ctrl-C, palette action,
    background connection recovery and terminal close.
 
 Each server was terminated after its test. No existing server configuration or

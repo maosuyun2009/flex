@@ -485,6 +485,50 @@ Menus support Up/Down, Enter and Escape. Opening a menu takes keyboard focus
 away from the terminal; dismissing it restores focus without forwarding menu
 input to the remote program.
 
+## Files sidebar
+
+Click the **right-sidebar icon** in the title bar to open the right-hand remote
+file browser (tooltip: 文件浏览与传输).
+It starts collapsed, remembers its width, and can be resized by dragging its
+left edge. Narrow windows reserve space for the terminal instead of overlaying it.
+
+The browser follows the focused terminal pane. It starts at the foreground
+process's working directory; manually opened paths are remembered per pane.
+The terminal-outline icon beside the path returns to that pane's current
+directory. Use the breadcrumbs or the `..` row, double-click folders to enter,
+and use the circular-arrow icon to refresh. The eye icon toggles dotfiles.
+The rounded filter field supports **Aa** (case), **ab** (whole word), and **`.*`**
+(regular expression); all filter only loaded entries. Source/capability details
+are in the information icon's tooltip, not mixed into the file list. If Rex
+truncates a large directory, **Load matching prefix** narrows the server query;
+this is not recursive search or pagination.
+
+Drag regular files from Windows Explorer into the panel, or click the **upload
+arrow** in its header (keyboard alternative: Ctrl/Cmd+U while the panel has focus).
+The confirmation shows the original server and pane. **Rex decides where files
+are stored; dropping onto this panel does not upload to the browsed directory.**
+Files in one selection are a single sequential Rex batch. On complete success,
+Rex pastes all paths into the original terminal. Folders and symlink inputs are
+rejected; no SSH or command-line transfer fallback is used.
+
+Click the **download arrow** beside a file to download. A Windows Save As dialog chooses the local
+path, and replacing an existing file requires confirmation. Bytes are streamed
+to a temporary file in that directory; only a confirmed complete stream is
+atomically saved. Existing files survive failed or cancelled downloads.
+
+Transfers remain bound to the original server/session/pane when you switch tabs
+or hide the panel. The queue shows progress, failure, cancellation and manual
+retry. Upload retries start a new batch and may leave prior server residue.
+Closing flex with pending work asks whether to wait or stop and exit. Cancellation
+cannot undo completed uploads or paths already pasted into a terminal; there is
+no cross-restart resume or detached background transfer process.
+
+Upload requires API 11 and download API 13. Support is checked on the negotiated
+connection and the block's advertised methods; unavailable operations are shown
+disabled. Only regular remote files can be downloaded. Arbitrary block renderers,
+remote delete/rename, directory transfer, file editing and Git views are not part
+of this panel.
+
 ## Rex integration
 
 Settings → **Connection** now includes saved-server editing, reconnect/probe,
@@ -541,7 +585,7 @@ server already accepted. Enable automation only for trusted servers/peers.
   protocols, native system notifications, and arbitrary plugin renderers remain
   outside the implemented renderer. Text URL opening and application toasts exist.
 - Older servers may reject newer management methods. The client negotiates up
-  to API revision 10, retaining revision 8 as its minimum, and surfaces RPC errors.
+  to API revision 13, retaining revision 8 as its minimum, and surfaces RPC errors.
 
 Local dependency changes are recorded in [`vendor/shrew/README.md`](vendor/shrew/README.md).
 

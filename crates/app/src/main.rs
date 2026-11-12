@@ -10,6 +10,7 @@
 
 mod background;
 mod fonts;
+mod file_browser;
 mod icons;
 mod keymap;
 mod paint;

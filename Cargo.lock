@@ -1679,6 +1679,7 @@ dependencies = [
  "flex-engine",
  "gpui",
  "image",
+ "regex",
  "serde_json",
  "shrew-core",
  "windows-sys 0.61.2",
