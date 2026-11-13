@@ -1846,6 +1846,9 @@ impl Render for TerminalView {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                // A floating terminal overlaps another terminal's hitbox.
+                // Consume even at the history edge and before the Ctrl-wheel branch.
+                cx.stop_propagation();
                 // Vertical wheel scrolls the scrollback; horizontal is ignored.
                 let notches: f32 = match event.delta {
                     gpui::ScrollDelta::Lines(lines) => lines.y,

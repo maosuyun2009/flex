@@ -5393,7 +5393,8 @@ impl Workspace {
                     // over the picture behind it, and the glass setting still
                     // shows through.
                     .when(floating, |el| {
-                        el.shadow_lg().rounded_md().bg(chrome.surface())
+                        // The title, border and resize grip also cover lower panes.
+                        el.occlude().shadow_lg().rounded_md().bg(chrome.surface())
                     })
                     .when(
                         self.tinted.as_deref() == Some(block.id.as_str()) && floating,
